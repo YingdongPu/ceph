@@ -1313,7 +1313,7 @@ int set_bucket_quota(rgw::sal::Store* store, OPT opt_cmd,
 
   set_quota_info(bucket->get_info().quota, opt_cmd, max_size, max_objects, have_max_size, have_max_objects);
 
-  r = bucket->put_instance_info(dpp(), false, real_time());
+  r = bucket->put_info(dpp(), false, real_time());
   if (r < 0) {
     cerr << "ERROR: failed writing bucket instance info: " << cpp_strerror(-r) << std::endl;
     return -r;
@@ -2918,7 +2918,7 @@ public:
       return 0;
     }
 
-    int ret = bucket->put_instance_info(dpp(), false, real_time());
+    int ret = bucket->put_info(dpp(), false, real_time());
     if (ret < 0) {
       cerr << "failed to store bucket info: " << cpp_strerror(-ret) << std::endl;
       return -ret;
@@ -3151,8 +3151,7 @@ void init_realm_param(CephContext *cct, string& var, std::optional<string>& opt_
 
 int main(int argc, const char **argv)
 {
-  vector<const char*> args;
-  argv_to_vec(argc, (const char **)argv, args);
+  auto args = argv_to_vec(argc, argv);
   if (args.empty()) {
     cerr << argv[0] << ": -h or --help for usage" << std::endl;
     exit(1);

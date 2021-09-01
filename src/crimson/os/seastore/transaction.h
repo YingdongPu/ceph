@@ -142,11 +142,8 @@ public:
   }
 
   enum class src_t : uint8_t {
-    // normal IO operations at seastore boundary or within a test
     MUTATE = 0,
-    READ,
-    // transaction manager level operations
-    INIT,
+    READ, // including weak and non-weak read transactions
     CLEANER,
     MAX
   };
@@ -227,14 +224,6 @@ public:
               num_inserts == 0 &&
               num_erases == 0);
     }
-    void increment(const tree_stats_t& incremental) {
-      if (incremental.depth != 0) {
-        // depth is an absolute value
-        depth = incremental.depth;
-      }
-      num_inserts += incremental.num_inserts;
-      num_erases += incremental.num_erases;
-    }
   };
   tree_stats_t& get_onode_tree_stats() {
     return onode_tree_stats;
@@ -290,8 +279,6 @@ inline std::ostream& operator<<(std::ostream& os,
     return os << "MUTATE";
   case Transaction::src_t::READ:
     return os << "READ";
-  case Transaction::src_t::INIT:
-    return os << "INIT";
   case Transaction::src_t::CLEANER:
     return os << "CLEANER";
   default:

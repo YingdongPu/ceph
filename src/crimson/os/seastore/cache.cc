@@ -9,7 +9,7 @@
 
 // included for get_extent_by_type
 #include "crimson/os/seastore/collection_manager/collection_flat_node.h"
-#include "crimson/os/seastore/lba_manager/btree/lba_btree_node_impl.h"
+#include "crimson/os/seastore/lba_manager/btree/lba_btree_node.h"
 #include "crimson/os/seastore/omap_manager/btree/omap_btree_node_impl.h"
 #include "crimson/os/seastore/object_data_handler.h"
 #include "crimson/os/seastore/collection_manager/collection_flat_node.h"
@@ -38,6 +38,8 @@ Cache::~Cache()
 Cache::retire_extent_ret Cache::retire_extent_addr(
   Transaction &t, paddr_t addr, extent_len_t length)
 {
+  assert(addr.is_real() && !addr.is_block_relative());
+
   LOG_PREFIX(Cache::retire_extent);
   CachedExtentRef ext;
   auto result = t.get_extent(addr, &ext);
@@ -49,6 +51,9 @@ Cache::retire_extent_ret Cache::retire_extent_addr(
     ERRORT("{} is already retired", t, addr);
     ceph_abort();
   }
+
+  // any relative addr must have been on the transaction
+  assert(!addr.is_relative());
 
   // absent from transaction
   // retiring is not included by the cache hit metrics
@@ -98,7 +103,6 @@ void Cache::register_metrics()
   std::map<src_t, sm::label_instance> labels_by_src {
     {src_t::MUTATE,  src_label("MUTATE")},
     {src_t::READ,    src_label("READ")},
-    {src_t::INIT,    src_label("INIT")},
     {src_t::CLEANER, src_label("CLEANER")},
   };
 
@@ -435,82 +439,78 @@ void Cache::register_metrics()
    */
   auto tree_label = sm::label("tree");
   auto onode_label = tree_label("ONODE");
-  stats.committed_onode_tree_stats = {};
-  stats.invalidated_onode_tree_stats = {};
-  metrics.add_group(
-    "cache",
-    {
-      sm::make_counter(
-        "tree_depth",
-        stats.committed_onode_tree_stats.depth,
-        sm::description("the depth of tree"),
-        {onode_label}
-      ),
-      sm::make_counter(
-        "tree_inserts_committed",
-        stats.committed_onode_tree_stats.num_inserts,
-        sm::description("total number of committed insert operations"),
-        {onode_label}
-      ),
-      sm::make_counter(
-        "tree_erases_committed",
-        stats.committed_onode_tree_stats.num_erases,
-        sm::description("total number of committed erase operations"),
-        {onode_label}
-      ),
-      sm::make_counter(
-        "tree_inserts_invalidated",
-        stats.invalidated_onode_tree_stats.num_inserts,
-        sm::description("total number of invalidated insert operations"),
-        {onode_label}
-      ),
-      sm::make_counter(
-        "tree_erases_invalidated",
-        stats.invalidated_onode_tree_stats.num_erases,
-        sm::description("total number of invalidated erase operations"),
-        {onode_label}
-      ),
-    }
-  );
-
   auto lba_label = tree_label("LBA");
-  stats.committed_lba_tree_stats = {};
-  stats.invalidated_lba_tree_stats = {};
-  metrics.add_group(
-    "cache",
-    {
-      sm::make_counter(
-        "tree_depth",
-        stats.committed_lba_tree_stats.depth,
-        sm::description("the depth of tree"),
-        {lba_label}
-      ),
-      sm::make_counter(
-        "tree_inserts_committed",
-        stats.committed_lba_tree_stats.num_inserts,
-        sm::description("total number of committed insert operations"),
-        {lba_label}
-      ),
-      sm::make_counter(
-        "tree_erases_committed",
-        stats.committed_lba_tree_stats.num_erases,
-        sm::description("total number of committed erase operations"),
-        {lba_label}
-      ),
-      sm::make_counter(
-        "tree_inserts_invalidated",
-        stats.invalidated_lba_tree_stats.num_inserts,
-        sm::description("total number of invalidated insert operations"),
-        {lba_label}
-      ),
-      sm::make_counter(
-        "tree_erases_invalidated",
-        stats.invalidated_lba_tree_stats.num_erases,
-        sm::description("total number of invalidated erase operations"),
-        {lba_label}
-      ),
+  auto register_tree_metrics = [&labels_by_src, &onode_label, this](
+      const sm::label_instance& tree_label,
+      uint64_t& tree_depth,
+      counter_by_src_t<tree_efforts_t>& committed_tree_efforts,
+      counter_by_src_t<tree_efforts_t>& invalidated_tree_efforts) {
+    tree_depth = 0;
+    metrics.add_group(
+      "cache",
+      {
+        sm::make_counter(
+          "tree_depth",
+          tree_depth,
+          sm::description("the depth of tree"),
+          {tree_label}
+        ),
+      }
+    );
+    committed_tree_efforts.fill({});
+    invalidated_tree_efforts.fill({});
+    for (auto& [src, src_label] : labels_by_src) {
+      if (src == src_t::READ) {
+        // READ transaction won't contain any tree inserts and erases
+        continue;
+      }
+      if (src == src_t::CLEANER && tree_label == onode_label) {
+        // CLEANER transaction won't contain any onode tree operations
+        continue;
+      }
+      auto& committed_efforts = get_by_src(committed_tree_efforts, src);
+      auto& invalidated_efforts = get_by_src(invalidated_tree_efforts, src);
+      metrics.add_group(
+        "cache",
+        {
+          sm::make_counter(
+            "tree_inserts_committed",
+            committed_efforts.num_inserts,
+            sm::description("total number of committed insert operations"),
+            {tree_label, src_label}
+          ),
+          sm::make_counter(
+            "tree_erases_committed",
+            committed_efforts.num_erases,
+            sm::description("total number of committed erase operations"),
+            {tree_label, src_label}
+          ),
+          sm::make_counter(
+            "tree_inserts_invalidated",
+            invalidated_efforts.num_inserts,
+            sm::description("total number of invalidated insert operations"),
+            {tree_label, src_label}
+          ),
+          sm::make_counter(
+            "tree_erases_invalidated",
+            invalidated_efforts.num_erases,
+            sm::description("total number of invalidated erase operations"),
+            {tree_label, src_label}
+          ),
+        }
+      );
     }
-  );
+  };
+  register_tree_metrics(
+      onode_label,
+      stats.onode_tree_depth,
+      stats.committed_onode_tree_efforts,
+      stats.invalidated_onode_tree_efforts);
+  register_tree_metrics(
+      lba_label,
+      stats.lba_tree_depth,
+      stats.committed_lba_tree_efforts,
+      stats.invalidated_lba_tree_efforts);
 }
 
 void Cache::add_extent(CachedExtentRef ref)
@@ -664,8 +664,16 @@ void Cache::invalidate(Transaction& t, CachedExtent& conflicting_extent)
       efforts.mutate_delta_bytes += i->get_delta().length();
     }
 
-    stats.invalidated_onode_tree_stats.increment(t.onode_tree_stats);
-    stats.invalidated_lba_tree_stats.increment(t.lba_tree_stats);
+    if (t.get_src() == Transaction::src_t::CLEANER) {
+      // CLEANER transaction won't contain any onode tree operations
+      assert(t.onode_tree_stats.is_clear());
+    } else {
+      get_by_src(stats.invalidated_onode_tree_efforts, t.get_src()
+          ).increment(t.onode_tree_stats);
+    }
+
+    get_by_src(stats.invalidated_lba_tree_efforts, t.get_src()
+        ).increment(t.lba_tree_stats);
   } else {
     // read transaction won't have non-read efforts
     assert(t.retired_set.empty());
@@ -769,8 +777,24 @@ record_t Cache::prepare_record(Transaction &t)
 
   assert(!t.is_weak());
   assert(t.get_src() != Transaction::src_t::READ);
-  stats.committed_onode_tree_stats.increment(t.onode_tree_stats);
-  stats.committed_lba_tree_stats.increment(t.lba_tree_stats);
+
+  if (t.get_src() == Transaction::src_t::CLEANER) {
+    // CLEANER transaction won't contain any onode tree operations
+    assert(t.onode_tree_stats.is_clear());
+  } else {
+    if (t.onode_tree_stats.depth) {
+      stats.onode_tree_depth = t.onode_tree_stats.depth;
+    }
+    get_by_src(stats.committed_onode_tree_efforts, t.get_src()
+        ).increment(t.onode_tree_stats);
+  }
+
+  if (t.lba_tree_stats.depth) {
+    stats.lba_tree_depth = t.lba_tree_stats.depth;
+  }
+  get_by_src(stats.committed_lba_tree_efforts, t.get_src()
+      ).increment(t.lba_tree_stats);
+
   ++(get_by_src(stats.trans_committed_by_src, t.get_src()));
   auto& efforts = get_by_src(stats.committed_efforts_by_src,
                              t.get_src());
@@ -1053,40 +1077,72 @@ Cache::replay_delta(
 }
 
 Cache::get_next_dirty_extents_ret Cache::get_next_dirty_extents(
+  Transaction &t,
   journal_seq_t seq,
   size_t max_bytes)
 {
   LOG_PREFIX(Cache::get_next_dirty_extents);
-  std::vector<CachedExtentRef> ret;
+  std::vector<CachedExtentRef> cand;
   size_t bytes_so_far = 0;
   for (auto i = dirty.begin();
        i != dirty.end() && bytes_so_far < max_bytes;
        ++i) {
-    CachedExtentRef cand;
     if (i->get_dirty_from() != journal_seq_t() && i->get_dirty_from() < seq) {
-      DEBUG("next {}", *i);
-      if (!(ret.empty() ||
-	    ret.back()->get_dirty_from() <= i->get_dirty_from())) {
-	DEBUG("last {}, next {}", *ret.back(), *i);
+      DEBUGT("next {}", t, *i);
+      if (!(cand.empty() ||
+	    cand.back()->get_dirty_from() <= i->get_dirty_from())) {
+	ERRORT("last {}, next {}", t, *cand.back(), *i);
       }
-      assert(ret.empty() || ret.back()->get_dirty_from() <= i->get_dirty_from());
+      assert(cand.empty() || cand.back()->get_dirty_from() <= i->get_dirty_from());
       bytes_so_far += i->get_length();
-      ret.push_back(&*i);
+      cand.push_back(&*i);
+
     } else {
       break;
     }
   }
   return seastar::do_with(
-    std::move(ret),
-    [FNAME](auto &ret) {
-      return seastar::do_for_each(
-	ret,
-	[FNAME](auto &ext) {
+    std::move(cand),
+    decltype(cand)(),
+    [FNAME, this, &t](auto &cand, auto &ret) {
+      return trans_intr::do_for_each(
+	cand,
+	[FNAME, this, &t, &ret](auto &ext) {
 	  DEBUG("waiting on {}", *ext);
-	  return ext->wait_io();
-	}).then([&ret]() mutable {
-	  return seastar::make_ready_future<std::vector<CachedExtentRef>>(
-	    std::move(ret));
+
+	  return trans_intr::make_interruptible(
+	    ext->wait_io()
+	  ).then_interruptible([FNAME, this, ext, &t, &ret] {
+	    if (!ext->is_valid()) {
+	      invalidate(t, *ext);
+	      return;
+	    }
+
+	    CachedExtentRef on_transaction;
+	    auto result = t.get_extent(ext->get_paddr(), &on_transaction);
+	    if (result == Transaction::get_extent_ret::ABSENT) {
+	      DEBUGT("{} absent on t", t, *ext);
+	      t.add_to_read_set(ext);
+	      if (ext->get_type() == extent_types_t::ROOT) {
+		if (t.root) {
+		  assert(&*t.root == &*ext);
+		  assert(0 == "t.root would have to already be in the read set");
+		} else {
+		  assert(&*ext == &*root);
+		  t.root = root;
+		}
+	      }
+	      ret.push_back(ext);
+	    } else if (result == Transaction::get_extent_ret::PRESENT) {
+	      DEBUGT("{} present on t as {}", t, *ext, *on_transaction);
+	      ret.push_back(on_transaction);
+	    } else {
+	      assert(result == Transaction::get_extent_ret::RETIRED);
+	      DEBUGT("{} retired on t", t, *ext);
+	    }
+	  });
+	}).then_interruptible([&ret] {
+	  return std::move(ret);
 	});
     });
 }
