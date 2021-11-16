@@ -147,6 +147,13 @@ class FSStatus(object):
             if info['rank'] >= 0 and info['state'] != 'up:standby-replay':
                 yield info
 
+    def get_damaged(self, fscid):
+        """
+        Get the damaged ranks for the given FSCID.
+        """
+        fs = self.get_fsmap(fscid)
+        return fs['mdsmap']['damaged']
+
     def get_rank(self, fscid, rank):
         """
         Get the rank for the given FSCID.
@@ -470,6 +477,17 @@ class MDSCluster(CephCluster):
         """
         for fs in self.status().get_filesystems():
             Filesystem(ctx=self._ctx, fscid=fs['id']).destroy()
+
+    @property
+    def beacon_timeout(self):
+        """
+        Generate an acceptable timeout for the mons to drive some MDSMap change
+        because of missed beacons from some MDS. This involves looking up the
+        grace period in use by the mons and adding an acceptable buffer.
+        """
+
+        grace = float(self.get_config("mds_beacon_grace", service_type="mon"))
+        return grace*2+15
 
 
 class Filesystem(MDSCluster):
@@ -1012,6 +1030,11 @@ class Filesystem(MDSCluster):
         if status is None:
             status = self.getinfo()
         return status.get_ranks(self.id)
+
+    def get_damaged(self, status=None):
+        if status is None:
+            status = self.getinfo()
+        return status.get_damaged(self.id)
 
     def get_replays(self, status=None):
         if status is None:

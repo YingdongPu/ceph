@@ -6,3 +6,7 @@ tasks:
       - ceph orch ls
       - ceph orch host ls
       - ceph orch device ls
+      - ceph orch apply rgw foo
+      - ceph orch apply mds foo
+      - ceph orch apply rbd-mirror
+      - ceph orch apply nfs foo --port 12777

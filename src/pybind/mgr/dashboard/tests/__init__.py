@@ -5,6 +5,7 @@ import json
 import logging
 import threading
 import time
+from typing import Any, Dict
 from unittest.mock import Mock
 
 import cherrypy
@@ -13,8 +14,9 @@ from cherrypy.test import helper
 from mgr_module import HandleCommandResult
 from pyfakefs import fake_filesystem
 
-from .. import DEFAULT_VERSION, mgr
+from .. import mgr
 from ..controllers import generate_controller_routes, json_error_page
+from ..controllers._version import APIVersion
 from ..module import Module
 from ..plugins import PLUGIN_MANAGER, debug, feature_toggles  # noqa
 from ..services.auth import AuthManagerTool
@@ -100,12 +102,18 @@ class ControllerTestCase(helper.CPWebCase):
     _endpoints_cache = {}
 
     @classmethod
-    def setup_controllers(cls, ctrl_classes, base_url=''):
+    def setup_controllers(cls, ctrl_classes, base_url='', cp_config: Dict[str, Any] = None):
         if not isinstance(ctrl_classes, list):
             ctrl_classes = [ctrl_classes]
         mapper = cherrypy.dispatch.RoutesDispatcher()
         endpoint_list = []
         for ctrl in ctrl_classes:
+            ctrl._cp_config = {
+                'tools.dashboard_exception_handler.on': True,
+                'tools.authenticate.on': False
+            }
+            if cp_config:
+                ctrl._cp_config.update(cp_config)
             inst = ctrl()
 
             # We need to cache the controller endpoints because
@@ -152,18 +160,18 @@ class ControllerTestCase(helper.CPWebCase):
         if cls._request_logging:
             cherrypy.config.update({'tools.request_logging.on': False})
 
-    def _request(self, url, method, data=None, headers=None, version=DEFAULT_VERSION):
+    def _request(self, url, method, data=None, headers=None, version=APIVersion.DEFAULT):
         if not data:
             b = None
             if version:
-                h = [('Accept', 'application/vnd.ceph.api.v{}+json'.format(version)),
+                h = [('Accept', version.to_mime_type()),
                      ('Content-Length', '0')]
             else:
                 h = None
         else:
             b = json.dumps(data)
             if version is not None:
-                h = [('Accept', 'application/vnd.ceph.api.v{}+json'.format(version)),
+                h = [('Accept', version.to_mime_type()),
                      ('Content-Type', 'application/json'),
                      ('Content-Length', str(len(b)))]
 
@@ -175,19 +183,19 @@ class ControllerTestCase(helper.CPWebCase):
             h = headers
         self.getPage(url, method=method, body=b, headers=h)
 
-    def _get(self, url, headers=None, version=DEFAULT_VERSION):
+    def _get(self, url, headers=None, version=APIVersion.DEFAULT):
         self._request(url, 'GET', headers=headers, version=version)
 
-    def _post(self, url, data=None, version=DEFAULT_VERSION):
+    def _post(self, url, data=None, version=APIVersion.DEFAULT):
         self._request(url, 'POST', data, version=version)
 
-    def _delete(self, url, data=None, version=DEFAULT_VERSION):
+    def _delete(self, url, data=None, version=APIVersion.DEFAULT):
         self._request(url, 'DELETE', data, version=version)
 
-    def _put(self, url, data=None, version=DEFAULT_VERSION):
+    def _put(self, url, data=None, version=APIVersion.DEFAULT):
         self._request(url, 'PUT', data, version=version)
 
-    def _task_request(self, method, url, data, timeout, version=DEFAULT_VERSION):
+    def _task_request(self, method, url, data, timeout, version=APIVersion.DEFAULT):
         self._request(url, method, data, version=version)
         if self.status != '202 Accepted':
             logger.info("task finished immediately")
@@ -229,13 +237,13 @@ class ControllerTestCase(helper.CPWebCase):
         elif method == 'DELETE':
             self.status = '204 No Content'
 
-    def _task_post(self, url, data=None, timeout=60, version=DEFAULT_VERSION):
+    def _task_post(self, url, data=None, timeout=60, version=APIVersion.DEFAULT):
         self._task_request('POST', url, data, timeout, version=version)
 
-    def _task_delete(self, url, timeout=60, version=DEFAULT_VERSION):
+    def _task_delete(self, url, timeout=60, version=APIVersion.DEFAULT):
         self._task_request('DELETE', url, None, timeout, version=version)
 
-    def _task_put(self, url, data=None, timeout=60, version=DEFAULT_VERSION):
+    def _task_put(self, url, data=None, timeout=60, version=APIVersion.DEFAULT):
         self._task_request('PUT', url, data, timeout, version=version)
 
     def json_body(self):

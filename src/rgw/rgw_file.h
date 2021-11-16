@@ -371,6 +371,10 @@ namespace rgw {
       fh.fh_private = this;
     }
 
+    const std::string& get_name() const {
+      return name;
+    }
+
     const fh_key& get_key() const {
       return fhk;
     }
@@ -1290,6 +1294,8 @@ namespace rgw {
     }
 
     struct rgw_fs* get_fs() { return &fs; }
+
+    RGWFileHandle& get_fh() { return root_fh; }
 
     uint64_t get_fsid() { return root_fh.state.dev; }
 
@@ -2517,6 +2523,8 @@ public:
     // invoking this classes's header_init()
     (void) RGWWriteRequest::header_init();
     op = this;
+    // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+    hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
   }
 
   bool only_bucket() override { return true; }
@@ -2631,11 +2639,10 @@ public:
     state->op = OP_PUT;
 
     src_bucket_name = src_parent->bucket_name();
-    // need s->src_bucket_name?
+    state->src_bucket_name = src_bucket_name;
     dest_bucket_name = dst_parent->bucket_name();
-    // need s->bucket.name?
+    state->bucket_name = dest_bucket_name;
     dest_obj_name = dst_parent->format_child_name(dst_name, false);
-    // need s->object_name?
 
     int rc = valid_s3_object_name(dest_obj_name);
     if (rc != 0)
@@ -2667,8 +2674,8 @@ public:
     dest_policy = s3policy;
     /* src_object required before RGWCopyObj::verify_permissions() */
     rgw_obj_key k = rgw_obj_key(src_name);
-    src_object = rgwlib.get_store()->get_object(k);
-    s->object = src_object->clone(); // needed to avoid trap at rgw_op.cc:5150
+    s->src_object = s->bucket->get_object(k);
+    s->object = s->src_object->clone(); // needed to avoid trap at rgw_op.cc:5150
     return ret;
   }
 

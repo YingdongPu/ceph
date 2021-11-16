@@ -590,7 +590,9 @@ void BlueFS::_init_alloc()
               << std::dec << dendl;
       alloc[id] = Allocator::create(cct, cct->_conf->bluefs_allocator,
 				    bdev[id]->get_size(),
-				    alloc_size[id], name);
+				    alloc_size[id],
+				    0, 0,
+				    name);
       alloc[id]->init_add_free(
         block_reserved[id],
         _get_total(id));
@@ -1163,18 +1165,27 @@ int BlueFS::_replay(bool noop, bool to_stdout)
       bl.claim_append(t);
       read_pos += r;
     }
-    seen_recs = true;
     bluefs_transaction_t t;
     try {
       auto p = bl.cbegin();
       decode(t, p);
+      seen_recs = true;
     }
     catch (ceph::buffer::error& e) {
-      derr << __func__ << " 0x" << std::hex << pos << std::dec
-           << ": stop: failed to decode: " << e.what()
-           << dendl;
-      delete log_reader;
-      return -EIO;
+      // Multi-block transactions might be incomplete due to unexpected
+      // power off. Hence let's treat that as a regular stop condition.
+      if (seen_recs && more) {
+        dout(10) << __func__ << " 0x" << std::hex << pos << std::dec
+                 << ": stop: failed to decode: " << e.what()
+                 << dendl;
+      } else {
+        derr << __func__ << " 0x" << std::hex << pos << std::dec
+             << ": stop: failed to decode: " << e.what()
+             << dendl;
+        delete log_reader;
+        return -EIO;
+      }
+      break;
     }
     ceph_assert(seq == t.seq);
     dout(10) << __func__ << " 0x" << std::hex << pos << std::dec
@@ -3795,7 +3806,9 @@ uint8_t OriginalVolumeSelector::select_prefer_bdev(void* hint)
 void OriginalVolumeSelector::get_paths(const std::string& base, paths& res) const
 {
   res.emplace_back(base, db_total);
-  res.emplace_back(base + ".slow", slow_total);
+  res.emplace_back(base + ".slow",
+    slow_total ? slow_total : db_total); // use fake non-zero value if needed to
+                                         // avoid RocksDB complains
 }
 
 #undef dout_prefix

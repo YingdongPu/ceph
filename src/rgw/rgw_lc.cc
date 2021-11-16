@@ -360,7 +360,7 @@ static bool obj_has_expired(const DoutPrefixProvider *dpp, CephContext *cct, cep
     *expire_time = mtime + make_timespan(cmp);
   }
 
-  ldpp_dout(dpp, 20) << __func__ << __func__
+  ldpp_dout(dpp, 20) << __func__
 		 << "(): mtime=" << mtime << " days=" << days
 		 << " base_time=" << base_time << " timediff=" << timediff
 		 << " cmp=" << cmp
@@ -837,14 +837,14 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
    * operating on one shard at a time */
   params.allow_unordered = true;
   params.ns = RGW_OBJ_NS_MULTIPART;
-  params.filter = &mp_filter;
+  params.access_list_filter = &mp_filter;
 
   auto pf = [&](RGWLC::LCWorker* wk, WorkQ* wq, WorkItem& wi) {
     auto wt = boost::get<std::tuple<lc_op, rgw_bucket_dir_entry>>(wi);
     auto& [rule, obj] = wt;
     if (obj_has_expired(this, cct, obj.meta.mtime, rule.mp_expiration)) {
       rgw_obj_key key(obj.key);
-      std::unique_ptr<rgw::sal::MultipartUpload> mpu = store->get_multipart_upload(target, key.name);
+      std::unique_ptr<rgw::sal::MultipartUpload> mpu = target->get_multipart_upload(key.name);
       RGWObjectCtx rctx(store);
       int ret = mpu->abort(this, cct, &rctx);
       if (ret == 0) {
@@ -855,13 +855,13 @@ int RGWLC::handle_multipart_expiration(rgw::sal::Bucket* target,
 	if (ret == -ERR_NO_SUCH_UPLOAD) {
 	  ldpp_dout(wk->get_lc(), 5)
 	    << "ERROR: abort_multipart_upload failed, ret=" << ret
-	    << wq->thr_name()
+	    << ", thread:" << wq->thr_name()
 	    << ", meta:" << obj.key
 	    << dendl;
 	} else {
 	  ldpp_dout(wk->get_lc(), 0)
 	    << "ERROR: abort_multipart_upload failed, ret=" << ret
-	    << wq->thr_name()
+	    << ", thread:" << wq->thr_name()
 	    << ", meta:" << obj.key
 	    << dendl;
 	}
@@ -1407,7 +1407,7 @@ int LCOpRule::process(rgw_bucket_dir_entry& o,
     if (!cont) {
       ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
 			 << ": no rule match, skipping "
-			 << " " << wq->thr_name() << dendl;
+			 << wq->thr_name() << dendl;
       return 0;
     }
 
@@ -1446,9 +1446,9 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     return ret;
   }
 
-  ret = bucket->get_bucket_info(this, null_yield);
+  ret = bucket->load_bucket(this, null_yield);
   if (ret < 0) {
-    ldpp_dout(this, 0) << "LC:get_bucket_info for " << bucket_name
+    ldpp_dout(this, 0) << "LC:load_bucket for " << bucket_name
 		       << " failed" << dendl;
     return ret;
   }
@@ -1493,7 +1493,7 @@ int RGWLC::bucket_lc_process(string& shard_id, LCWorker* worker,
     if (ret < 0) {
       ldpp_dout(wk->get_lc(), 20)
 	<< "ERROR: orule.process() returned ret=" << ret
-	<< wq->thr_name() 
+	<< "thread:" << wq->thr_name()
 	<< dendl;
     }
   };

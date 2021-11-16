@@ -234,6 +234,7 @@ private:
 
   void pwl_init(Context *on_finish, pwl::DeferredContexts &later);
   void update_image_cache_state(Context *on_finish);
+  void check_image_cache_state_clean();
 
   void flush_dirty_entries(Context *on_finish);
   bool can_flush_entry(const std::shared_ptr<pwl::GenericLogEntry> log_entry);
@@ -293,6 +294,7 @@ protected:
   std::atomic<int> m_async_flush_ops = {0};
   std::atomic<int> m_async_append_ops = {0};
 
+  std::atomic<int> m_flush_ops_will_send = {0};
   /* Acquire locks in order declared here */
 
   mutable ceph::mutex m_log_retire_lock;
@@ -336,12 +338,14 @@ protected:
       std::map<uint64_t, bool> &missing_sync_points,
       std::map<uint64_t,
       std::shared_ptr<pwl::SyncPointLogEntry>> &sync_point_entries,
-      int entry_index);
+      uint64_t entry_index);
   void update_sync_points(
       std::map<uint64_t, bool> &missing_sync_points,
       std::map<uint64_t,
       std::shared_ptr<pwl::SyncPointLogEntry>> &sync_point_entries,
-      pwl::DeferredContexts &later, uint32_t alloc_size);
+      pwl::DeferredContexts &later);
+  virtual void inc_allocated_cached_bytes(
+      std::shared_ptr<pwl::GenericLogEntry> log_entry) = 0;
   Context *construct_flush_entry(
       const std::shared_ptr<pwl::GenericLogEntry> log_entry, bool invalidating);
   void process_writeback_dirty_entries();
@@ -386,10 +390,9 @@ protected:
   virtual void persist_last_flushed_sync_gen() {}
   virtual void reserve_cache(C_BlockIORequestT *req, bool &alloc_succeeds,
                              bool &no_space) {}
-  virtual Context *construct_flush_entry_ctx(
-      const std::shared_ptr<pwl::GenericLogEntry> log_entry) {
-    return nullptr;
-  }
+  virtual void construct_flush_entries(pwl::GenericLogEntries entries_to_flush,
+					DeferredContexts &post_unlock,
+					bool has_write_entry) = 0;
   virtual uint64_t get_max_extent() {
     return 0;
   }

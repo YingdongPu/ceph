@@ -301,7 +301,7 @@ bool WriteLog<I>::initialize_pool(Context *on_finish, pwl::DeferredContexts &lat
     m_first_valid_entry = 0;
     TX_BEGIN(m_log_pool) {
       TX_ADD(pool_root);
-      D_RW(pool_root)->header.layout_version = RWL_POOL_VERSION;
+      D_RW(pool_root)->header.layout_version = RWL_LAYOUT_VERSION;
       D_RW(pool_root)->log_entries =
         TX_ZALLOC(struct WriteLogCacheEntry,
                   sizeof(struct WriteLogCacheEntry) * num_small_writes);
@@ -334,11 +334,11 @@ bool WriteLog<I>::initialize_pool(Context *on_finish, pwl::DeferredContexts &lat
       return false;
     }
     pool_root = POBJ_ROOT(m_log_pool, struct WriteLogPoolRoot);
-    if (D_RO(pool_root)->header.layout_version != RWL_POOL_VERSION) {
+    if (D_RO(pool_root)->header.layout_version != RWL_LAYOUT_VERSION) {
       // TODO: will handle upgrading version in the future
       lderr(cct) << "Pool layout version is "
                  << D_RO(pool_root)->header.layout_version
-                 << " expected " << RWL_POOL_VERSION << dendl;
+                 << " expected " << RWL_LAYOUT_VERSION << dendl;
       on_finish->complete(-EINVAL);
       return false;
     }
@@ -436,7 +436,16 @@ void WriteLog<I>::load_existing_entries(DeferredContexts &later) {
     entry_index = (entry_index + 1) % this->m_total_log_entries;
   }
 
-  this->update_sync_points(missing_sync_points, sync_point_entries, later, MIN_WRITE_ALLOC_SIZE);
+  this->update_sync_points(missing_sync_points, sync_point_entries, later);
+}
+
+template <typename I>
+void WriteLog<I>::inc_allocated_cached_bytes(
+    std::shared_ptr<pwl::GenericLogEntry> log_entry) {
+  if (log_entry->is_write_entry()) {
+    this->m_bytes_allocated += std::max(log_entry->write_bytes(), MIN_WRITE_ALLOC_SIZE);
+    this->m_bytes_cached += log_entry->write_bytes();
+  }
 }
 
 template <typename I>
@@ -567,23 +576,28 @@ bool WriteLog<I>::retire_entries(const unsigned long int frees_per_tx) {
 }
 
 template <typename I>
-Context* WriteLog<I>::construct_flush_entry_ctx(
-    std::shared_ptr<GenericLogEntry> log_entry) {
+void WriteLog<I>::construct_flush_entries(pwl::GenericLogEntries entries_to_flush,
+				          DeferredContexts &post_unlock,
+					  bool has_write_entry) {
   bool invalidating = this->m_invalidating; // snapshot so we behave consistently
-  Context *ctx = this->construct_flush_entry(log_entry, invalidating);
 
-  if (invalidating) {
-    return ctx;
-  }
-  return new LambdaContext(
-    [this, log_entry, ctx](int r) {
-      m_image_ctx.op_work_queue->queue(new LambdaContext(
+  for (auto &log_entry : entries_to_flush) {
+    Context *ctx = this->construct_flush_entry(log_entry, invalidating);
+
+    if (!invalidating) {
+      ctx = new LambdaContext(
         [this, log_entry, ctx](int r) {
-          ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
-                                     << " " << *log_entry << dendl;
-          log_entry->writeback(this->m_image_writeback, ctx);
-        }), 0);
-    });
+	  m_image_ctx.op_work_queue->queue(new LambdaContext(
+	    [this, log_entry, ctx](int r) {
+	      ldout(m_image_ctx.cct, 15) << "flushing:" << log_entry
+					 << " " << *log_entry << dendl;
+	      log_entry->writeback(this->m_image_writeback, ctx);
+	      this->m_flush_ops_will_send -= 1;
+	    }), 0);
+        });
+   }
+   post_unlock.add(ctx);
+  }
 }
 
 const unsigned long int ops_flushed_together = 4;

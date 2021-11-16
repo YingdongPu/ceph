@@ -1516,6 +1516,8 @@ options:
     at which some pools' pg_num may be shrunk in order to enable increasing the pg_num
     of others.
   default: 250
+  flags:
+  - runtime
   services:
   - mgr
   - mon
@@ -3178,7 +3180,7 @@ options:
   type: bool
   level: dev
   default: false
-  with_legacy: truen
+  with_legacy: true
 - name: osd_debug_pretend_recovery_active
   type: bool
   level: dev
@@ -5018,6 +5020,15 @@ options:
   desc: inject crc verification errors into bluestore device reads
   default: 0
   with_legacy: true
+- name: bluestore_debug_legacy_omap
+  type: bool
+  level: dev
+  desc: Allows mkfs to create OSD in legacy OMAP naming mode (neither per-pool nor per-pg).
+    This is intended primarily for developers' purposes. The resulting OSD might/would
+    be transformed to the currrently default 'per-pg' format when BlueStore's quick-fix or
+    repair are applied.
+  default: false
+  with_legacy: true
 - name: bluestore_fsck_error_on_no_per_pool_stats
   type: bool
   level: advanced
@@ -5202,6 +5213,15 @@ options:
   long_desc: How often (in seconds) to print KV sync thread utilization, not logged
     when set to 0 or when utilization is 0%
   default: 10
+  flags:
+  - runtime
+  with_legacy: true
+- name: bluestore_fail_eio
+  type: bool
+  level: dev
+  desc: fail/crash on EIO
+  long_desc: whether bluestore osd fails on eio
+  default: false
   flags:
   - runtime
   with_legacy: true
@@ -6058,3 +6078,18 @@ options:
   - spdk
   - pmem
   - hm_smr
+- name: bluestore_cleaner_sleep_interval
+  type: float
+  level: advanced
+  desc: How long cleaner should sleep before re-checking utilization
+  default: 5
+  with_legacy: true
+- name: jaeger_tracing_enable
+  type: bool
+  level: advanced
+  desc: Ceph should use jaeger tracing system
+  default: false
+  services:
+  - rgw
+  - osd
+  with_legacy: true

@@ -14,6 +14,7 @@
  * Foundation.  See file COPYING.
  *
  */
+#include "PrimaryLogPG.h"
 
 #include <errno.h>
 
@@ -24,42 +25,45 @@
 #include <boost/intrusive_ptr.hpp>
 #include <boost/tuple/tuple.hpp>
 
-#include "PG.h"
-#include "pg_scrubber.h"
 #include "PrimaryLogPG.h"
-#include "OSD.h"
-#include "PrimaryLogScrub.h"
-#include "OpRequest.h"
-#include "ScrubStore.h"
-#include "Session.h"
-#include "objclass/objclass.h"
-#include "osd/ClassHandler.h"
 
 #include "cls/cas/cls_cas_ops.h"
+#include "common/CDC.h"
+#include "common/EventTrace.h"
 #include "common/ceph_crypto.h"
 #include "common/config.h"
 #include "common/errno.h"
-#include "common/scrub_types.h"
 #include "common/perf_counters.h"
-#include "common/CDC.h"
-#include "common/EventTrace.h"
-
-#include "messages/MOSDOp.h"
+#include "common/scrub_types.h"
+#include "include/compat.h"
+#include "json_spirit/json_spirit_reader.h"
+#include "json_spirit/json_spirit_value.h"
+#include "messages/MCommandReply.h"
 #include "messages/MOSDBackoff.h"
-#include "messages/MOSDPGTrim.h"
-#include "messages/MOSDPGScan.h"
-#include "messages/MOSDRepScrub.h"
+#include "messages/MOSDOp.h"
 #include "messages/MOSDPGBackfill.h"
 #include "messages/MOSDPGBackfillRemove.h"
 #include "messages/MOSDPGLog.h"
+#include "messages/MOSDPGScan.h"
+#include "messages/MOSDPGTrim.h"
 #include "messages/MOSDPGUpdateLogMissing.h"
 #include "messages/MOSDPGUpdateLogMissingReply.h"
-#include "messages/MCommandReply.h"
+#include "messages/MOSDRepScrub.h"
 #include "messages/MOSDScrubReserve.h"
-
-#include "include/compat.h"
 #include "mon/MonClient.h"
+#include "objclass/objclass.h"
+#include "osd/ClassHandler.h"
 #include "osdc/Objecter.h"
+#include "osd/scrubber/PrimaryLogScrub.h"
+#include "osd/scrubber/ScrubStore.h"
+#include "osd/scrubber/pg_scrubber.h"
+
+#include "OSD.h"
+#include "OpRequest.h"
+#include "PG.h"
+#include "Session.h"
+
+// required includes order:
 #include "json_spirit/json_spirit_value.h"
 #include "json_spirit/json_spirit_reader.h"
 #include "include/ceph_assert.h"  // json_spirit clobbers it
@@ -77,9 +81,7 @@
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
 
-#ifdef HAVE_JAEGER
-#include "common/tracer.h"
-#endif
+#include "osd_tracer.h"
 
 MEMPOOL_DEFINE_OBJECT_FACTORY(PrimaryLogPG, replicatedpg, osd);
 
@@ -943,7 +945,7 @@ PrimaryLogPG::get_pgls_filter(bufferlist::const_iterator& iter)
   if (type.compare("plain") == 0) {
     filter = std::make_unique<PGLSPlainFilter>();
   } else {
-    std::size_t dot = type.find(".");
+    std::size_t dot = type.find('.');
     if (dot == std::string::npos || dot == 0 || dot == type.size() - 1) {
       return { -EINVAL, nullptr };
     }
@@ -1028,7 +1030,7 @@ void PrimaryLogPG::do_command(
     f->close_section();
 
     if (is_primary() && is_active() && m_scrubber) {
-      m_scrubber->dump(f.get());
+      m_scrubber->dump_scrubber(f.get(), m_planned_scrub);
     }
 
     f->open_object_section("agent_state");
@@ -1175,7 +1177,7 @@ void PrimaryLogPG::do_command(
       if (deep) {
         set_last_deep_scrub_stamp(stamp);
       } else {
-        set_last_scrub_stamp(stamp);
+        set_last_scrub_stamp(stamp); // also for 'deep', as we use this value to order scrubs
       }
       f->open_object_section("result");
       f->dump_bool("deep", deep);
@@ -1756,6 +1758,11 @@ PrimaryLogPG::PrimaryLogPG(OSDService *o, OSDMapRef curmap,
   m_scrubber = make_unique<PrimaryLogScrub>(this);
 }
 
+PrimaryLogPG::~PrimaryLogPG()
+{
+  m_scrubber.reset();
+}
+
 void PrimaryLogPG::get_src_oloc(const object_t& oid, const object_locator_t& oloc, object_locator_t& src_oloc)
 {
   src_oloc = oloc;
@@ -1790,11 +1797,9 @@ void PrimaryLogPG::do_request(
     op->pg_trace.init("pg op", &trace_endpoint, &op->osd_trace);
     op->pg_trace.event("do request");
   }
-#ifdef HAVE_JAEGER
-  if (op->osd_parent_span) {
-    auto do_req_span = jaeger_tracing::child_span(__func__, op->osd_parent_span);
-  }
-#endif
+
+  [[maybe_unused]] auto span = tracing::osd::tracer.add_span(__func__, op->osd_parent_span);
+
 // make sure we have a new enough map
   auto p = waiting_for_map.find(op->get_source());
   if (p != waiting_for_map.end()) {
@@ -2123,12 +2128,21 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
     return;
   }
   int64_t poolid = get_pgid().pool();
-  if (op->may_write()) {
-
-    const pg_pool_t *pi = get_osdmap()->get_pg_pool(poolid);
-    if (!pi) {
-      return;
+  const pg_pool_t *pi = get_osdmap()->get_pg_pool(poolid);
+  if (!pi) {
+    return;
+  }
+  if (pi->has_flag(pg_pool_t::FLAG_EIO)) {
+    // drop op on the floor; the client will handle returning EIO
+    if (m->has_flag(CEPH_OSD_FLAG_SUPPORTSPOOLEIO)) {
+      dout(10) << __func__ << " discarding op due to pool EIO flag" << dendl;
+    } else {
+      dout(10) << __func__ << " replying EIO due to pool EIO flag" << dendl;
+      osd->reply_op_error(op, -EIO);
     }
+    return;
+  }
+  if (op->may_write()) {
 
     // invalid?
     if (m->get_snapid() != CEPH_NOSNAP) {
@@ -2157,11 +2171,8 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
 	   << " flags " << ceph_osd_flag_string(m->get_flags())
 	   << dendl;
 
-#ifdef HAVE_JAEGER
-  if (op->osd_parent_span) {
-    auto do_op_span = jaeger_tracing::child_span(__func__, op->osd_parent_span);
-  }
-#endif
+  [[maybe_unused]] auto span = tracing::osd::tracer.add_span(__func__, op->osd_parent_span);
+
   // missing object?
   if (is_unreadable_object(head)) {
     if (!is_primary()) {
@@ -2530,7 +2541,8 @@ PrimaryLogPG::cache_result_t PrimaryLogPG::maybe_handle_manifest_detail(
 	op.op == CEPH_OSD_OP_UNSET_MANIFEST ||
 	op.op == CEPH_OSD_OP_TIER_PROMOTE ||
 	op.op == CEPH_OSD_OP_TIER_FLUSH ||
-	op.op == CEPH_OSD_OP_TIER_EVICT) {
+	op.op == CEPH_OSD_OP_TIER_EVICT ||
+	op.op == CEPH_OSD_OP_ISDIRTY) {
       return cache_result_t::NOOP;
     }
   }
@@ -4171,11 +4183,8 @@ void PrimaryLogPG::execute_ctx(OpContext *ctx)
     tracepoint(osd, prepare_tx_enter, reqid.name._type,
         reqid.name._num, reqid.tid, reqid.inc);
   }
-#ifdef HAVE_JAEGER
-  if (ctx->op->osd_parent_span) {
-    auto execute_span = jaeger_tracing::child_span(__func__, ctx->op->osd_parent_span);
-  }
-#endif
+
+  [[maybe_unused]] auto span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
 
   int result = prepare_transaction(ctx);
 
@@ -5937,12 +5946,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
   PGTransaction* t = ctx->op_t.get();
 
   dout(10) << "do_osd_op " << soid << " " << ops << dendl;
-#ifdef HAVE_JAEGER
-  if (ctx->op->osd_parent_span) {
-    auto do_osd_op_span = jaeger_tracing::child_span(__func__, ctx->op->osd_parent_span);
-  }
-#endif
 
+  jspan span;
+  if (ctx->op) {
+    span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
+  }
   ctx->current_osd_subop_num = 0;
   for (auto p = ops.begin(); p != ops.end(); ++p, ctx->current_osd_subop_num++, ctx->processed_subop_count++) {
     OSDOp& osd_op = *p;
@@ -7398,20 +7406,14 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	}
 
 	// The chunks already has a reference, so it is just enough to invoke truncate if necessary
-	uint64_t chunk_length = 0;
-	for (auto p : obs.oi.manifest.chunk_map) {
-	  chunk_length += p.second.length;
-	}
-	if (chunk_length == obs.oi.size) {
-	  for (auto &p : obs.oi.manifest.chunk_map) {
-	    p.second.set_flag(chunk_info_t::FLAG_MISSING);
-	  }
+	for (auto &p : obs.oi.manifest.chunk_map) {
+	  p.second.set_flag(chunk_info_t::FLAG_MISSING);
 	  // punch hole
-	  t->zero(soid, 0, oi.size);
-	  oi.clear_data_digest();
-	  ctx->delta_stats.num_wr++;
-	  ctx->cache_operation = true;
+	  t->zero(soid, p.first, p.second.length);
 	}
+	oi.clear_data_digest();
+	ctx->delta_stats.num_wr++;
+	ctx->cache_operation = true;
 	osd->logger->inc(l_osd_tier_evict);
       }
 
@@ -8901,11 +8903,11 @@ void PrimaryLogPG::finish_ctx(OpContext *ctx, int log_op_type, int result)
 	   << dendl;
   utime_t now = ceph_clock_now();
 
-#ifdef HAVE_JAEGER
-  if (ctx->op->osd_parent_span) {
-    auto finish_ctx_span = jaeger_tracing::child_span(__func__, ctx->op->osd_parent_span);
+  jspan span;
+  if (ctx->op) {
+    span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
   }
-#endif
+
   // Drop the reference if deduped chunk is modified
   if (ctx->new_obs.oi.is_dirty() &&
     (ctx->obs->oi.has_manifest() && ctx->obs->oi.manifest.is_chunked()) &&
@@ -11289,11 +11291,10 @@ void PrimaryLogPG::op_applied(const eversion_t &applied_version)
 
 void PrimaryLogPG::eval_repop(RepGather *repop)
 {
-  #ifdef HAVE_JAEGER
-  if (repop->op->osd_parent_span) {
-    auto eval_span = jaeger_tracing::child_span(__func__, repop->op->osd_parent_span);
+  jspan span;
+  if (repop->op) {
+    span = tracing::osd::tracer.add_span(__func__, repop->op->osd_parent_span);
   }
- #endif
   dout(10) << "eval_repop " << *repop
     << (repop->op && repop->op->get_req<MOSDOp>() ? "" : " (no op)") << dendl;
 
@@ -11348,11 +11349,11 @@ void PrimaryLogPG::issue_repop(RepGather *repop, OpContext *ctx)
   dout(7) << "issue_repop rep_tid " << repop->rep_tid
           << " o " << soid
           << dendl;
-#ifdef HAVE_JAEGER
-  if (ctx->op->osd_parent_span) {
-    auto issue_repop_span = jaeger_tracing::child_span(__func__, ctx->op->osd_parent_span);
+
+  jspan span;
+  if (ctx->op) {
+    span = tracing::osd::tracer.add_span(__func__, ctx->op->osd_parent_span);
   }
-#endif
 
   repop->v = ctx->at_version;
 
@@ -12860,8 +12861,7 @@ void PrimaryLogPG::on_shutdown()
   }
 
   m_scrubber->scrub_clear_state();
-
-  m_scrubber->unreg_next_scrub();
+  m_scrubber->rm_from_osd_scrubbing();
 
   vector<ceph_tid_t> tids;
   cancel_copy_ops(false, &tids);

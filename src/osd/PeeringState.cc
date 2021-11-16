@@ -711,6 +711,8 @@ void PeeringState::start_peering_interval(
     // did primary change?
     if (was_old_primary != is_primary()) {
       state_clear(PG_STATE_CLEAN);
+      // queue/dequeue the scrubber
+      pl->on_primary_status_change(was_old_primary, is_primary());
     }
 
     pl->on_role_change();
@@ -732,6 +734,10 @@ void PeeringState::start_peering_interval(
 		 << ", replicas changed" << dendl;
       }
     }
+  }
+
+  if (is_primary() && was_old_primary) {
+    pl->reschedule_scrub();
   }
 
   if (acting.empty() && !up.empty() && up_primary == pg_whoami) {
@@ -2739,6 +2745,9 @@ void PeeringState::activate(
 
       bool needs_past_intervals = pi.dne();
 
+      // Save num_bytes for backfill reservation request, can't be negative
+      peer_bytes[peer] = std::max<int64_t>(0, pi.stats.stats.sum.num_bytes);
+
       if (pi.last_update == info.last_update) {
         // empty log
 	if (!pi.last_backfill.is_max())
@@ -2789,8 +2798,6 @@ void PeeringState::activate(
 	pi.last_interval_started = info.last_interval_started;
 	pi.history = info.history;
 	pi.hit_set = info.hit_set;
-        // Save num_bytes for reservation request, can't be negative
-        peer_bytes[peer] = std::max<int64_t>(0, pi.stats.stats.sum.num_bytes);
         pi.stats.stats.clear();
         pi.stats.stats.sum.num_bytes = peer_bytes[peer];
 
@@ -3803,7 +3810,7 @@ std::optional<pg_stat_t> PeeringState::prepare_stats_for_publish(
   if (info.stats.state != state) {
     info.stats.last_change = now;
     // Optimistic estimation, if we just find out an inactive PG,
-    // assumt it is active till now.
+    // assume it is active till now.
     if (!(state & PG_STATE_ACTIVE) &&
 	(info.stats.state & PG_STATE_ACTIVE))
       info.stats.last_active = now;
@@ -3969,12 +3976,18 @@ void PeeringState::update_stats(
   if (f(info.history, info.stats)) {
     pl->publish_stats_to_osd();
   }
-  pl->on_info_history_change();
+  pl->reschedule_scrub();
 
   if (t) {
     dirty_info = true;
     write_if_dirty(*t);
   }
+}
+
+void PeeringState::update_stats_wo_resched(
+  std::function<void(pg_history_t &, pg_stat_t &)> f)
+{
+  f(info.history, info.stats);
 }
 
 bool PeeringState::append_log_entries_update_missing(

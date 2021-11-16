@@ -27,10 +27,18 @@ public:
 
   using mapped_space_visitor_t = LBAManager::scan_mapped_space_func_t;
 
+  struct lba_tree_inner_stats_t {
+    uint64_t num_alloc_extents = 0;
+    uint64_t num_alloc_extents_iter_nexts = 0;
+  } static lba_tree_inner_stats;
+
   class iterator {
   public:
-    iterator(const iterator &) noexcept = default;
-    iterator(iterator &&) noexcept = default;
+    iterator(const iterator &rhs) noexcept :
+      internal(rhs.internal), leaf(rhs.leaf) {}
+    iterator(iterator &&rhs) noexcept :
+      internal(std::move(rhs.internal)), leaf(std::move(rhs.leaf)) {}
+
     iterator &operator=(const iterator &) = default;
     iterator &operator=(iterator &&) = default;
 
@@ -79,8 +87,8 @@ public:
     }
 
     bool is_end() const {
-      assert(leaf.pos <= leaf.node->get_size());
-      return leaf.pos == leaf.node->get_size();
+      // external methods may only resolve at a boundary if at end
+      return at_boundary();
     }
 
     bool is_begin() const {
@@ -102,8 +110,8 @@ public:
     }
 
   private:
-    iterator() = default;
-    iterator(depth_t depth) : internal(depth - 1) {}
+    iterator() noexcept {}
+    iterator(depth_t depth) noexcept : internal(depth - 1) {}
 
     friend class LBABtree;
     static constexpr uint16_t INVALID = std::numeric_limits<uint16_t>::max();
@@ -126,6 +134,17 @@ public:
       node_position_t<LBAInternalNode>, MAX_DEPTH> internal;
     node_position_t<LBALeafNode> leaf;
 
+    bool at_boundary() const {
+      assert(leaf.pos <= leaf.node->get_size());
+      return leaf.pos == leaf.node->get_size();
+    }
+
+    using handle_boundary_ertr = base_iertr;
+    using handle_boundary_ret = handle_boundary_ertr::future<>;
+    handle_boundary_ret handle_boundary(
+      op_context_t c,
+      mapped_space_visitor_t *visitor);
+
     depth_t check_split() const {
       if (!leaf.node->at_max_capacity()) {
 	return 0;
@@ -138,11 +157,11 @@ public:
     }
 
     depth_t check_merge() const {
-      if (!leaf.node->at_min_capacity()) {
+      if (!leaf.node->below_min_capacity()) {
 	return 0;
       }
       for (depth_t merge_from = 1; merge_from < get_depth(); ++merge_from) {
-	if (!get_internal(merge_from + 1).node->at_min_capacity())
+	if (!get_internal(merge_from + 1).node->below_min_capacity())
 	  return merge_from;
       }
       return get_depth();
@@ -249,26 +268,30 @@ public:
   static base_iertr::future<> iterate_repeat(
     op_context_t c,
     iterator_fut &&iter_fut,
+    bool need_count,
     F &&f,
     mapped_space_visitor_t *visitor=nullptr) {
     return std::move(
       iter_fut
-    ).si_then([c, visitor, f=std::forward<F>(f)](auto iter) {
+    ).si_then([c, need_count, visitor, f=std::forward<F>(f)](auto iter) {
       return seastar::do_with(
 	iter,
 	std::move(f),
-	[c, visitor](auto &pos, auto &f) {
+	[c, need_count, visitor](auto &pos, auto &f) {
 	  return trans_intr::repeat(
-	    [c, visitor, &f, &pos] {
+	    [c, need_count, visitor, &f, &pos] {
 	      return f(
 		pos
-	      ).si_then([c, visitor, &pos](auto done) {
+	      ).si_then([c, need_count, visitor, &pos](auto done) {
 		if (done == seastar::stop_iteration::yes) {
 		  return iterate_repeat_ret_inner(
 		    interruptible::ready_future_marker{},
 		    seastar::stop_iteration::yes);
 		} else {
 		  ceph_assert(!pos.is_end());
+		  if (need_count) {
+		    ++LBABtree::lba_tree_inner_stats.num_alloc_extents_iter_nexts;
+		  }
 		  return pos.next(
 		    c, visitor
 		  ).si_then([&pos](auto next) {
@@ -471,6 +494,14 @@ private:
     });
   }
 
+  /**
+   * lookup_depth_range
+   *
+   * Performs node lookups on depths [from, to) using li and ll to
+   * specific target at each level.  Note, may leave the iterator
+   * at_boundary(), call handle_boundary() prior to returning out
+   * lf LBABtree.
+   */
   using lookup_depth_range_iertr = base_iertr;
   using lookup_depth_range_ret = lookup_depth_range_iertr::future<>;
   template <typename LI, typename LL>
@@ -556,13 +587,31 @@ private:
 	    0,
 	    li,
 	    ll,
-	    visitor);
+	    visitor
+	  ).si_then([c, visitor, &iter] {
+	    if (iter.at_boundary()) {
+	      return iter.handle_boundary(c, visitor);
+	    } else {
+	      return lookup_iertr::now();
+	    }
+	  });
 	}).si_then([&iter] {
 	  return std::move(iter);
 	});
       });
   }
 
+  /**
+   * handle_split
+   *
+   * Prepare iter for insertion.  iter should begin pointing at
+   * the valid insertion point (lower_bound(laddr)).
+   *
+   * Upon completion, iter will point at the
+   * position at which laddr should be inserted.  iter may, upon completion,
+   * point at the end of a leaf other than the end leaf if that's the correct
+   * insertion point.
+   */
   using find_insertion_iertr = base_iertr;
   using find_insertion_ret = find_insertion_iertr::future<>;
   static find_insertion_ret find_insertion(
@@ -570,6 +619,16 @@ private:
     laddr_t laddr,
     iterator &iter);
 
+  /**
+   * handle_split
+   *
+   * Split nodes in iter as needed for insertion. First, scan iter from leaf
+   * to find first non-full level.  Then, split from there towards leaf.
+   *
+   * Upon completion, iter will point at the newly split insertion point.  As
+   * with find_insertion, iter's leaf pointer may be end without iter being
+   * end.
+   */
   using handle_split_iertr = base_iertr;
   using handle_split_ret = handle_split_iertr::future<>;
   handle_split_ret handle_split(

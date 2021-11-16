@@ -855,7 +855,7 @@ protected:
   std::map<std::string, bool> categories;
   std::map<rgw_user_bucket, rgw_usage_log_entry> usage;
   std::map<std::string, rgw_usage_log_entry> summary_map;
-  std::map<std::string, cls_user_bucket_entry> buckets_usage;
+  std::map<std::string, bucket_meta_entry> buckets_usage;
   cls_user_header header;
   RGWStorageStats stats;
 public:
@@ -1497,7 +1497,6 @@ protected:
   rgw::sal::Attrs attrs;
   std::string src_tenant_name, src_bucket_name, src_obj_name;
   std::unique_ptr<rgw::sal::Bucket> src_bucket;
-  std::unique_ptr<rgw::sal::Object> src_object;
   std::string dest_tenant_name, dest_bucket_name, dest_obj_name;
   std::unique_ptr<rgw::sal::Bucket> dest_bucket;
   std::unique_ptr<rgw::sal::Object> dest_object;

@@ -479,15 +479,15 @@ void dump_epoch_header(struct req_state *s, const char *name, real_time t)
   return dump_header(s, name, std::string_view(buf, len));
 }
 
-void dump_time(struct req_state *s, const char *name, real_time *t)
+void dump_time(struct req_state *s, const char *name, real_time t)
 {
   char buf[TIME_BUF_SIZE];
-  rgw_to_iso8601(*t, buf, sizeof(buf));
+  rgw_to_iso8601(t, buf, sizeof(buf));
 
   s->formatter->dump_string(name, buf);
 }
 
-void dump_owner(struct req_state *s, const rgw_user& id, string& name,
+void dump_owner(struct req_state *s, const rgw_user& id, const string& name,
 		const char *section)
 {
   if (!section)
@@ -1615,7 +1615,7 @@ int RGWListBucketMultiparts_ObjStore::get_params(optional_yield y)
   string upload_id_marker = s->info.args.get("upload-id-marker");
   if (!key_marker.empty()) {
     std::unique_ptr<rgw::sal::MultipartUpload> upload;
-    upload = store->get_multipart_upload(s->bucket.get(), key_marker,
+    upload = s->bucket->get_multipart_upload(key_marker,
 					 upload_id_marker);
     marker_meta = upload->get_meta();
     marker_key = upload->get_key();

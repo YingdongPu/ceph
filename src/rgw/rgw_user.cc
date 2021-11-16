@@ -68,7 +68,7 @@ int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::Store* stor
 
       auto& bucket = i->second;
 
-      ret = bucket->get_bucket_info(dpp, y);
+      ret = bucket->load_bucket(dpp, y);
       if (ret < 0) {
         ldpp_dout(dpp, 0) << "ERROR: could not read bucket info: bucket=" << bucket << " ret=" << ret << dendl;
         continue;
@@ -97,7 +97,7 @@ int rgw_user_sync_all_stats(const DoutPrefixProvider *dpp, rgw::sal::Store* stor
 int rgw_user_get_all_buckets_stats(const DoutPrefixProvider *dpp,
 				   rgw::sal::Store* store,
 				   rgw::sal::User* user,
-				   map<string, cls_user_bucket_entry>& buckets_usage_map,
+				   map<string, bucket_meta_entry>& buckets_usage_map,
 				   optional_yield y)
 {
   CephContext *cct = store->ctx();
@@ -118,13 +118,16 @@ int rgw_user_get_all_buckets_stats(const DoutPrefixProvider *dpp,
       marker = i.first;
 
       auto& bucket_ent = i.second;
-      ret = bucket_ent->read_bucket_stats(dpp, y);
+      ret = bucket_ent->load_bucket(dpp, y);
       if (ret < 0) {
         ldpp_dout(dpp, 0) << "ERROR: could not get bucket stats: ret=" << ret << dendl;
         return ret;
       }
-      cls_user_bucket_entry entry;
-      bucket_ent->convert(&entry);
+      bucket_meta_entry entry;
+      entry.size = bucket_ent->get_size();
+      entry.size_rounded = bucket_ent->get_size_rounded();
+      entry.creation_time = bucket_ent->get_creation_time();
+      entry.count = bucket_ent->get_count();
       buckets_usage_map.emplace(bucket_ent->get_name(), entry);
     }
     done = (buckets.count() < max_entries);
@@ -636,8 +639,9 @@ int RGWAccessKeyPool::check_op(RGWUserAdminOpState& op_state,
 
   // don't check for secret key because we may be doing a removal
 
-  check_existing_key(op_state);
-
+  if (check_existing_key(op_state)) {
+    op_state.set_access_key_exist();
+  }
   return 0;
 }
 
@@ -1178,6 +1182,11 @@ int RGWSubUserPool::add(const DoutPrefixProvider *dpp, RGWUserAdminOpState& op_s
   if (ret < 0) {
     set_err_msg(err_msg, "unable to parse request, " + subprocess_msg);
     return ret;
+  }
+
+  if (op_state.get_access_key_exist()) {
+    set_err_msg(err_msg, "cannot create existing key");
+    return -ERR_KEY_EXIST;
   }
 
   if (key_type == KEY_TYPE_S3 && op_state.get_access_key().empty()) {
@@ -1727,7 +1736,7 @@ int RGWUser::execute_rename(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
       auto& bucket = it->second;
       marker = it->first;
 
-      ret = bucket->get_bucket_info(dpp, y);
+      ret = bucket->load_bucket(dpp, y);
       if (ret < 0) {
         set_err_msg(err_msg, "failed to fetch bucket info for bucket=" + bucket->get_name());
         return ret;

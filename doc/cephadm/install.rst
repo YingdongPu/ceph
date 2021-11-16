@@ -176,7 +176,7 @@ available options.
 * By default, Ceph daemons send their log output to stdout/stderr, which is picked
   up by the container runtime (docker or podman) and (on most systems) sent to
   journald.  If you want Ceph to write traditional log files to ``/var/log/ceph/$fsid``,
-  use ``--log-to-file`` option during bootstrap.
+  use the ``--log-to-file`` option during bootstrap.
 
 * Larger Ceph clusters perform better when (external to the Ceph cluster)
   public network traffic is separated from (internal to the Ceph cluster)
@@ -316,7 +316,16 @@ available and unused device:
 
     ceph orch apply osd --all-available-devices
 
-Or See :ref:`cephadm-deploy-osds` for more detailed instructions.
+See :ref:`cephadm-deploy-osds` for more detailed instructions.
+
+In case the cluster runs on hardware that is used exclusively for
+Ceph, it is recommended to enable ``osd_memory_target_autotune``.
+See :ref:`osd_autotune`.
+
+  .. prompt:: bash #
+
+    ceph config set osd osd_memory_target_autotune true
+
 
 Using Ceph
 ==========

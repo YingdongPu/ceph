@@ -295,12 +295,13 @@ void check_bad_user_bucket_mapping(rgw::sal::Store* store, rgw::sal::User* user,
   } while (user_buckets.is_truncated());
 }
 
-// note: function type conforms to RGWRados::check_filter_t
-bool rgw_bucket_object_check_filter(const string& oid)
+// returns true if entry is in the empty namespace. note: function
+// type conforms to type RGWBucketListNameFilter
+bool rgw_bucket_object_check_filter(const std::string& oid)
 {
-  rgw_obj_key key;
-  string ns;
-  return rgw_obj_key::oid_to_key_in_ns(oid, &key, ns);
+  const static std::string empty_ns;
+  rgw_obj_key key; // thrown away but needed for parsing
+  return rgw_obj_key::oid_to_key_in_ns(oid, &key, empty_ns);
 }
 
 int rgw_remove_object(const DoutPrefixProvider *dpp, rgw::sal::Store* store, rgw::sal::Bucket* bucket, rgw_obj_key& key)
@@ -604,6 +605,7 @@ int RGWBucket::check_object_index(const DoutPrefixProvider *dpp,
   while (results.is_truncated) {
     rgw::sal::Bucket::ListParams params;
     params.marker = results.next_marker;
+    params.force_check_filter = rgw_bucket_object_check_filter;
 
     int r = bucket->list(dpp, params, listing_max_entries, results, y);
 
@@ -934,7 +936,19 @@ int RGWBucketAdminOp::link(rgw::sal::Store* store, RGWBucketAdminOpState& op_sta
 
   if (*loc_bucket != *old_bucket) {
     // like RGWRados::delete_bucket -- excepting no bucket_index work.
-    r = old_bucket->remove_metadata(dpp, &ep_data.ep_objv, null_yield);
+    r = static_cast<rgw::sal::RadosStore*>(store)->ctl()->bucket->remove_bucket_entrypoint_info(
+					old_bucket->get_key(), null_yield, dpp,
+					RGWBucketCtl::Bucket::RemoveParams()
+					.set_objv_tracker(&ep_data.ep_objv));
+    if (r < 0) {
+      set_err_msg(err, "failed to unlink old bucket " + old_bucket->get_tenant() + "/" + old_bucket->get_name());
+      return r;
+    }
+    r = static_cast<rgw::sal::RadosStore*>(store)->ctl()->bucket->remove_bucket_instance_info(
+					old_bucket->get_key(), old_bucket->get_info(),
+					null_yield, dpp,
+					RGWBucketCtl::BucketInstance::RemoveParams()
+					.set_objv_tracker(&ep_data.ep_objv));
     if (r < 0) {
       set_err_msg(err, "failed to unlink old bucket " + old_bucket->get_tenant() + "/" + old_bucket->get_name());
       return r;
@@ -1051,7 +1065,7 @@ static int bucket_stats(rgw::sal::Store* store,
 
   string bucket_ver, master_ver;
   string max_marker;
-  ret = bucket->get_bucket_stats(dpp, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, &max_marker);
+  ret = bucket->read_stats(dpp, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, &max_marker);
   if (ret < 0) {
     cerr << "error getting bucket stats bucket=" << bucket->get_name() << " ret=" << ret << std::endl;
     return ret;
@@ -1151,14 +1165,14 @@ int RGWBucketAdminOp::limit_check(rgw::sal::Store* store,
 				     * as we may now not reach the end of
 				     * the loop body */
 
-	ret = bucket->get_bucket_info(dpp, null_yield);
+	ret = bucket->load_bucket(dpp, null_yield);
 	if (ret < 0)
 	  continue;
 
 	/* need stats for num_entries */
 	string bucket_ver, master_ver;
 	std::map<RGWObjCategory, RGWStorageStats> stats;
-	ret = bucket->get_bucket_stats(dpp, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, nullptr);
+	ret = bucket->read_stats(dpp, RGW_NO_SHARD, &bucket_ver, &master_ver, stats, nullptr);
 
 	if (ret < 0)
 	  continue;
@@ -1909,6 +1923,8 @@ static void get_md5_digest(const RGWBucketEntryPoint *be, string& md5_digest) {
    f->flush(bl);
 
    MD5 hash;
+   // Allow use of MD5 digest in FIPS mode for non-cryptographic purposes
+   hash.SetFlags(EVP_MD_CTX_FLAG_NON_FIPS_ALLOW);
    hash.Update((const unsigned char *)bl.c_str(), bl.length());
    hash.Final(m);
 

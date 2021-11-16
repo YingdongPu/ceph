@@ -92,7 +92,7 @@ void dump_bucket(struct req_state *s, rgw::sal::Bucket& obj)
 {
   s->formatter->open_object_section("Bucket");
   s->formatter->dump_string("Name", obj.get_name());
-  dump_time(s, "CreationDate", &obj.get_creation_time());
+  dump_time(s, "CreationDate", obj.get_creation_time());
   s->formatter->close_section();
 }
 
@@ -1328,7 +1328,7 @@ static void dump_usage_categories_info(Formatter *formatter, const rgw_usage_log
   formatter->close_section(); // Category
 }
 
-static void dump_usage_bucket_info(Formatter *formatter, const std::string& name, const cls_user_bucket_entry& entry)
+static void dump_usage_bucket_info(Formatter *formatter, const std::string& name, const bucket_meta_entry& entry)
 {
   formatter->open_object_section("Entry");
   encode_json("Bucket", name, formatter);
@@ -1441,7 +1441,7 @@ void RGWGetUsage_ObjStore_S3::send_response()
   formatter->open_object_section("User");
   formatter->open_array_section("Buckets");
   for (const auto& biter : buckets_usage) {
-    const cls_user_bucket_entry& entry = biter.second;
+    const bucket_meta_entry& entry = biter.second;
     dump_usage_bucket_info(formatter, biter.first, entry);
   }
   formatter->close_section(); // Buckets
@@ -1601,7 +1601,7 @@ void RGWListBucket_ObjStore_S3::send_versioned_response()
       }
       s->formatter->dump_string("VersionId", version_id);
       s->formatter->dump_bool("IsLatest", iter->is_current());
-      dump_time(s, "LastModified", &iter->meta.mtime);
+      dump_time(s, "LastModified", iter->meta.mtime);
       if (!iter->is_delete_marker()) {
         s->formatter->dump_format("ETag", "\"%s\"", iter->meta.etag.c_str());
         s->formatter->dump_int("Size", iter->meta.accounted_size);
@@ -1691,7 +1691,7 @@ void RGWListBucket_ObjStore_S3::send_response()
       } else {
           s->formatter->dump_string("Key", key.name);
       }
-        dump_time(s, "LastModified", &iter->meta.mtime);
+        dump_time(s, "LastModified", iter->meta.mtime);
         s->formatter->dump_format("ETag", "\"%s\"", iter->meta.etag.c_str());
         s->formatter->dump_int("Size", iter->meta.accounted_size);
         auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
@@ -1768,7 +1768,7 @@ void RGWListBucket_ObjStore_S3v2::send_versioned_response()
       }
       s->formatter->dump_string("VersionId", version_id);
       s->formatter->dump_bool("IsLatest", iter->is_current());
-      dump_time(s, "LastModified", &iter->meta.mtime);
+      dump_time(s, "LastModified", iter->meta.mtime);
       if (!iter->is_delete_marker()) {
         s->formatter->dump_format("ETag", "\"%s\"", iter->meta.etag.c_str());
         s->formatter->dump_int("Size", iter->meta.accounted_size);
@@ -1849,7 +1849,7 @@ void RGWListBucket_ObjStore_S3v2::send_response()
       else {
         s->formatter->dump_string("Key", key.name);
       }
-      dump_time(s, "LastModified", &iter->meta.mtime);
+      dump_time(s, "LastModified", iter->meta.mtime);
       s->formatter->dump_format("ETag", "\"%s\"", iter->meta.etag.c_str());
       s->formatter->dump_int("Size", iter->meta.accounted_size);
       auto& storage_class = rgw_placement_rule::get_canonical_storage_class(iter->meta.storage_class);
@@ -2581,7 +2581,7 @@ int RGWPutObj_ObjStore_S3::get_encrypt_filter(
   int res = 0;
   if (!multipart_upload_id.empty()) {
     std::unique_ptr<rgw::sal::MultipartUpload> upload =
-      store->get_multipart_upload(s->bucket.get(), s->object->get_name(),
+      s->bucket->get_multipart_upload(s->object->get_name(),
 				  multipart_upload_id);
     std::unique_ptr<rgw::sal::Object> obj = upload->get_meta_obj();
     obj->set_in_extra_data(true);
@@ -3239,7 +3239,6 @@ int RGWCopyObj_ObjStore_S3::get_params(optional_yield y)
 
   src_tenant_name = s->src_tenant_name;
   src_bucket_name = s->src_bucket_name;
-  src_object = s->src_object->clone();
   dest_tenant_name = s->bucket->get_tenant();
   dest_bucket_name = s->bucket->get_name();
   dest_obj_name = s->object->get_name();
@@ -3269,8 +3268,8 @@ int RGWCopyObj_ObjStore_S3::get_params(optional_yield y)
   if (source_zone.empty() &&
       (dest_tenant_name.compare(src_tenant_name) == 0) &&
       (dest_bucket_name.compare(src_bucket_name) == 0) &&
-      (dest_obj_name.compare(src_object->get_name()) == 0) &&
-      src_object->get_instance().empty() &&
+      (dest_obj_name.compare(s->src_object->get_name()) == 0) &&
+      s->src_object->get_instance().empty() &&
       (attrs_mod != rgw::sal::ATTRSMOD_REPLACE)) {
     need_to_check_storage_class = true;
   }
@@ -3321,7 +3320,7 @@ void RGWCopyObj_ObjStore_S3::send_response()
     send_partial_response(0);
 
   if (op_ret == 0) {
-    dump_time(s, "LastModified", &mtime);
+    dump_time(s, "LastModified", mtime);
     if (!etag.empty()) {
       s->formatter->dump_string("ETag", std::move(etag));
     }
@@ -3847,7 +3846,7 @@ void RGWListMultipart_ObjStore_S3::send_response()
 
       s->formatter->open_object_section("Part");
 
-      dump_time(s, "LastModified", &part->get_mtime());
+      dump_time(s, "LastModified", part->get_mtime());
 
       s->formatter->dump_unsigned("PartNumber", part->get_num());
       s->formatter->dump_format("ETag", "\"%s\"", part->get_etag().c_str());
@@ -3877,7 +3876,7 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
     s->formatter->dump_string("Tenant", s->bucket_tenant);
   s->formatter->dump_string("Bucket", s->bucket_name);
   if (!prefix.empty())
-    s->formatter->dump_string("ListMultipartUploadsResult.Prefix", prefix);
+    s->formatter->dump_string("Prefix", prefix);
   if (!marker_key.empty())
     s->formatter->dump_string("KeyMarker", marker_key);
   if (!marker_upload_id.empty())
@@ -3902,20 +3901,20 @@ void RGWListBucketMultiparts_ObjStore_S3::send_response()
         s->formatter->dump_string("Key", upload->get_key());
       }
       s->formatter->dump_string("UploadId", upload->get_upload_id());
-      dump_owner(s, s->user->get_id(), s->user->get_display_name(), "Initiator");
-      dump_owner(s, s->user->get_id(), s->user->get_display_name());
+      const ACLOwner& owner = upload->get_owner();
+      dump_owner(s, owner.get_id(), owner.get_display_name(), "Initiator");
+      dump_owner(s, owner.get_id(), owner.get_display_name()); // Owner
       s->formatter->dump_string("StorageClass", "STANDARD");
-      dump_time(s, "Initiated", &upload->get_mtime());
+      dump_time(s, "Initiated", upload->get_mtime());
       s->formatter->close_section();
     }
     if (!common_prefixes.empty()) {
       s->formatter->open_array_section("CommonPrefixes");
       for (const auto& kv : common_prefixes) {
         if (encode_url) {
-          s->formatter->dump_string("CommonPrefixes.Prefix",
-                                    url_encode(kv.first, false));
+          s->formatter->dump_string("Prefix", url_encode(kv.first, false));
         } else {
-          s->formatter->dump_string("CommonPrefixes.Prefix", kv.first);
+          s->formatter->dump_string("Prefix", kv.first);
         }
       }
       s->formatter->close_section();
@@ -4024,7 +4023,7 @@ void RGWGetObjLayout_ObjStore_S3::send_response()
   }
 
   f.open_object_section("result");
-  s->object->get_obj_layout(this, s->yield, &f, s->obj_ctx);
+  s->object->dump_obj_layout(this, s->yield, &f, s->obj_ctx);
   f.close_section();
   rgw_flush_formatter(s, &f);
 }
@@ -4655,6 +4654,8 @@ int RGWHandler_REST_S3::init_from_header(rgw::sal::Store* store,
       encoded_obj_str = req.substr(pos+1);
     }
 
+    /* dang: s->bucket is never set here, since it's created with permissions.
+     * These calls will always create an object with no bucket. */
     if (!encoded_obj_str.empty()) {
       if (s->bucket) {
 	s->object = s->bucket->get_object(rgw_obj_key(encoded_obj_str, s->info.args.get("versionId")));
@@ -5024,10 +5025,10 @@ int RGWHandler_REST_S3Website::retarget(RGWOp* op, RGWOp** new_op, optional_yiel
   /*
    * FIXME: if s->object != new_obj, drop op and create a new op to handle
    * operation. Or remove this comment if it's not applicable anymore
+   * dang: This could be problematic, since we're not actually replacing op, but
+   * we are replacing s->object.  Something might have a pointer to it.
    */
-
-  s->object = store->get_object(new_obj);
-  s->object->set_bucket(s->bucket.get());
+  s->object = s->bucket->get_object(new_obj);
 
   return 0;
 }
@@ -5056,6 +5057,9 @@ int RGWHandler_REST_S3Website::serve_errordoc(const DoutPrefixProvider *dpp, int
   getop->if_unmod = NULL;
   getop->if_match = NULL;
   getop->if_nomatch = NULL;
+  /* This is okay.  It's an error, so nothing will run after this, and it can be
+   * called by abort_early(), which can be called before s->object or s->bucket
+   * are set up. Note, it won't have bucket. */
   s->object = store->get_object(errordoc_key);
 
   ret = init_permissions(getop.get(), y);
@@ -5408,33 +5412,7 @@ AWSGeneralAbstractor::get_auth_data_v4(const req_state* const s,
     throw -EPERM;
   }
 
-  bool is_non_s3_op = false;
-  if (s->op_type == RGW_STS_GET_SESSION_TOKEN ||
-      s->op_type == RGW_STS_ASSUME_ROLE ||
-      s->op_type == RGW_STS_ASSUME_ROLE_WEB_IDENTITY ||
-      s->op_type == RGW_OP_CREATE_ROLE ||
-      s->op_type == RGW_OP_DELETE_ROLE ||
-      s->op_type == RGW_OP_GET_ROLE ||
-      s->op_type == RGW_OP_MODIFY_ROLE ||
-      s->op_type == RGW_OP_LIST_ROLES ||
-      s->op_type == RGW_OP_PUT_ROLE_POLICY ||
-      s->op_type == RGW_OP_GET_ROLE_POLICY ||
-      s->op_type == RGW_OP_LIST_ROLE_POLICIES ||
-      s->op_type == RGW_OP_DELETE_ROLE_POLICY ||
-      s->op_type == RGW_OP_PUT_USER_POLICY ||
-      s->op_type == RGW_OP_GET_USER_POLICY ||
-      s->op_type == RGW_OP_LIST_USER_POLICIES ||
-      s->op_type == RGW_OP_DELETE_USER_POLICY ||
-      s->op_type == RGW_OP_CREATE_OIDC_PROVIDER ||
-      s->op_type == RGW_OP_DELETE_OIDC_PROVIDER ||
-      s->op_type == RGW_OP_GET_OIDC_PROVIDER ||
-      s->op_type == RGW_OP_LIST_OIDC_PROVIDERS ||
-      s->op_type == RGW_OP_PUBSUB_TOPIC_CREATE ||
-      s->op_type == RGW_OP_PUBSUB_TOPICS_LIST ||
-      s->op_type == RGW_OP_PUBSUB_TOPIC_GET ||
-      s->op_type == RGW_OP_PUBSUB_TOPIC_DELETE) {
-    is_non_s3_op = true;
-  }
+  bool is_non_s3_op = rgw::auth::s3::is_non_s3_op(s->op_type);
 
   const char* exp_payload_hash = nullptr;
   string payload_hash;
@@ -5948,7 +5926,8 @@ rgw::auth::s3::LocalEngine::authenticate(
     return result_t::deny(-ERR_SIGNATURE_NO_MATCH);
   }
 
-  auto apl = apl_factory->create_apl_local(cct, s, user->get_info(), k.subuser, boost::none);
+  auto apl = apl_factory->create_apl_local(cct, s, user->get_info(),
+                                           k.subuser, std::nullopt);
   return result_t::grant(std::move(apl), completer_factory(k.key));
 }
 
@@ -6084,6 +6063,7 @@ rgw::auth::s3::STSEngine::authenticate(
   rgw_user user_id;
   string role_id;
   rgw::auth::RoleApplier::Role r;
+  rgw::auth::RoleApplier::TokenAttrs t_attrs;
   if (! token.roleId.empty()) {
     std::unique_ptr<rgw::sal::RGWRole> role = store->get_role(token.roleId);
     if (role->get_by_id(dpp, y) < 0) {
@@ -6100,8 +6080,6 @@ rgw::auth::s3::STSEngine::authenticate(
         r.role_policies.push_back(std::move(perm_policy));
       }
     }
-    // This is mostly needed to assign the owner of a bucket during its creation
-    user_id = token.user;
   }
 
   user = store->get_user(token.user);
@@ -6119,7 +6097,13 @@ rgw::auth::s3::STSEngine::authenticate(
                                             get_creds_info(token));
     return result_t::grant(std::move(apl), completer_factory(token.secret_access_key));
   } else if (token.acct_type == TYPE_ROLE) {
-    auto apl = role_apl_factory->create_apl_role(cct, s, r, user_id, token.policy, token.role_session, token.token_claims, token.issued_at);
+    t_attrs.user_id = std::move(token.user); // This is mostly needed to assign the owner of a bucket during its creation
+    t_attrs.token_policy = std::move(token.policy);
+    t_attrs.role_session_name = std::move(token.role_session);
+    t_attrs.token_claims = std::move(token.token_claims);
+    t_attrs.token_issued_at = std::move(token.issued_at);
+    t_attrs.principal_tags = std::move(token.principal_tags);
+    auto apl = role_apl_factory->create_apl_role(cct, s, r, t_attrs);
     return result_t::grant(std::move(apl), completer_factory(token.secret_access_key));
   } else { // This is for all local users of type TYPE_RGW or TYPE_NONE
     string subuser;

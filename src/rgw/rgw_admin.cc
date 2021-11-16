@@ -242,6 +242,7 @@ void usage()
   cout << "  mdlog status               read metadata log status\n";
   cout << "  bilog list                 list bucket index log\n";
   cout << "  bilog trim                 trim bucket index log (use start-marker, end-marker)\n";
+  cout << "  mdlog autotrim             auto trim metadata log\n";
   cout << "  bilog status               read bucket index log status\n";
   cout << "  datalog list               list data log\n";
   cout << "  datalog trim               trim data log\n";
@@ -252,14 +253,14 @@ void usage()
   cout << "  orphans list-jobs          deprecated -- list the current job-ids for orphans search\n";
   cout << "                           * the three 'orphans' sub-commands are now deprecated; consider using the `rgw-orphan-list` tool\n";
   cout << "  role create                create a AWS role for use with STS\n";
-  cout << "  role rm                    remove a role\n";
+  cout << "  role delete                remove a role\n";
   cout << "  role get                   get a role\n";
   cout << "  role list                  list roles with specified path prefix\n";
   cout << "  role modify                modify the assume role policy of an existing role\n";
   cout << "  role-policy put            add/update permission policy to role\n";
   cout << "  role-policy list           list policies attached to a role\n";
   cout << "  role-policy get            get the specified inline policy document embedded with the given role\n";
-  cout << "  role-policy rm             remove policy attached to a role\n";
+  cout << "  role-policy delete         remove policy attached to a role\n";
   cout << "  reshard add                schedule a resharding of a bucket\n";
   cout << "  reshard list               list all bucket resharding or scheduled to be resharded\n";
   cout << "  reshard status             read bucket resharding status\n";
@@ -385,6 +386,7 @@ void usage()
   cout << "   --sync-stats              option to 'user stats', update user stats with current\n";
   cout << "                             stats reported by user's buckets indexes\n";
   cout << "   --reset-stats             option to 'user stats', reset stats in accordance with user buckets\n";
+  cout << "   --show-config             show configuration\n";
   cout << "   --show-log-entries=<flag> enable/disable dump of log entries on log show\n";
   cout << "   --show-log-sum=<flag>     enable/disable dump of log summation on log show\n";
   cout << "   --skip-zero-entries       log show only dumps entries that don't have zero value\n";
@@ -1144,12 +1146,7 @@ static int init_bucket(rgw::sal::User* user,
 		       const string& bucket_id,
                        std::unique_ptr<rgw::sal::Bucket>* bucket)
 {
-  rgw_bucket b;
-  b.tenant = tenant_name;
-  b.name = bucket_name;
-  if (!bucket_id.empty()) {
-    b.bucket_id = bucket_name + ":" + bucket_id;
-  }
+  rgw_bucket b{tenant_name, bucket_name, bucket_id};
   return init_bucket(user, b, bucket);
 }
 
@@ -6847,12 +6844,13 @@ next:
 
     std::unique_ptr<rgw::sal::Bucket> cur_bucket;
     ret = init_bucket(user.get(), tenant, bucket_name, string(), &cur_bucket);
-    if (ret < 0) {
+    if (ret == -ENOENT) {
+      // no bucket entrypoint
+    } else if (ret < 0) {
       cerr << "ERROR: could not init current bucket info for bucket_name=" << bucket_name << ": " << cpp_strerror(-ret) << std::endl;
       return -ret;
-    }
-
-    if (cur_bucket->get_bucket_id() == bucket->get_bucket_id() && !yes_i_really_mean_it) {
+    } else if (cur_bucket->get_bucket_id() == bucket->get_bucket_id() &&
+               !yes_i_really_mean_it) {
       cerr << "specified bucket instance points to a current bucket instance" << std::endl;
       cerr << "do you really mean it? (requires --yes-i-really-mean-it)" << std::endl;
       return EINVAL;
@@ -9560,7 +9558,7 @@ next:
       cerr << "ERROR: lua package name was not provided (via --package)" << std::endl;
       return EINVAL;
     }
-    const auto rc = rgw::lua::add_package(dpp(), store, null_yield, *script_package, bool(allow_compilation));
+    const auto rc = rgw::lua::add_package(dpp(), static_cast<rgw::sal::RadosStore*>(store), null_yield, *script_package, bool(allow_compilation));
     if (rc < 0) {
       cerr << "ERROR: failed to add lua package: " << script_package << " .error: " << rc << std::endl;
       return -rc;
@@ -9577,7 +9575,7 @@ next:
       cerr << "ERROR: lua package name was not provided (via --package)" << std::endl;
       return EINVAL;
     }
-    const auto rc = rgw::lua::remove_package(dpp(), store, null_yield, *script_package);
+    const auto rc = rgw::lua::remove_package(dpp(), static_cast<rgw::sal::RadosStore*>(store), null_yield, *script_package);
     if (rc == -ENOENT) {
       cerr << "WARNING: package " << script_package << " did not exists or already removed" << std::endl;
       return 0;
@@ -9595,7 +9593,7 @@ next:
   if (opt_cmd == OPT::SCRIPT_PACKAGE_LIST) {
 #ifdef WITH_RADOSGW_LUA_PACKAGES
     rgw::lua::packages_t packages;
-    const auto rc = rgw::lua::list_packages(dpp(), store, null_yield, packages);
+    const auto rc = rgw::lua::list_packages(dpp(), static_cast<rgw::sal::RadosStore*>(store), null_yield, packages);
     if (rc == -ENOENT) {
       std::cout << "no lua packages in allowlist" << std::endl;
     } else if (rc < 0) {

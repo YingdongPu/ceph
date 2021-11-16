@@ -1095,6 +1095,8 @@ ceph_add_mds_perf_query(BaseMgrModule *self, PyObject *args)
     {"opened_files", MDSPerformanceCounterType::OPENED_FILES_METRIC},
     {"pinned_icaps", MDSPerformanceCounterType::PINNED_ICAPS_METRIC},
     {"opened_inodes", MDSPerformanceCounterType::OPENED_INODES_METRIC},
+    {"read_io_sizes", MDSPerformanceCounterType::READ_IO_SIZES_METRIC},
+    {"write_io_sizes", MDSPerformanceCounterType::WRITE_IO_SIZES_METRIC},
   };
 
   PyObject *py_query = nullptr;
@@ -1263,11 +1265,7 @@ ceph_add_mds_perf_query(BaseMgrModule *self, PyObject *args)
           }
           limit->order_by = it->second;
         } else if (limit_param_name == NAME_LIMIT_MAX_COUNT) {
-#if PY_MAJOR_VERSION <= 2
-          if (!PyInt_Check(limit_param_val) && !PyLong_Check(limit_param_val)) {
-#else
           if (!PyLong_Check(limit_param_val)) {
-#endif
             derr << __func__ << " " << limit_param_name << " not an int"
                  << dendl;
             Py_RETURN_NONE;

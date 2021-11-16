@@ -103,6 +103,12 @@ public:
     Transaction &t,
     CachedExtentRef extent) final;
 
+  update_le_mapping_ret update_mapping(
+    Transaction& t,
+    laddr_t laddr,
+    paddr_t prev_addr,
+    paddr_t paddr) final;
+
   get_physical_extent_if_live_ret get_physical_extent_if_live(
     Transaction &t,
     extent_types_t type,
@@ -124,11 +130,13 @@ private:
   btree_pin_set_t pin_set;
 
   op_context_t get_context(Transaction &t) {
-    return op_context_t{cache, pin_set, t};
+    return op_context_t{cache, t, &pin_set};
   }
 
   static btree_range_pin_t &get_pin(CachedExtent &e);
 
+  seastar::metrics::metric_group metrics;
+  void register_metrics();
   template <typename F, typename... Args>
   auto with_btree(
     op_context_t c,

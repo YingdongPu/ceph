@@ -1255,9 +1255,10 @@ struct pg_pool_t {
     FLAG_SELFMANAGED_SNAPS = 1<<13, // pool uses selfmanaged snaps
     FLAG_POOL_SNAPS = 1<<14,        // pool has pool snaps
     FLAG_CREATING = 1<<15,          // initial pool PGs are being created
+    FLAG_EIO = 1<<16,               // return EIO for all client ops
   };
 
-  static const char *get_flag_name(int f) {
+  static const char *get_flag_name(uint64_t f) {
     switch (f) {
     case FLAG_HASHPSPOOL: return "hashpspool";
     case FLAG_FULL: return "full";
@@ -1275,6 +1276,7 @@ struct pg_pool_t {
     case FLAG_SELFMANAGED_SNAPS: return "selfmanaged_snaps";
     case FLAG_POOL_SNAPS: return "pool_snaps";
     case FLAG_CREATING: return "creating";
+    case FLAG_EIO: return "eio";
     default: return "???";
     }
   }
@@ -1325,6 +1327,8 @@ struct pg_pool_t {
       return FLAG_POOL_SNAPS;
     if (name == "creating")
       return FLAG_CREATING;
+    if (name == "eio")
+      return FLAG_EIO;
     return 0;
   }
 
@@ -2175,6 +2179,28 @@ inline bool operator==(const object_stat_collection_t& l,
   return l.sum == r.sum;
 }
 
+enum class scrub_level_t : bool { shallow = false, deep = true };
+enum class scrub_type_t : bool { not_repair = false, do_repair = true };
+
+/// is there a scrub in our future?
+enum class pg_scrub_sched_status_t : uint16_t {
+  unknown,         ///< status not reported yet
+  not_queued,	   ///< not in the OSD's scrub queue. Probably not active.
+  active,          ///< scrubbing
+  scheduled,	   ///< scheduled for a scrub at an already determined time
+  queued	   ///< queued to be scrubbed
+};
+
+struct pg_scrubbing_status_t {
+  utime_t m_scheduled_at{};
+  int32_t m_duration_seconds{0}; // relevant when scrubbing
+  pg_scrub_sched_status_t m_sched_status{pg_scrub_sched_status_t::unknown};
+  bool m_is_active{false};
+  scrub_level_t m_is_deep{scrub_level_t::shallow};
+  bool m_is_periodic{true};
+};
+
+bool operator==(const pg_scrubbing_status_t& l, const pg_scrubbing_status_t& r);
 
 /** pg_stat
  * aggregate stats for a single PG.
@@ -2209,6 +2235,7 @@ struct pg_stat_t {
   utime_t last_scrub_stamp;
   utime_t last_deep_scrub_stamp;
   utime_t last_clean_scrub_stamp;
+  int32_t last_scrub_duration{0};
 
   object_stat_collection_t stats;
 
@@ -2232,8 +2259,10 @@ struct pg_stat_t {
   int32_t acting_primary;
 
   // snaptrimq.size() is 64bit, but let's be serious - anything over 50k is
-  // absurd already, so cap it to 2^32 and save 4 bytes at  the same time
+  // absurd already, so cap it to 2^32 and save 4 bytes at the same time
   uint32_t snaptrimq_len;
+
+  pg_scrubbing_status_t scrub_sched_status;
 
   bool stats_invalid:1;
   /// true if num_objects_dirty is not accurate (because it was not
@@ -2322,6 +2351,7 @@ struct pg_stat_t {
   bool is_acting_osd(int32_t osd, bool primary) const;
   void dump(ceph::Formatter *f) const;
   void dump_brief(ceph::Formatter *f) const;
+  std::string dump_scrub_schedule() const;
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   static void generate_test_instances(std::list<pg_stat_t*>& o);
@@ -5912,6 +5942,28 @@ struct object_info_t {
     auto p = std::cbegin(bl);
     decode(p);
   }
+
+  void encode_no_oid(ceph::buffer::list& bl, uint64_t features) {
+    // TODO: drop soid field and remove the denc no_oid methods
+    auto tmp_oid = hobject_t(hobject_t::get_max());
+    tmp_oid.swap(soid);
+    encode(bl, features);
+    soid = tmp_oid;
+  }
+  void decode_no_oid(ceph::buffer::list::const_iterator& bl) {
+    decode(bl);
+    ceph_assert(soid.is_max());
+  }
+  void decode_no_oid(const ceph::buffer::list& bl) {
+    auto p = std::cbegin(bl);
+    decode_no_oid(p);
+  }
+  void decode_no_oid(const ceph::buffer::list& bl, const hobject_t& _soid) {
+    auto p = std::cbegin(bl);
+    decode_no_oid(p);
+    soid = _soid;
+  }
+
   void dump(ceph::Formatter *f) const;
   static void generate_test_instances(std::list<object_info_t*>& o);
 
@@ -5934,6 +5986,11 @@ struct object_info_t {
 
   explicit object_info_t(const ceph::buffer::list& bl) {
     decode(bl);
+  }
+
+  explicit object_info_t(const ceph::buffer::list& bl, const hobject_t& _soid) {
+    decode_no_oid(bl);
+    soid = _soid;
   }
 };
 WRITE_CLASS_ENCODER_FEATURES(object_info_t)
@@ -6047,9 +6104,6 @@ struct PushOp {
 };
 WRITE_CLASS_ENCODER_FEATURES(PushOp)
 std::ostream& operator<<(std::ostream& out, const PushOp &op);
-
-enum class scrub_level_t : bool { shallow = false, deep = true };
-enum class scrub_type_t : bool { not_repair = false, do_repair = true };
 
 /*
  * summarize pg contents for purposes of a scrub

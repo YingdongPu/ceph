@@ -20,10 +20,10 @@
 #include "common/config.h"
 #include "OSD.h"
 #include "OpRequest.h"
-#include "ScrubStore.h"
-#include "pg_scrubber.h"
-#include "Session.h"
+#include "osd/scrubber/ScrubStore.h"
+#include "osd/scrubber/pg_scrubber.h"
 #include "osd/scheduler/OpSchedulerItem.h"
+#include "Session.h"
 
 #include "common/Timer.h"
 #include "common/perf_counters.h"
@@ -818,10 +818,17 @@ void PG::publish_stats_to_osd()
   if (!is_primary())
     return;
 
+  if (m_scrubber) {
+    recovery_state.update_stats_wo_resched(
+      [scrubber = m_scrubber.get()](pg_history_t& hist,
+                                    pg_stat_t& info) mutable -> void {
+        info.scrub_sched_status = scrubber->get_schedule();
+      });
+  }
+
   std::lock_guard l{pg_stats_publish_lock};
-  auto stats = recovery_state.prepare_stats_for_publish(
-    pg_stats_publish,
-    unstable_stats);
+  auto stats =
+    recovery_state.prepare_stats_for_publish(pg_stats_publish, unstable_stats);
   if (stats) {
     pg_stats_publish = std::move(stats);
   }
@@ -1324,26 +1331,22 @@ unsigned int PG::scrub_requeue_priority(Scrub::scrub_prio_t with_priority, unsig
  *  Unless failing to start scrubbing, the 'planned scrub' flag-set is 'frozen' into
  *  PgScrubber's m_flags, then cleared.
  */
-bool PG::sched_scrub()
+Scrub::schedule_result_t PG::sched_scrub()
 {
   dout(15) << __func__ << " pg(" << info.pgid
 	  << (is_active() ? ") <active>" : ") <not-active>")
 	  << (is_clean() ? " <clean>" : " <not-clean>") << dendl;
   ceph_assert(ceph_mutex_is_locked(_lock));
 
-  if (m_scrubber && m_scrubber->is_scrub_active()) {
-    return false;
-  }
-  
   if (!is_primary() || !is_active() || !is_clean()) {
-    return false;
+    return Scrub::schedule_result_t::bad_pg_state;
   }
 
   if (scrub_queued) {
     // only applicable to the very first time a scrub event is queued
     // (until handled and posted to the scrub FSM)
     dout(10) << __func__ << ": already queued" << dendl;
-    return false;
+    return Scrub::schedule_result_t::already_started;
   }
 
   // analyse the combination of the requested scrub flags, the osd/pool configuration
@@ -1355,14 +1358,14 @@ bool PG::sched_scrub()
     // (due to configuration or priority issues)
     // The reason was already reported by the callee.
     dout(10) << __func__ << ": failed to initiate a scrub" << dendl;
-    return false;
+    return Scrub::schedule_result_t::preconditions;
   }
 
   // try to reserve the local OSD resources. If failing: no harm. We will
   // be retried by the OSD later on.
   if (!m_scrubber->reserve_local()) {
     dout(10) << __func__ << ": failed to reserve locally" << dendl;
-    return false;
+    return Scrub::schedule_result_t::no_local_resources;
   }
 
   // can commit to the updated flags now, as nothing will stop the scrub
@@ -1379,7 +1382,7 @@ bool PG::sched_scrub()
 
   scrub_queued = true;
   osd->queue_for_scrub(this, Scrub::scrub_prio_t::low_priority);
-  return true;
+  return Scrub::schedule_result_t::scrub_initiated;
 }
 
 double PG::next_deepscrub_interval() const
@@ -1482,15 +1485,20 @@ bool PG::verify_periodic_scrub_mode(bool allow_deep_scrub,
 
 std::optional<requested_scrub_t> PG::verify_scrub_mode() const
 {
-  dout(10) << __func__ << " processing pg " << info.pgid << dendl;
-
-  bool allow_deep_scrub = !(get_osdmap()->test_flag(CEPH_OSDMAP_NODEEP_SCRUB) ||
-			    pool.info.has_flag(pg_pool_t::FLAG_NODEEP_SCRUB));
   bool allow_regular_scrub = !(get_osdmap()->test_flag(CEPH_OSDMAP_NOSCRUB) ||
-			       pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB));
+                               pool.info.has_flag(pg_pool_t::FLAG_NOSCRUB));
+  bool allow_deep_scrub = allow_regular_scrub &&
+                          !(get_osdmap()->test_flag(CEPH_OSDMAP_NODEEP_SCRUB) ||
+                            pool.info.has_flag(pg_pool_t::FLAG_NODEEP_SCRUB));
   bool has_deep_errors = (info.stats.stats.sum.num_deep_scrub_errors > 0);
-  bool try_to_auto_repair =
-    (cct->_conf->osd_scrub_auto_repair && get_pgbackend()->auto_repair_supported());
+  bool try_to_auto_repair = (cct->_conf->osd_scrub_auto_repair &&
+                             get_pgbackend()->auto_repair_supported());
+
+  dout(10) << __func__ << " pg: " << info.pgid
+           << " allow: " << allow_regular_scrub << "/" << allow_deep_scrub
+           << " deep errs: " << has_deep_errors
+           << " auto-repair: " << try_to_auto_repair << " ("
+           << cct->_conf->osd_scrub_auto_repair << ")" << dendl;
 
   auto upd_flags = m_planned_scrub;
 
@@ -1532,17 +1540,37 @@ std::optional<requested_scrub_t> PG::verify_scrub_mode() const
   return upd_flags;
 }
 
-void PG::reg_next_scrub()
-{
-  m_scrubber->reg_next_scrub(m_planned_scrub);
-}
-
+/*
+ * Note: on_info_history_change() is used in those two cases where we're not sure
+ * whether the role of the PG was changed, and if so - was this change relayed to the
+ * scrub-queue.
+ */
 void PG::on_info_history_change()
 {
-  dout(20) << __func__ << dendl;
+  dout(20) << __func__ << " for a " << (is_primary() ? "Primary" : "non-primary") <<dendl;
+
   if (m_scrubber) {
-    m_scrubber->unreg_next_scrub();
-    m_scrubber->reg_next_scrub(m_planned_scrub);
+    m_scrubber->on_maybe_registration_change(m_planned_scrub);
+  }
+}
+
+void PG::reschedule_scrub()
+{
+  dout(20) << __func__ << " for a " << (is_primary() ? "Primary" : "non-primary") <<dendl;
+
+  // we are assuming no change in primary status
+  if (is_primary() && m_scrubber) {
+    m_scrubber->update_scrub_job(m_planned_scrub);
+  }
+}
+
+void PG::on_primary_status_change(bool was_primary, bool now_primary)
+{
+  // make sure we have a working scrubber when becoming a primary
+  ceph_assert(m_scrubber || !now_primary);
+
+  if ((was_primary != now_primary) && m_scrubber) {
+    m_scrubber->on_primary_change(m_planned_scrub);
   }
 }
 
@@ -1575,6 +1603,9 @@ void PG::on_new_interval() {
   scrub_queued = false;
   projected_last_update = eversion_t();
   cancel_recovery();
+  if (m_scrubber) {
+    m_scrubber->on_maybe_registration_change(m_planned_scrub);
+  }
 }
 
 epoch_t PG::oldest_stored_osdmap() {
@@ -2079,6 +2110,23 @@ void PG::forward_scrub_event(ScrubAPI fn, epoch_t epoch_queued, std::string_view
   }
 }
 
+void PG::forward_scrub_event(ScrubSafeAPI fn,
+			     epoch_t epoch_queued,
+			     Scrub::act_token_t act_token,
+			     std::string_view desc)
+{
+  dout(20) << __func__ << ": " << desc << " queued: " << epoch_queued
+	   << " token: " << act_token << dendl;
+  if (is_active() && m_scrubber) {
+    ((*m_scrubber).*fn)(epoch_queued, act_token);
+  } else {
+    // pg might be in the process of being deleted
+    dout(5) << __func__ << " refusing to forward. "
+	    << (is_clean() ? "(clean) " : "(not clean) ")
+	    << (is_active() ? "(active) " : "(not active) ") << dendl;
+  }
+}
+
 void PG::replica_scrub(OpRequestRef op, ThreadPool::TPHandle& handle)
 {
   dout(10) << __func__ << " (op)" << dendl;
@@ -2087,12 +2135,14 @@ void PG::replica_scrub(OpRequestRef op, ThreadPool::TPHandle& handle)
 }
 
 void PG::replica_scrub(epoch_t epoch_queued,
+		       Scrub::act_token_t act_token,
 		       [[maybe_unused]] ThreadPool::TPHandle& handle)
 {
   dout(10) << __func__ << " queued at: " << epoch_queued
 	   << (is_primary() ? " (primary)" : " (replica)") << dendl;
   scrub_queued = false;
-  forward_scrub_event(&ScrubPgIF::send_start_replica, epoch_queued, "StartReplica/nw");
+  forward_scrub_event(&ScrubPgIF::send_start_replica, epoch_queued, act_token,
+		      "StartReplica/nw");
 }
 
 bool PG::ops_blocked_by_scrub() const
@@ -2495,12 +2545,6 @@ void PG::handle_query_state(Formatter *f)
   dout(10) << "handle_query_state" << dendl;
   PeeringState::QueryState q(f);
   recovery_state.handle_event(q, 0);
-
-  // This code has moved to after the close of recovery_state array.
-  // I don't think that scrub is a recovery state
-  if (is_primary() && is_active() && m_scrubber && m_scrubber->is_scrub_active()) {
-    m_scrubber->handle_query_state(f);
-  }
 }
 
 void PG::init_collection_pool_opts()
@@ -2539,7 +2583,7 @@ std::pair<ghobject_t, bool> PG::do_delete_work(
       epoch_t e = get_osdmap()->get_epoch();
       PGRef pgref(this);
       auto delete_requeue_callback = new LambdaContext([this, pgref, e](int r) {
-        dout(20) << __func__ << " wake up at "
+        dout(20) << "do_delete_work() [cb] wake up at "
                  << ceph_clock_now()
 	         << ", re-queuing delete" << dendl;
         std::scoped_lock locker{*this};

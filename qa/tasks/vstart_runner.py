@@ -56,7 +56,7 @@ from teuthology.orchestra.remote import Remote
 from teuthology.config import config as teuth_config
 from teuthology.contextutil import safe_while
 from teuthology.contextutil import MaxWhileTries
-from teuthology.orchestra.run import CommandFailedError
+from teuthology.exceptions import CommandFailedError
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -996,10 +996,13 @@ class LocalCluster(object):
 
 class LocalContext(object):
     def __init__(self):
-        self.config = {}
+        self.config = {'cluster': 'ceph'}
         self.teuthology_config = teuth_config
         self.cluster = LocalCluster()
         self.daemons = DaemonGroup()
+        if not hasattr(self, 'managers'):
+            self.managers = {}
+        self.managers[self.config['cluster']] = LocalCephManager()
 
         # Shove some LocalDaemons into the ctx.daemons DaemonGroup instance so that any
         # tests that want to look these up via ctx can do so.
