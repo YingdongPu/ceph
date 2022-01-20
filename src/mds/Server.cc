@@ -2063,7 +2063,9 @@ void Server::perf_gather_op_latency(const cref_t<MClientRequest> &req, utime_t l
   case CEPH_MDS_OP_RENAMESNAP:
     code = l_mdss_req_renamesnap_latency;
     break;
-  default: ceph_abort();
+  default:
+    dout(1) << ": unknown client op" << dendl;
+    return;
   }
   logger->tinc(code, lat);   
 }
@@ -2529,7 +2531,7 @@ void Server::dispatch_client_request(MDRequestRef& mdr)
   if (is_full) {
     CInode *cur = try_get_auth_inode(mdr, req->get_filepath().get_ino());
     if (!cur) {
-      respond_to_request(mdr, -EINVAL);
+      // the request is already responded to
       return;
     }
     if (req->get_op() == CEPH_MDS_OP_SETLAYOUT ||
@@ -6690,6 +6692,7 @@ void Server::handle_client_link(MDRequestRef& mdr)
   if (targeti->get_projected_inode()->nlink == 0) {
     dout(7) << "target has no link, failing..." << dendl;
     respond_to_request(mdr, -CEPHFS_ENOENT);
+    return;
   }
 
   if ((!mdr->has_more() || mdr->more()->witnessed.empty())) {
@@ -8240,10 +8243,10 @@ void Server::handle_client_rename(MDRequestRef& mdr)
     if (!check_access(mdr, destdn->get_dir()->get_inode(), MAY_WRITE))
       return;
 
-    if (!check_fragment_space(mdr, destdn->get_dir()))
+    if (!linkmerge && !check_fragment_space(mdr, destdn->get_dir()))
       return;
 
-    if (!check_dir_max_entries(mdr, destdn->get_dir()))
+    if (!linkmerge && !check_dir_max_entries(mdr, destdn->get_dir()))
       return;
 
     if (!check_access(mdr, srci, MAY_WRITE))

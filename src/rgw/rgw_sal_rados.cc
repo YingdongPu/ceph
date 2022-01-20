@@ -29,10 +29,12 @@
 #include "rgw_acl_s3.h"
 #include "rgw_aio.h"
 #include "rgw_aio_throttle.h"
+#include "rgw_tracer.h"
 
 #include "rgw_zone.h"
 #include "rgw_rest_conn.h"
 #include "rgw_service.h"
+#include "rgw_lc.h"
 #include "services/svc_sys_obj.h"
 #include "services/svc_zone.h"
 #include "services/svc_tier_rados.h"
@@ -50,24 +52,6 @@ using namespace std;
 static string mp_ns = RGW_OBJ_NS_MULTIPART;
 
 namespace rgw::sal {
-
-struct multipart_upload_info
-{
-  rgw_placement_rule dest_placement;
-
-  void encode(bufferlist& bl) const {
-    ENCODE_START(1, 1, bl);
-    encode(dest_placement, bl);
-    ENCODE_FINISH(bl);
-  }
-
-  void decode(bufferlist::const_iterator& bl) {
-    DECODE_START(1, bl);
-    decode(dest_placement, bl);
-    DECODE_FINISH(bl);
-  }
-};
-WRITE_CLASS_ENCODER(multipart_upload_info)
 
 // default number of entries to list with each bucket listing call
 // (use marker to bridge between calls)
@@ -300,6 +284,14 @@ int RadosUser::read_attrs(const DoutPrefixProvider* dpp, optional_yield y)
   return store->ctl()->user->get_attrs_by_uid(dpp, get_id(), &attrs, y, &objv_tracker);
 }
 
+int RadosUser::merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y)
+{
+  for(auto& it : new_attrs) {
+	  attrs[it.first] = it.second;
+  }
+  return store_user(dpp, y, false);
+}
+
 int RadosUser::read_stats(const DoutPrefixProvider *dpp,
                              optional_yield y, RGWStorageStats* stats,
 			     ceph::real_time* last_stats_sync,
@@ -360,17 +352,17 @@ RadosBucket::~RadosBucket() {}
 
 int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
 			       bool delete_children,
-			       std::string prefix,
-			       std::string delimiter,
 			       bool forward_to_master,
-			       req_info* req_info, optional_yield y)
+			       req_info* req_info,
+			       optional_yield y)
 {
   int ret;
 
   // Refresh info
   ret = load_bucket(dpp, y);
-  if (ret < 0)
+  if (ret < 0) {
     return ret;
+  }
 
   ListParams params;
   params.list_versions = true;
@@ -382,8 +374,9 @@ int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
     results.objs.clear();
 
     ret = list(dpp, params, 1000, results, y);
-    if (ret < 0)
+    if (ret < 0) {
       return ret;
+    }
 
     if (!results.objs.empty() && !delete_children) {
       ldpp_dout(dpp, -1) << "ERROR: could not remove non-empty bucket " << info.bucket.name <<
@@ -401,15 +394,16 @@ int RadosBucket::remove_bucket(const DoutPrefixProvider* dpp,
     }
   } while(results.is_truncated);
 
-  /* If there's a prefix, then we are aborting multiparts as well */
-  if (!prefix.empty()) {
-    ret = abort_multiparts(dpp, store->ctx(), prefix, delimiter);
-    if (ret < 0) {
-      return ret;
-    }
+  ret = abort_multiparts(dpp, store->ctx());
+  if (ret < 0) {
+    return ret;
   }
 
-  ret = store->ctl()->bucket->sync_user_stats(dpp, info.owner, info, y);
+  // remove lifecycle config, if any (XXX note could be made generic)
+  (void) store->getRados()->get_lc()->remove_bucket_config(
+    this, get_attrs());
+
+  ret = store->ctl()->bucket->sync_user_stats(dpp, info.owner, info, y, nullptr);
   if (ret < 0) {
      ldout(store->ctx(), 1) << "WARNING: failed sync user stats before bucket delete. ret=" <<  ret << dendl;
   }
@@ -476,9 +470,7 @@ int RadosBucket::remove_bucket_bypass_gc(int concurrent_max, bool
   if (ret < 0)
     return ret;
 
-  string prefix, delimiter;
-
-  ret = abort_multiparts(dpp, cct, prefix, delimiter);
+  ret = abort_multiparts(dpp, cct);
   if (ret < 0) {
     return ret;
   }
@@ -560,8 +552,8 @@ int RadosBucket::remove_bucket_bypass_gc(int concurrent_max, bool
         max_aio = concurrent_max;
       }
       obj_ctx.invalidate(obj->get_obj());
-    } // for all RGW objects
-  }
+    } // for all RGW objects in results
+  } // while is_truncated
 
   ret = handles->drain();
   if (ret < 0) {
@@ -579,7 +571,7 @@ int RadosBucket::remove_bucket_bypass_gc(int concurrent_max, bool
   // this function can only be run if caller wanted children to be
   // deleted, so we can ignore the check for children as any that
   // remain are detritus from a prior bug
-  ret = remove_bucket(dpp, true, std::string(), std::string(), false, nullptr, y);
+  ret = remove_bucket(dpp, true, false, nullptr, y);
   if (ret < 0) {
     ldpp_dout(dpp, -1) << "ERROR: could not remove bucket " << this << dendl;
     return ret;
@@ -588,7 +580,7 @@ int RadosBucket::remove_bucket_bypass_gc(int concurrent_max, bool
   return ret;
 }
 
-int RadosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y)
+int RadosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y, bool get_stats)
 {
   auto obj_ctx = store->svc()->sysobj->init_obj_ctx();
   int ret;
@@ -615,7 +607,9 @@ int RadosBucket::load_bucket(const DoutPrefixProvider* dpp, optional_yield y)
 
   bucket_version = ep_ot.read_version;
 
-  ret = store->ctl()->bucket->read_bucket_stats(info.bucket, &ent, y, dpp);
+  if (get_stats) {
+    ret = store->ctl()->bucket->read_bucket_stats(info.bucket, &ent, y, dpp);
+  }
 
   return ret;
 }
@@ -635,7 +629,7 @@ int RadosBucket::read_stats_async(const DoutPrefixProvider *dpp, int shard_id, R
 
 int RadosBucket::sync_user_stats(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  return store->ctl()->bucket->sync_user_stats(dpp, owner->get_id(), info, y);
+  return store->ctl()->bucket->sync_user_stats(dpp, owner->get_id(), info, y, &ent);
 }
 
 int RadosBucket::update_container_stats(const DoutPrefixProvider* dpp)
@@ -743,7 +737,9 @@ int RadosBucket::check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_q
 
 int RadosBucket::merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y)
 {
-  Bucket::merge_and_store_attrs(dpp, new_attrs, y);
+  for(auto& it : new_attrs) {
+	  attrs[it.first] = it.second;
+  }
   return store->ctl()->bucket->set_bucket_instance_attrs(get_info(),
 				new_attrs, &get_info().objv_tracker, y, dpp);
 }
@@ -917,9 +913,8 @@ int RadosBucket::list_multiparts(const DoutPrefixProvider *dpp,
   return 0;
 }
 
-int RadosBucket::abort_multiparts(const DoutPrefixProvider *dpp,
-				 CephContext *cct,
-				 string& prefix, string& delim)
+int RadosBucket::abort_multiparts(const DoutPrefixProvider* dpp,
+				  CephContext* cct)
 {
   constexpr int max = 1000;
   int ret, num_deleted = 0;
@@ -928,14 +923,16 @@ int RadosBucket::abort_multiparts(const DoutPrefixProvider *dpp,
   string marker;
   bool is_truncated;
 
+  const std::string empty_delim;
+  const std::string empty_prefix;
+
   do {
-    ret = list_multiparts(dpp, prefix, marker, delim,
-				 max, uploads, nullptr, &is_truncated);
+    ret = list_multiparts(dpp, empty_prefix, marker, empty_delim,
+			  max, uploads, nullptr, &is_truncated);
     if (ret < 0) {
       ldpp_dout(dpp, 0) << __func__ <<
 	" ERROR : calling list_bucket_multiparts; ret=" << ret <<
-	"; bucket=\"" << this << "\"; prefix=\"" <<
-	prefix << "\"; delim=\"" << delim << "\"" << dendl;
+	"; bucket=\"" << this << "\"" << dendl;
       return ret;
     }
     ldpp_dout(dpp, 20) << __func__ <<
@@ -977,6 +974,11 @@ int RadosBucket::abort_multiparts(const DoutPrefixProvider *dpp,
 std::unique_ptr<User> RadosStore::get_user(const rgw_user &u)
 {
   return std::make_unique<RadosUser>(this, u);
+}
+
+std::string RadosStore::get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y)
+{
+  return getRados()->get_cluster_fsid(dpp, y);
 }
 
 int RadosStore::get_user_by_access_key(const DoutPrefixProvider* dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user)
@@ -1156,12 +1158,15 @@ std::unique_ptr<Completions> RadosStore::get_completions(void)
   return std::make_unique<RadosCompletions>();
 }
 
-std::unique_ptr<Notification> RadosStore::get_notification(rgw::sal::Object* obj,
-							    struct req_state* s,
-							    rgw::notify::EventType event_type,
-                                                            const std::string* object_name)
+std::unique_ptr<Notification> RadosStore::get_notification(
+  rgw::sal::Object* obj, rgw::sal::Object* src_obj, struct req_state* s, rgw::notify::EventType event_type, const std::string* object_name)
 {
-  return std::make_unique<RadosNotification>(s, this, obj, s, event_type, object_name);
+  return std::make_unique<RadosNotification>(s, this, obj, src_obj, s, event_type, object_name);
+}
+
+std::unique_ptr<Notification> RadosStore::get_notification(const DoutPrefixProvider* dpp, rgw::sal::Object* obj, rgw::sal::Object* src_obj, RGWObjectCtx* rctx, rgw::notify::EventType event_type, rgw::sal::Bucket* _bucket, std::string& _user_id, std::string& _user_tenant, std::string& _req_id, optional_yield y)
+{
+  return std::make_unique<RadosNotification>(dpp, this, obj, src_obj, rctx, event_type, _bucket, _user_id, _user_tenant, _req_id, y);
 }
 
 int RadosStore::delete_raw_obj(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj)
@@ -1217,6 +1222,13 @@ void RadosStore::get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota)
 {
     bucket_quota = svc()->quota->get_bucket_quota();
     user_quota = svc()->quota->get_user_quota();
+}
+
+void RadosStore::get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit)
+{
+  bucket_ratelimit = svc()->zone->get_current_period().get_config().bucket_ratelimit;
+  user_ratelimit = svc()->zone->get_current_period().get_config().user_ratelimit;
+  anon_ratelimit = svc()->zone->get_current_period().get_config().anon_ratelimit;
 }
 
 int RadosStore::set_buckets_enabled(const DoutPrefixProvider* dpp, vector<rgw_bucket>& buckets, bool enabled)
@@ -1988,15 +2000,20 @@ int RadosMultipartUpload::abort(const DoutPrefixProvider *dpp, CephContext *cct,
     }
   } while (truncated);
 
-  /* use upload id as tag and do it synchronously */
-  ret = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id());
-  if (ret < 0) {
-    ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
-    if (ret == -ENOENT) {
-      return -ERR_NO_SUCH_UPLOAD;
-    }
-    //Delete objects inline if send chain to gc fails
+  if (store->getRados()->get_gc() == nullptr) {
+    //Delete objects inline if gc hasn't been initialised (in case when bypass gc is specified)
     store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id());
+  } else {
+    /* use upload id as tag and do it synchronously */
+    ret = store->getRados()->send_chain_to_gc(chain, mp_obj.get_upload_id());
+    if (ret < 0) {
+      ldpp_dout(dpp, 5) << __func__ << ": gc->send_chain() returned " << ret << dendl;
+      if (ret == -ENOENT) {
+        return -ERR_NO_SUCH_UPLOAD;
+      }
+      //Delete objects inline if send chain to gc fails
+      store->getRados()->delete_objs_inline(dpp, chain, mp_obj.get_upload_id());
+    }
   }
 
   std::unique_ptr<rgw::sal::Object::DeleteOp> del_op = meta_obj->get_delete_op(obj_ctx);
@@ -2378,6 +2395,8 @@ int RadosMultipartUpload::get_info(const DoutPrefixProvider *dpp, optional_yield
     }
     return ret;
   }
+
+  extract_span_context(meta_obj->get_attrs(), trace_ctx);
 
   if (attrs) {
     /* Attrs are filled in by prepare */

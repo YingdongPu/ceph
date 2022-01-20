@@ -181,12 +181,19 @@ public:
   const pg_shard_t pg_whoami;
   const spg_t pg_id;
 
+  /// the 'scrubber'. Will be allocated in the derivative (PrimaryLogPG) ctor,
+  /// and be removed only in the PrimaryLogPG destructor.
   std::unique_ptr<ScrubPgIF> m_scrubber;
 
   /// flags detailing scheduling/operation characteristics of the next scrub 
   requested_scrub_t m_planned_scrub;
+
   /// scrubbing state for both Primary & replicas
   bool is_scrub_active() const { return m_scrubber->is_scrub_active(); }
+
+  /// set when the scrub request is queued, and reset after scrubbing fully
+  /// cleaned up.
+  bool is_scrub_queued_or_active() const { return m_scrubber->is_queued_or_active(); }
 
 public:
   // -- members --
@@ -272,6 +279,31 @@ public:
       [=](auto &history, auto &stats) {
 	set_last_deep_scrub_stamp(t, history, stats);
 	return true;
+      });
+  }
+
+  static void add_objects_scrubbed_count(
+    int64_t count, pg_stat_t &stats) {
+    stats.objects_scrubbed += count;
+  }
+
+  void add_objects_scrubbed_count(int64_t count) {
+    recovery_state.update_stats(
+      [=](auto &history, auto &stats) {
+	add_objects_scrubbed_count(count, stats);
+	return true;
+      });
+  }
+
+  static void reset_objects_scrubbed(pg_stat_t &stats) {
+    stats.objects_scrubbed = 0;
+  }
+
+  void reset_objects_scrubbed() {
+    recovery_state.update_stats(
+      [=](auto &history, auto &stats) {
+  reset_objects_scrubbed(stats);
+  return true;
       });
   }
 
@@ -384,7 +416,6 @@ public:
   void scrub(epoch_t queued, ThreadPool::TPHandle& handle)
   {
     // a new scrub
-    scrub_queued = false;
     forward_scrub_event(&ScrubPgIF::initiate_regular_scrub, queued, "StartScrub");
   }
 
@@ -397,7 +428,6 @@ public:
   void recovery_scrub(epoch_t queued, ThreadPool::TPHandle& handle)
   {
     // a new scrub
-    scrub_queued = false;
     forward_scrub_event(&ScrubPgIF::initiate_scrub_after_repair, queued,
 			"AfterRepairScrub");
   }
@@ -410,7 +440,6 @@ public:
 			     Scrub::act_token_t act_token,
 			     ThreadPool::TPHandle& handle)
   {
-    scrub_queued = false;
     forward_scrub_event(&ScrubPgIF::send_sched_replica, queued, act_token,
 			"SchedReplica");
   }
@@ -428,7 +457,6 @@ public:
 
   void scrub_send_scrub_resched(epoch_t queued, ThreadPool::TPHandle& handle)
   {
-    scrub_queued = false;
     forward_scrub_event(&ScrubPgIF::send_scrub_resched, queued, "InternalSchedScrub");
   }
 
@@ -808,7 +836,6 @@ protected:
   /* You should not use these items without taking their respective queue locks
    * (if they have one) */
   xlist<PG*>::item stat_queue_item;
-  bool scrub_queued;
   bool recovery_queued;
 
   int recovery_ops_active;

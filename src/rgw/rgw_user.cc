@@ -118,7 +118,7 @@ int rgw_user_get_all_buckets_stats(const DoutPrefixProvider *dpp,
       marker = i.first;
 
       auto& bucket_ent = i.second;
-      ret = bucket_ent->load_bucket(dpp, y);
+      ret = bucket_ent->load_bucket(dpp, y, true /* load user stats */);
       if (ret < 0) {
         ldpp_dout(dpp, 0) << "ERROR: could not get bucket stats: ret=" << ret << dendl;
         return ret;
@@ -150,64 +150,6 @@ static bool char_is_unreserved_url(char c)
   default:
     return false;
   }
-}
-
-struct rgw_flags_desc {
-  uint32_t mask;
-  const char *str;
-};
-
-static struct rgw_flags_desc rgw_perms[] = {
- { RGW_PERM_FULL_CONTROL, "full-control" },
- { RGW_PERM_READ | RGW_PERM_WRITE, "read-write" },
- { RGW_PERM_READ, "read" },
- { RGW_PERM_WRITE, "write" },
- { RGW_PERM_READ_ACP, "read-acp" },
- { RGW_PERM_WRITE_ACP, "write-acp" },
- { 0, NULL }
-};
-
-void rgw_perm_to_str(uint32_t mask, char *buf, int len)
-{
-  const char *sep = "";
-  int pos = 0;
-  if (!mask) {
-    snprintf(buf, len, "<none>");
-    return;
-  }
-  while (mask) {
-    uint32_t orig_mask = mask;
-    for (int i = 0; rgw_perms[i].mask; i++) {
-      struct rgw_flags_desc *desc = &rgw_perms[i];
-      if ((mask & desc->mask) == desc->mask) {
-        pos += snprintf(buf + pos, len - pos, "%s%s", sep, desc->str);
-        if (pos == len)
-          return;
-        sep = ", ";
-        mask &= ~desc->mask;
-        if (!mask)
-          return;
-      }
-    }
-    if (mask == orig_mask) // no change
-      break;
-  }
-}
-
-uint32_t rgw_str_to_perm(const char *str)
-{
-  if (strcasecmp(str, "") == 0)
-    return RGW_PERM_NONE;
-  else if (strcasecmp(str, "read") == 0)
-    return RGW_PERM_READ;
-  else if (strcasecmp(str, "write") == 0)
-    return RGW_PERM_WRITE;
-  else if (strcasecmp(str, "readwrite") == 0)
-    return RGW_PERM_READ | RGW_PERM_WRITE;
-  else if (strcasecmp(str, "full") == 0)
-    return RGW_PERM_FULL_CONTROL;
-
-  return RGW_PERM_INVALID;
 }
 
 int rgw_validate_tenant_name(const string& t)
@@ -1939,9 +1881,8 @@ int RGWUser::execute_remove(const DoutPrefixProvider *dpp, RGWUserAdminOpState& 
       return -EEXIST; // change to code that maps to 409: conflict
     }
 
-    std::string prefix, delimiter;
     for (auto it = m.begin(); it != m.end(); ++it) {
-      ret = it->second->remove_bucket(dpp, true, prefix, delimiter, false, nullptr, y);
+      ret = it->second->remove_bucket(dpp, true, false, nullptr, y);
       if (ret < 0) {
         set_err_msg(err_msg, "unable to delete user data");
         return ret;
@@ -2982,5 +2923,10 @@ int RGWUserCtl::read_stats_async(const DoutPrefixProvider *dpp, const rgw_user& 
 
 RGWMetadataHandler *RGWUserMetaHandlerAllocator::alloc(RGWSI_User *user_svc) {
   return new RGWUserMetadataHandler(user_svc);
+}
+
+void rgw_user::dump(Formatter *f) const
+{
+  ::encode_json("user", *this, f);
 }
 

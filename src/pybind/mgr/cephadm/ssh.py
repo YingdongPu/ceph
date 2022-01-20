@@ -6,7 +6,7 @@ from threading import Thread
 from contextlib import contextmanager
 from io import StringIO
 from shlex import quote
-from typing import TYPE_CHECKING, Optional, List, Tuple, Dict, Any, Iterator
+from typing import TYPE_CHECKING, Optional, List, Tuple, Dict, Iterator, TypeVar, Awaitable
 from orchestrator import OrchestratorError
 
 try:
@@ -17,6 +17,9 @@ except ImportError:
 if TYPE_CHECKING:
     from cephadm.module import CephadmOrchestrator
     from asyncssh.connection import SSHClientConnection
+
+T = TypeVar('T')
+
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +38,13 @@ Host *
 class EventLoopThread(Thread):
 
     def __init__(self) -> None:
-
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.set_debug(True)
 
         super().__init__(target=self._loop.run_forever)
         self.start()
 
-    def get_result(self, coro) -> Any:  # type: ignore
+    def get_result(self, coro: Awaitable[T]) -> T:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
 
 
@@ -123,7 +124,7 @@ class SSHManager:
                           host: str,
                           addr: Optional[str] = None,
                           ) -> "SSHClientConnection":
-        return self.mgr.event_loop.get_result(self._remote_connection(host, addr))
+        return self.mgr.wait_async(self._remote_connection(host, addr))
 
     async def _execute_command(self,
                                host: str,
@@ -153,7 +154,7 @@ class SSHManager:
                         stdin: Optional[str] = None,
                         addr: Optional[str] = None,
                         ) -> Tuple[str, str, int]:
-        return self.mgr.event_loop.get_result(self._execute_command(host, cmd, stdin, addr))
+        return self.mgr.wait_async(self._execute_command(host, cmd, stdin, addr))
 
     async def _check_execute_command(self,
                                      host: str,
@@ -174,7 +175,7 @@ class SSHManager:
                               stdin: Optional[str] = None,
                               addr: Optional[str] = None,
                               ) -> str:
-        return self.mgr.event_loop.get_result(self._check_execute_command(host, cmd, stdin, addr))
+        return self.mgr.wait_async(self._check_execute_command(host, cmd, stdin, addr))
 
     async def _write_remote_file(self,
                                  host: str,
@@ -188,12 +189,17 @@ class SSHManager:
         try:
             dirname = os.path.dirname(path)
             await self._check_execute_command(host, ['mkdir', '-p', dirname], addr=addr)
-            tmp_path = path + '.new'
+            await self._check_execute_command(host, ['mkdir', '-p', '/tmp' + dirname], addr=addr)
+            tmp_path = '/tmp' + path + '.new'
             await self._check_execute_command(host, ['touch', tmp_path], addr=addr)
             if uid is not None and gid is not None and mode is not None:
                 # shlex quote takes str or byte object, not int
                 await self._check_execute_command(host, ['chown', '-R', str(uid) + ':' + str(gid), tmp_path], addr=addr)
                 await self._check_execute_command(host, ['chmod', oct(mode)[2:], tmp_path], addr=addr)
+            elif self.mgr.ssh_user != 'root':
+                assert self.mgr.ssh_user
+                await self._check_execute_command(host, ['chown', '-R', self.mgr.ssh_user, tmp_path], addr=addr)
+                await self._check_execute_command(host, ['chmod', str(644), tmp_path], addr=addr)
             with NamedTemporaryFile(prefix='cephadm-write-remote-file-') as f:
                 os.fchmod(f.fileno(), 0o600)
                 f.write(content)
@@ -215,7 +221,7 @@ class SSHManager:
                           gid: Optional[int] = None,
                           addr: Optional[str] = None,
                           ) -> None:
-        self.mgr.event_loop.get_result(self._write_remote_file(
+        self.mgr.wait_async(self._write_remote_file(
             host, path, content, mode, uid, gid, addr))
 
     async def _reset_con(self, host: str) -> None:
@@ -226,7 +232,7 @@ class SSHManager:
             del self.cons[host]
 
     def reset_con(self, host: str) -> None:
-        self.mgr.event_loop.get_result(self._reset_con(host))
+        self.mgr.wait_async(self._reset_con(host))
 
     def _reset_cons(self) -> None:
         for host, conn in self.cons.items():

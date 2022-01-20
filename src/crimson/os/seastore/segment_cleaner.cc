@@ -9,9 +9,11 @@
 
 namespace {
   seastar::logger& logger() {
-    return crimson::get_logger(ceph_subsys_seastore);
+    return crimson::get_logger(ceph_subsys_seastore_cleaner);
   }
 }
+
+SET_SUBSYS(seastore_cleaner);
 
 namespace crimson::os::seastore {
 
@@ -179,6 +181,26 @@ void SegmentCleaner::register_metrics()
   metrics.add_group("segment_cleaner", {
     sm::make_counter("segments_released", stats.segments_released,
 		     sm::description("total number of extents released by SegmentCleaner")),
+    sm::make_counter("accumulated_blocked_ios", stats.accumulated_blocked_ios,
+		     sm::description("accumulated total number of ios that were blocked by gc")),
+    sm::make_derive("empty_segments", stats.empty_segments,
+		    sm::description("current empty segments")),
+    sm::make_derive("ios_blocking", stats.ios_blocking,
+		    sm::description("IOs that are blocking on space usage")),
+    sm::make_derive("used_bytes", stats.used_bytes,
+		    sm::description("the size of the space occupied by live extents")),
+    sm::make_derive("projected_used_bytes", stats.projected_used_bytes,
+		    sm::description("the size of the space going to be occupied by new extents")),
+    sm::make_derive("avail_bytes",
+		    [this] {
+		      return segments.get_available_bytes();
+		    },
+		    sm::description("the size of the space not occupied")),
+    sm::make_derive("opened_segments",
+		    [this] {
+		      return segments.get_opened_segments();
+		    },
+		    sm::description("the number of segments whose state is open"))
   });
 }
 
@@ -200,7 +222,7 @@ SegmentCleaner::get_segment_ret SegmentCleaner::get_segment(device_id_t id)
   assert(0 == "out of space handling todo");
   return get_segment_ret(
     get_segment_ertr::ready_future_marker{},
-    ZERO_SEG_ID);
+    NULL_SEG_ID);
 }
 
 void SegmentCleaner::update_journal_tail_target(journal_seq_t target)
@@ -309,7 +331,10 @@ SegmentCleaner::gc_trim_journal_ret SegmentCleaner::gc_trim_journal()
 {
   return repeat_eagain([this] {
     return ecb->with_transaction_intr(
-        Transaction::src_t::CLEANER, [this](auto& t) {
+      Transaction::src_t::CLEANER_TRIM,
+      "trim_journal",
+      [this](auto& t)
+    {
       return rewrite_dirty(t, get_dirty_tail()
       ).si_then([this, &t] {
         return ecb->submit_transaction_direct(t);
@@ -349,8 +374,10 @@ SegmentCleaner::gc_reclaim_space_ret SegmentCleaner::gc_reclaim_space()
           "SegmentCleaner::gc_reclaim_space: processing {} extents",
           extents.size());
         return ecb->with_transaction_intr(
-            Transaction::src_t::CLEANER,
-            [this, &extents](auto& t) {
+          Transaction::src_t::CLEANER_RECLAIM,
+          "reclaim_space",
+          [this, &extents](auto& t)
+        {
           return trans_intr::do_for_each(
               extents,
               [this, &t](auto &extent) {

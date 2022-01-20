@@ -2,6 +2,14 @@ find_program(GPERF gperf)
 if(NOT GPERF)
   message(FATAL_ERROR "Can't find gperf")
 endif()
+
+if(WITH_RADOSGW_SELECT_PARQUET)
+  find_package(Arrow QUIET REQUIRED)
+  set(ARROW_LIBRARIES "-larrow -lparquet")
+  add_definitions(-D_ARROW_EXIST)
+  message("-- arrow is installed, radosgw/s3select-op is able to process parquet objects")
+endif(WITH_RADOSGW_SELECT_PARQUET)
+
 function(gperf_generate input output)
   add_custom_command(
     OUTPUT ${output}
@@ -60,18 +68,17 @@ set(librgw_common_srcs
   rgw_etag_verifier.cc
   rgw_cors.cc
   rgw_cors_s3.cc
-  rgw_dencoder.cc
   rgw_env.cc
   rgw_es_query.cc
   rgw_formats.cc
   rgw_gc.cc
   rgw_gc_log.cc
   rgw_http_client.cc
-  rgw_json_enc.cc
   rgw_keystone.cc
   rgw_ldap.cc
   rgw_lc.cc
   rgw_lc_s3.cc
+  rgw_lc_tier.cc
   rgw_metadata.cc
   rgw_multi.cc
   rgw_multi_del.cc
@@ -123,6 +130,7 @@ set(librgw_common_srcs
   rgw_rest_realm.cc
   rgw_rest_role.cc
   rgw_rest_s3.cc
+  rgw_s3select.cc
   rgw_role.cc
   rgw_sal.cc
   rgw_sal_rados.cc
@@ -134,7 +142,6 @@ set(librgw_common_srcs
   rgw_user.cc
   rgw_website.cc
   rgw_xml.cc
-  rgw_xml_enc.cc
   rgw_torrent.cc
   rgw_crypt.cc
   rgw_crypt_sanitize.cc
@@ -206,6 +213,7 @@ target_link_libraries(rgw_common
     ${CURL_LIBRARIES}
     ${EXPAT_LIBRARIES}
     ${LUA_LIBRARIES}
+    ${ARROW_LIBRARIES}
   PUBLIC
     spawn)
 target_include_directories(rgw_common
@@ -242,8 +250,8 @@ if(WITH_LTTNG)
 endif()
 
 if(WITH_JAEGER)
-  add_dependencies(rgw_common jaeger-base)
-  target_link_libraries(rgw_common PUBLIC jaeger-base)
+  add_dependencies(rgw_common ${jaeger_base})
+  target_link_libraries(rgw_common PUBLIC ${jaeger_base})
 endif()
 
 if(WITH_RADOSGW_DBSTORE)
@@ -269,7 +277,9 @@ set(rgw_a_srcs
   rgw_rest_realm.cc
   rgw_rest_swift.cc
   rgw_rest_usage.cc
+  rgw_rest_info.cc
   rgw_rest_user.cc
+  rgw_rest_ratelimit.cc
   rgw_swift_auth.cc
   rgw_usage.cc
   rgw_opa.cc
@@ -303,6 +313,7 @@ target_link_libraries(rgw_a
     common_utf8 global
     ${CRYPTO_LIBS}
     ${LUA_LIBRARIES}
+    ${ARROW_LIBRARIES}
     OATH::OATH
   PUBLIC
     rgw_common

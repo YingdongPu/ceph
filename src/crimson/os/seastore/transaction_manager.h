@@ -45,7 +45,7 @@ auto repeat_eagain(F &&f) {
 	    return seastar::stop_iteration::yes;
 	  }).handle_error(
 	    [FNAME](const crimson::ct_error::eagain &e) {
-	      DEBUG("hit eagain, restarting");
+	      SUBDEBUG(seastore_tm, "hit eagain, restarting");
 	      return seastar::stop_iteration::no;
 	    },
 	    crimson::ct_error::pass_further_all{}
@@ -88,14 +88,16 @@ public:
 
   /// Creates empty transaction
   TransactionRef create_transaction(
-      Transaction::src_t src) final {
-    return cache->create_transaction(src);
+      Transaction::src_t src,
+      const char* name) final {
+    return cache->create_transaction(src, name, false);
   }
 
   /// Creates empty weak transaction
   TransactionRef create_weak_transaction(
-      Transaction::src_t src) {
-    return cache->create_weak_transaction(src);
+      Transaction::src_t src,
+      const char* name) {
+    return cache->create_transaction(src, name, true);
   }
 
   /// Resets transaction
@@ -147,18 +149,21 @@ public:
     LBAPinRef pin) {
     LOG_PREFIX(TransactionManager::pin_to_extent);
     using ret = pin_to_extent_ret<T>;
-    DEBUGT("getting extent {}", t, *pin);
+    SUBDEBUGT(seastore_tm, "getting extent {}", t, *pin);
+    auto &pref = *pin;
     return cache->get_extent<T>(
       t,
-      pin->get_paddr(),
-      pin->get_length()
-    ).si_then([this, FNAME, &t, pin=std::move(pin)](auto ref) mutable -> ret {
-      if (!ref->has_pin()) {
-	assert(!(pin->has_been_invalidated() || ref->has_been_invalidated()));
-	ref->set_pin(std::move(pin));
-	lba_manager->add_pin(ref->get_pin());
+      pref.get_paddr(),
+      pref.get_length(),
+      [this, pin=std::move(pin)](T &extent) mutable {
+	assert(!extent.has_pin());
+	assert(!extent.has_been_invalidated());
+	assert(!pin->has_been_invalidated());
+	extent.set_pin(std::move(pin));
+	lba_manager->add_pin(extent.get_pin());
       }
-      DEBUGT("got extent {}", t, *ref);
+    ).si_then([FNAME, &t](auto ref) mutable -> ret {
+      SUBDEBUGT(seastore_tm, "got extent {}", t, *ref);
       return pin_to_extent_ret<T>(
 	interruptible::ready_future_marker{},
 	std::move(ref));
@@ -185,8 +190,9 @@ public:
       t, offset
     ).si_then([this, FNAME, &t, offset, length] (auto pin) {
       if (length != pin->get_length() || !pin->get_paddr().is_real()) {
-        ERRORT("offset {} len {} got wrong pin {}",
-               t, offset, length, *pin);
+        SUBERRORT(seastore_tm,
+            "offset {} len {} got wrong pin {}",
+            t, offset, length, *pin);
         ceph_assert(0 == "Should be impossible");
       }
       return this->pin_to_extent<T>(t, std::move(pin));
@@ -207,8 +213,9 @@ public:
       t, offset
     ).si_then([this, FNAME, &t, offset] (auto pin) {
       if (!pin->get_paddr().is_real()) {
-        ERRORT("offset {} got wrong pin {}",
-               t, offset, *pin);
+        SUBERRORT(seastore_tm,
+            "offset {} got wrong pin {}",
+            t, offset, *pin);
         ceph_assert(0 == "Should be impossible");
       }
       return this->pin_to_extent<T>(t, std::move(pin));
@@ -224,14 +231,14 @@ public:
     stats.extents_mutated_total++;
     stats.extents_mutated_bytes += ret->get_length();
     if (!ret->has_pin()) {
-      DEBUGT(
+      SUBDEBUGT(seastore_tm,
 	"duplicating {} for write: {}",
 	t,
 	*ref,
 	*ret);
       ret->set_pin(ref->get_pin().duplicate());
     } else {
-      DEBUGT(
+      SUBDEBUGT(seastore_tm,
 	"{} already pending",
 	t,
 	*ref);
@@ -306,7 +313,7 @@ public:
       ext->set_pin(std::move(ref));
       stats.extents_allocated_total++;
       stats.extents_allocated_bytes += len;
-      DEBUGT("new extent: {}, laddr_hint: {}", t, *ext, laddr_hint);
+      SUBDEBUGT(seastore_tm, "new extent: {}, laddr_hint: {}", t, *ext, laddr_hint);
       return alloc_extent_iertr::make_ready_future<TCachedExtentRef<T>>(
 	std::move(ext));
     });
@@ -322,7 +329,7 @@ public:
       t,
       hint,
       len,
-      zero_paddr());
+      P_ADDR_ZERO);
   }
 
   /* alloc_extents
@@ -366,6 +373,15 @@ public:
   using SegmentCleaner::ExtentCallbackInterface::submit_transaction_direct_ret;
   submit_transaction_direct_ret submit_transaction_direct(
     Transaction &t) final;
+
+  /**
+   * flush
+   *
+   * Block until all outstanding IOs on handle are committed.
+   * Note, flush() machinery must go through the same pipeline
+   * stages and locks as submit_transaction.
+   */
+  seastar::future<> flush(OrderingHandle &handle);
 
   using SegmentCleaner::ExtentCallbackInterface::get_next_dirty_extents_ret;
   get_next_dirty_extents_ret get_next_dirty_extents(
@@ -502,7 +518,7 @@ public:
 
   void add_segment_manager(SegmentManager* sm) {
     LOG_PREFIX(TransactionManager::add_segment_manager);
-    DEBUG("adding segment manager {}", sm->get_device_id());
+    SUBDEBUG(seastore_tm, "adding segment manager {}", sm->get_device_id());
     scanner.add_segment_manager(sm);
     epm->add_allocator(
       device_type_t::SEGMENTED,

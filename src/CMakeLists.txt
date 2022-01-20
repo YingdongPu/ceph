@@ -394,6 +394,7 @@ set(libcommon_files
   global/global_context.cc
   xxHash/xxhash.c
   common/error_code.cc
+  common/tracer.cc
   log/Log.cc
   mon/MonCap.cc
   mon/MonClient.cc
@@ -418,8 +419,8 @@ set(libcommon_files
   osdc/error_code.cc
   librbd/Features.cc
   librbd/io/IoOperations.cc
-  ${mds_files}
-  common/tracer.cc)
+  ${mds_files})
+
 set_source_files_properties(ceph_ver.c
   APPEND PROPERTY OBJECT_DEPENDS ${CMAKE_BINARY_DIR}/src/include/ceph_ver.h)
 add_library(common-objs OBJECT ${libcommon_files})
@@ -429,32 +430,11 @@ add_dependencies(common-objs legacy-option-headers)
 
 if(WITH_JAEGER)
   find_package(thrift 0.13.0 REQUIRED)
-  find_package(yaml-cpp 0.6.0 REQUIRED)
-  include(BuildJaeger)
-  list(APPEND jaeger_base
-  opentracing::libopentracing
-  jaegertracing::libjaegertracing)
-
-  build_jaeger()
-
-  include_directories(${CMAKE_BINARY_DIR}/external/include)
-  # for testing jaeger build
-  add_custom_target(jaeger_base DEPENDS ${jaeger_base})
-  add_library(jaeger-base INTERFACE)
+  include(BuildOpentelemetry)
+  build_opentelemetry()
+  set(jaeger_base opentelemetry::libopentelemetry thrift::libthrift)
   add_dependencies(common-objs ${jaeger_base})
-  target_link_libraries(jaeger-base INTERFACE
-    yaml-cpp::yaml-cpp
-    opentracing::libopentracing
-    thrift::libthrift
-    jaegertracing::libjaegertracing)
-
-  list(APPEND jaeger_libs
-    ${CMAKE_BINARY_DIR}/external/lib/libjaegertracing.so.0
-    ${CMAKE_BINARY_DIR}/external/lib/libjaegertracing.so.0.6.1
-    ${CMAKE_BINARY_DIR}/external/lib/libopentracing.so.1
-    ${CMAKE_BINARY_DIR}/external/lib/libopentracing.so.1.6.0)
-  install(FILES ${jaeger_libs}
-    DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  target_link_libraries(common-objs ${jaeger_base})
 endif()
 
 CHECK_C_COMPILER_FLAG("-fvar-tracking-assignments" HAS_VTA)
@@ -518,7 +498,7 @@ if(WITH_DPDK)
 endif()
 
 if(WITH_JAEGER)
-  list(APPEND ceph_common_deps jaeger-base)
+  list(APPEND ceph_common_deps ${jaeger_base})
 endif()
 
 if(WIN32)
@@ -544,11 +524,11 @@ endif()
 
 add_library(common STATIC ${ceph_common_objs})
 target_link_libraries(common ${ceph_common_deps})
-add_dependencies(common legacy-option-headers)
+add_dependencies(common legacy-option-headers ${jaeger_base})
 
 add_library(ceph-common SHARED ${ceph_common_objs})
 target_link_libraries(ceph-common ${ceph_common_deps})
-add_dependencies(ceph-common legacy-option-headers)
+add_dependencies(ceph-common legacy-option-headers ${jaeger_base})
 # appease dpkg-shlibdeps
 set_target_properties(ceph-common PROPERTIES
   SOVERSION 2
@@ -613,6 +593,13 @@ if(WITH_LIBRADOSSTRIPER)
   add_subdirectory(libradosstriper)
 endif()
 
+# make rocksdb statically
+
+if(NOT WITH_SYSTEM_ROCKSDB)
+  include(BuildRocksDB)
+  build_rocksdb()
+endif(NOT WITH_SYSTEM_ROCKSDB)
+
 if(WITH_MGR)
   add_subdirectory(mgr)
 endif()
@@ -650,12 +637,6 @@ target_link_libraries(ceph-mon mon os global-static ceph-common
 install(TARGETS ceph-mon DESTINATION bin)
 
 # OSD/ObjectStore
-# make rocksdb statically
-
-if(NOT WITH_SYSTEM_ROCKSDB)
-  include(BuildRocksDB)
-  build_rocksdb()
-endif(NOT WITH_SYSTEM_ROCKSDB)
 
 include(TestBigEndian)
 test_big_endian(CEPH_BIG_ENDIAN)
@@ -755,8 +736,8 @@ install(PROGRAMS
   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph
   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-post-file
   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ceph-crash
-  ${CMAKE_SOURCE_DIR}/src/ceph-run
-  ${CMAKE_SOURCE_DIR}/src/ceph-clsinfo
+  ceph-run
+  ceph-clsinfo
   DESTINATION bin)
 install(PROGRAMS
   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/init-ceph
@@ -775,7 +756,7 @@ install(PROGRAMS
   DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ceph)
 
 install(PROGRAMS
-  ${CMAKE_SOURCE_DIR}/src/ceph-create-keys
+  ceph-create-keys
   DESTINATION sbin)
 
 add_subdirectory(bash_completion)
@@ -800,7 +781,7 @@ if(WITH_LIBCEPHFS)
   endif(ENABLE_SHARED)
   install(TARGETS cephfs DESTINATION ${CMAKE_INSTALL_LIBDIR})
   install(DIRECTORY
-    "${CMAKE_SOURCE_DIR}/src/include/cephfs"
+    "include/cephfs"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
   set(ceph_syn_srcs
     ceph_syn.cc
@@ -858,9 +839,9 @@ if(WITH_RBD)
   endif()
 
   install(PROGRAMS
-    ${CMAKE_SOURCE_DIR}/src/ceph-rbdnamer
-    ${CMAKE_SOURCE_DIR}/src/rbd-replay-many
-    ${CMAKE_SOURCE_DIR}/src/rbdmap
+    ceph-rbdnamer
+    rbd-replay-many
+    rbdmap
     DESTINATION ${CMAKE_INSTALL_BINDIR})
   add_subdirectory(rbd_replay)
 endif(WITH_RBD)
@@ -1016,4 +997,3 @@ if(DOXYGEN_FOUND)
     rgw
     COMMENT "Generate C++ documentation")
 endif()
-

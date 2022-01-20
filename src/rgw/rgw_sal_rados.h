@@ -72,6 +72,7 @@ class RadosUser : public User {
 			    std::unique_ptr<Bucket>* bucket,
 			    optional_yield y) override;
     virtual int read_attrs(const DoutPrefixProvider* dpp, optional_yield y) override;
+    virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y) override;
     virtual int read_stats(const DoutPrefixProvider *dpp,
                            optional_yield y, RGWStorageStats* stats,
 			   ceph::real_time* last_stats_sync = nullptr,
@@ -282,14 +283,14 @@ class RadosBucket : public Bucket {
 
     virtual std::unique_ptr<Object> get_object(const rgw_obj_key& k) override;
     virtual int list(const DoutPrefixProvider* dpp, ListParams&, int, ListResults&, optional_yield y) override;
-    virtual int remove_bucket(const DoutPrefixProvider* dpp, bool delete_children, std::string prefix, std::string delimiter, bool forward_to_master, req_info* req_info, optional_yield y) override;
+    virtual int remove_bucket(const DoutPrefixProvider* dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y) override;
     virtual int remove_bucket_bypass_gc(int concurrent_max, bool
 					keep_index_consistent,
 					optional_yield y, const
 					DoutPrefixProvider *dpp) override;
     virtual RGWAccessControlPolicy& get_acl(void) override { return acls; }
     virtual int set_acl(const DoutPrefixProvider* dpp, RGWAccessControlPolicy& acl, optional_yield y) override;
-    virtual int load_bucket(const DoutPrefixProvider* dpp, optional_yield y) override;
+    virtual int load_bucket(const DoutPrefixProvider* dpp, optional_yield y, bool get_stats = false) override;
     virtual int read_stats(const DoutPrefixProvider *dpp, int shard_id,
 				 std::string* bucket_ver, std::string* master_ver,
 				 std::map<RGWObjCategory, RGWStorageStats>& stats,
@@ -330,9 +331,8 @@ class RadosBucket : public Bucket {
 				std::vector<std::unique_ptr<MultipartUpload>>& uploads,
 				std::map<std::string, bool> *common_prefixes,
 				bool *is_truncated) override;
-    virtual int abort_multiparts(const DoutPrefixProvider *dpp,
-				 CephContext *cct,
-				 std::string& prefix, std::string& delim) override;
+    virtual int abort_multiparts(const DoutPrefixProvider* dpp,
+				 CephContext* cct) override;
 
   private:
     int link(const DoutPrefixProvider* dpp, User* new_user, optional_yield y, bool update_entrypoint = true, RGWObjVersionTracker* objv = nullptr);
@@ -374,7 +374,12 @@ class RadosStore : public Store {
       delete rados;
     }
 
+    virtual const char* get_name() const override {
+			return "rados";
+	}
+
     virtual std::unique_ptr<User> get_user(const rgw_user& u) override;
+    virtual std::string get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y) override;
     virtual int get_user_by_access_key(const DoutPrefixProvider* dpp, const std::string& key, optional_yield y, std::unique_ptr<User>* user) override;
     virtual int get_user_by_email(const DoutPrefixProvider* dpp, const std::string& email, optional_yield y, std::unique_ptr<User>* user) override;
     virtual int get_user_by_swift(const DoutPrefixProvider* dpp, const std::string& user_str, optional_yield y, std::unique_ptr<User>* user) override;
@@ -392,7 +397,12 @@ class RadosStore : public Store {
     virtual int cluster_stat(RGWClusterStat& stats) override;
     virtual std::unique_ptr<Lifecycle> get_lifecycle(void) override;
     virtual std::unique_ptr<Completions> get_completions(void) override;
-    virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, struct req_state* s, rgw::notify::EventType event_type, const std::string* object_name=nullptr) override;
+
+    // op variant
+    virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, rgw::sal::Object* src_obj, struct req_state* s, rgw::notify::EventType event_type, const std::string* object_name=nullptr) override;
+
+    // non-op variant (e.g., rgwlc)
+    virtual std::unique_ptr<Notification> get_notification(const DoutPrefixProvider* dpp, rgw::sal::Object* obj, rgw::sal::Object* src_obj, RGWObjectCtx* rctx, rgw::notify::EventType event_type, rgw::sal::Bucket* _bucket, std::string& _user_id, std::string& _user_tenant, std::string& _req_id, optional_yield y) override;
     virtual RGWLC* get_rgwlc(void) override { return rados->get_lc(); }
     virtual RGWCoroutinesManagerRegistry* get_cr_registry() override { return rados->get_cr_registry(); }
 
@@ -401,6 +411,7 @@ class RadosStore : public Store {
     virtual int register_to_service_map(const DoutPrefixProvider *dpp, const std::string& daemon_type,
 				const std::map<std::string, std::string>& meta) override;
     virtual void get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota) override;
+    virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) override;
     virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled) override;
     virtual uint64_t get_new_req_id() override { return rados->get_new_req_id(); }
     virtual int get_sync_policy_handler(const DoutPrefixProvider* dpp,
@@ -604,13 +615,25 @@ public:
 
 class RadosNotification : public Notification {
   RadosStore* store;
+  /* XXX it feels incorrect to me that rgw::notify::reservation_t is
+   * currently RADOS-specific; instead, I think notification types such as
+   * reservation_t should be generally visible, whereas the internal
+   * notification behavior should be made portable (e.g., notification
+   * to non-RADOS message sinks) */
   rgw::notify::reservation_t res;
 
   public:
-    RadosNotification(const DoutPrefixProvider *_dpp, RadosStore* _store, Object* _obj, req_state* _s, 
-        rgw::notify::EventType _type, const std::string* object_name=nullptr) :
-      Notification(_obj, _type), store(_store), res(_dpp, _store, _s, _obj, object_name) { }
+    RadosNotification(const DoutPrefixProvider* _dpp, RadosStore* _store, Object* _obj, Object* _src_obj, req_state* _s, rgw::notify::EventType _type, const std::string* object_name=nullptr) :
+      Notification(_obj, _src_obj, _type), store(_store), res(_dpp, _store, _s, _obj, _src_obj, object_name) { }
+
+    RadosNotification(const DoutPrefixProvider* _dpp, RadosStore* _store, Object* _obj, Object* _src_obj, RGWObjectCtx* rctx, rgw::notify::EventType _type, rgw::sal::Bucket* _bucket, std::string& _user_id, std::string& _user_tenant, std::string& _req_id, optional_yield y) :
+      Notification(_obj, _src_obj, _type), store(_store), res(_dpp, _store, rctx, _obj, _src_obj, _bucket, _user_id, _user_tenant, _req_id, y) {}
+
     ~RadosNotification() = default;
+
+    rgw::notify::reservation_t& get_reservation(void) {
+      return res;
+    }
 
     virtual int publish_reserve(const DoutPrefixProvider *dpp, RGWObjTags* obj_tags = nullptr) override;
     virtual int publish_commit(const DoutPrefixProvider* dpp, uint64_t size,

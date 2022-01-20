@@ -367,10 +367,10 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
                            map<string, bufferlist>& bucket_attrs,
                            RGWAccessControlPolicy* acl,
                            string *storage_class,
-			   boost::optional<Policy>& policy,
+                           boost::optional<Policy>& policy,
                            rgw::sal::Bucket* bucket,
                            rgw::sal::Object* object,
-			   optional_yield y,
+                           optional_yield y,
                            bool copy_src=false)
 {
   string upload_id;
@@ -411,8 +411,7 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
     if (bucket_owner.compare(s->user->get_id()) != 0 &&
         ! s->auth.identity->is_admin_of(bucket_owner)) {
       auto r = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                  *s->auth.identity, rgw::IAM::s3ListBucket,
-                                  ARN(bucket->get_key()));
+                                  rgw::IAM::s3ListBucket, ARN(bucket->get_key()));
       if (r == Effect::Allow)
         return -ENOENT;
       if (r == Effect::Deny)
@@ -427,8 +426,7 @@ static int read_obj_policy(const DoutPrefixProvider *dpp,
       }
       if (! s->session_policies.empty()) {
         r = eval_identity_or_session_policies(s->session_policies, s->env,
-                                  *s->auth.identity, rgw::IAM::s3ListBucket,
-                                  ARN(bucket->get_key()));
+                                  rgw::IAM::s3ListBucket, ARN(bucket->get_key()));
         if (r == Effect::Allow)
           return -ENOENT;
         if (r == Effect::Deny)
@@ -2206,6 +2204,19 @@ void RGWGetObj::execute(optional_yield y)
       filter = &*decompress;
   }
 
+  attr_iter = attrs.find(RGW_ATTR_MANIFEST);
+  if (attr_iter != attrs.end() && get_type() == RGW_OP_GET_OBJ && get_data) {
+    RGWObjManifest m;
+    decode(m, attr_iter->second);
+    if (m.get_tier_type() == "cloud-s3") {
+      /* XXX: Instead send presigned redirect or read-through */
+      op_ret = -ERR_INVALID_OBJECT_STATE;
+      ldpp_dout(this, 0) << "ERROR: Cannot get cloud tiered object. Failing with "
+		       << op_ret << dendl;
+      goto done_err;
+    }
+  }
+
   attr_iter = attrs.find(RGW_ATTR_USER_MANIFEST);
   if (attr_iter != attrs.end() && !skip_manifest) {
     op_ret = handle_user_manifest(attr_iter->second.c_str(), y);
@@ -2827,6 +2838,7 @@ void RGWStatBucket::execute(optional_yield y)
   if (op_ret) {
     return;
   }
+  op_ret = bucket->update_container_stats(s);
 }
 
 int RGWListBucket::verify_permission(optional_yield y)
@@ -3415,27 +3427,13 @@ void RGWDeleteBucket::execute(optional_yield y)
     return;
   }
 
-  string prefix, delimiter;
-
-  if (s->prot_flags & RGW_REST_SWIFT) {
-    string path_args;
-    path_args = s->info.args.get("path");
-    if (!path_args.empty()) {
-      if (!delimiter.empty() || !prefix.empty()) {
-        op_ret = -EINVAL;
-        return;
-      }
-      prefix = path_args;
-      delimiter="/";
-    }
-  }
-
-  op_ret = s->bucket->remove_bucket(this, false, prefix, delimiter, false, nullptr, y);
+  op_ret = s->bucket->remove_bucket(this, false, false, nullptr, y);
   if (op_ret < 0 && op_ret == -ECANCELED) {
       // lost a race, either with mdlog sync or another delete bucket operation.
       // in either case, we've already called ctl.bucket->unlink_bucket()
       op_ret = 0;
   }
+
   return;
 }
 
@@ -3488,6 +3486,9 @@ int RGWPutObj::init_processing(optional_yield y) {
 			      &bucket, y);
     if (ret < 0) {
       ldpp_dout(this, 5) << __func__ << "(): get_bucket() returned ret=" << ret << dendl;
+      if (ret == -ENOENT) {
+        ret = -ERR_NO_SUCH_BUCKET;
+      }
       return ret;
     }
 
@@ -3555,9 +3556,9 @@ int RGWPutObj::verify_permission(optional_yield y)
     cs_object->set_prefetch_data(s->obj_ctx);
 
     /* check source object permissions */
-    if (read_obj_policy(this, store, s, copy_source_bucket_info, cs_attrs, &cs_acl, nullptr,
-			policy, cs_bucket.get(), cs_object.get(), y, true) < 0) {
-      return -EACCES;
+    if (ret = read_obj_policy(this, store, s, copy_source_bucket_info, cs_attrs, &cs_acl, nullptr,
+			policy, cs_bucket.get(), cs_object.get(), y, true); ret < 0) {
+      return ret;
     }
 
     /* admin request overrides permission checks */
@@ -3648,7 +3649,6 @@ int RGWPutObj::verify_permission(optional_yield y)
       rgw_iam_add_buckettags(this, s);
 
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                            boost::none,
                                             rgw::IAM::s3PutObject,
                                             s->object->get_obj());
     if (identity_policy_res == Effect::Deny)
@@ -3669,7 +3669,6 @@ int RGWPutObj::verify_permission(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
       if (session_policy_res == Effect::Deny) {
@@ -3906,8 +3905,10 @@ void RGWPutObj::execute(optional_yield y)
   }
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(),
-						s, rgw::notify::ObjectCreatedPut);
+  std::unique_ptr<rgw::sal::Notification> res
+		     = store->get_notification(
+		       s->object.get(), s->src_object.get(), s,
+		       rgw::notify::ObjectCreatedPut);
   if(!multipart) {
     op_ret = res->publish_reserve(this, obj_tags.get());
     if (op_ret < 0) {
@@ -3923,11 +3924,14 @@ void RGWPutObj::execute(optional_yield y)
   rgw_placement_rule *pdest_placement = &s->dest_placement;
 
   if (multipart) {
-    s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, multipart_upload_id);
     std::unique_ptr<rgw::sal::MultipartUpload> upload;
     upload = s->bucket->get_multipart_upload(s->object->get_name(),
 					 multipart_upload_id);
     op_ret = upload->get_info(this, s->yield, s->obj_ctx, &pdest_placement);
+
+    s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, multipart_upload_id);
+    multipart_trace = tracing::rgw::tracer.add_span(name(), upload->get_trace());
+
     if (op_ret < 0) {
       if (op_ret != -ENOENT) {
         ldpp_dout(this, 0) << "ERROR: get_multipart_info returned " << op_ret << ": " << cpp_strerror(-op_ret) << dendl;
@@ -3972,7 +3976,6 @@ void RGWPutObj::execute(optional_yield y)
 		      << dendl;
     return;
   }
-
   if ((! copy_source.empty()) && !copy_source_range) {
     std::unique_ptr<rgw::sal::Bucket> bucket;
     op_ret = store->get_bucket(nullptr, copy_source_bucket_info, &bucket);
@@ -3989,6 +3992,18 @@ void RGWPutObj::execute(optional_yield y)
       ldpp_dout(this, 0) << "ERROR: get copy source obj state returned with error" << op_ret << dendl;
       return;
     }
+    bufferlist bl;
+    if (astate->get_attr(RGW_ATTR_MANIFEST, bl)) {
+      RGWObjManifest m;
+      decode(m, bl);
+      if (m.get_tier_type() == "cloud-s3") {
+        op_ret = -ERR_INVALID_OBJECT_STATE;
+        ldpp_dout(this, 0) << "ERROR: Cannot copy cloud tiered object. Failing with "
+		       << op_ret << dendl;
+        return;
+      }
+    }
+
     if (!astate->exists){
       op_ret = -ENOENT;
       return;
@@ -3997,7 +4012,6 @@ void RGWPutObj::execute(optional_yield y)
   } else {
     lst = copy_source_range_lst;
   }
-
   fst = copy_source_range_fst;
 
   // no filters by default
@@ -4232,7 +4246,6 @@ void RGWPostObj::execute(optional_yield y)
 
   if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                            boost::none,
                                             rgw::IAM::s3PutObject,
                                             s->object->get_obj());
     if (identity_policy_res == Effect::Deny) {
@@ -4256,7 +4269,6 @@ void RGWPostObj::execute(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
       if (session_policy_res == Effect::Deny) {
@@ -4295,7 +4307,8 @@ void RGWPostObj::execute(optional_yield y)
   }
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(), s, rgw::notify::ObjectCreatedPost);
+  std::unique_ptr<rgw::sal::Notification> res
+    = store->get_notification(s->object.get(), s->src_object.get(), s, rgw::notify::ObjectCreatedPost);
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -4812,7 +4825,7 @@ int RGWDeleteObj::verify_permission(optional_yield y)
 
   if (s->iam_policy || ! s->iam_user_policies.empty() || ! s->session_policies.empty()) {
     if (s->bucket->get_info().obj_lock_enabled() && bypass_governance_mode) {
-      auto r = eval_identity_or_session_policies(s->iam_user_policies, s->env, boost::none,
+      auto r = eval_identity_or_session_policies(s->iam_user_policies, s->env,
                                                rgw::IAM::s3BypassGovernanceRetention, ARN(s->bucket->get_key(), s->object->get_name()));
       if (r == Effect::Deny) {
         bypass_perm = false;
@@ -4823,7 +4836,7 @@ int RGWDeleteObj::verify_permission(optional_yield y)
           bypass_perm = false;
         }
       } else if (r == Effect::Pass && !s->session_policies.empty()) {
-        r = eval_identity_or_session_policies(s->session_policies, s->env, boost::none,
+        r = eval_identity_or_session_policies(s->session_policies, s->env,
                                                rgw::IAM::s3BypassGovernanceRetention, ARN(s->bucket->get_key(), s->object->get_name()));
         if (r == Effect::Deny) {
           bypass_perm = false;
@@ -4831,7 +4844,6 @@ int RGWDeleteObj::verify_permission(optional_yield y)
       }
     }
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               s->object->get_instance().empty() ?
                                               rgw::IAM::s3DeleteObject :
                                               rgw::IAM::s3DeleteObjectVersion,
@@ -4856,7 +4868,6 @@ int RGWDeleteObj::verify_permission(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               s->object->get_instance().empty() ?
                                               rgw::IAM::s3DeleteObject :
                                               rgw::IAM::s3DeleteObjectVersion,
@@ -4978,10 +4989,13 @@ void RGWDeleteObj::execute(optional_yield y)
 
     // make reservation for notification if needed
     const auto versioned_object = s->bucket->versioning_enabled();
-    const auto event_type = versioned_object && s->object->get_instance().empty() ? 
-        rgw::notify::ObjectRemovedDeleteMarkerCreated : rgw::notify::ObjectRemovedDelete;
-    std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(),
-									s, event_type);
+    const auto event_type = versioned_object &&
+      s->object->get_instance().empty() ?
+      rgw::notify::ObjectRemovedDeleteMarkerCreated :
+      rgw::notify::ObjectRemovedDelete;
+    std::unique_ptr<rgw::sal::Notification> res
+      = store->get_notification(s->object.get(), s->src_object.get(), s,
+				event_type);
     op_ret = res->publish_reserve(this);
     if (op_ret < 0) {
       return;
@@ -5151,7 +5165,6 @@ int RGWCopyObj::verify_permission(optional_yield y)
 
         ARN obj_arn(s->src_object->get_obj());
         auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                                  boost::none,
                                                   s->src_object->get_instance().empty() ?
                                                   rgw::IAM::s3GetObject :
                                                   rgw::IAM::s3GetObjectVersion,
@@ -5174,7 +5187,6 @@ int RGWCopyObj::verify_permission(optional_yield y)
 	}
         if (!s->session_policies.empty()) {
         auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                                  boost::none,
                                                   s->src_object->get_instance().empty() ?
                                                   rgw::IAM::s3GetObject :
                                                   rgw::IAM::s3GetObjectVersion,
@@ -5258,7 +5270,7 @@ int RGWCopyObj::verify_permission(optional_yield y)
 
       ARN obj_arn(dest_object->get_obj());
       auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies,
-                                                                  s->env, boost::none,
+                                                                  s->env,
                                                                   rgw::IAM::s3PutObject,
                                                                   obj_arn);
       if (identity_policy_res == Effect::Deny) {
@@ -5276,7 +5288,7 @@ int RGWCopyObj::verify_permission(optional_yield y)
         return -EACCES;
       }
       if (!s->session_policies.empty()) {
-        auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env, boost::none, rgw::IAM::s3PutObject, obj_arn);
+        auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env, rgw::IAM::s3PutObject, obj_arn);
         if (session_policy_res == Effect::Deny) {
             return false;
         }
@@ -5383,8 +5395,10 @@ void RGWCopyObj::execute(optional_yield y)
     return;
 
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(s->object.get(),
-						s, rgw::notify::ObjectCreatedCopy);
+  std::unique_ptr<rgw::sal::Notification> res
+				   = store->get_notification(
+				     s->object.get(), s->src_object.get(),
+				     s, rgw::notify::ObjectCreatedCopy);
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -5420,9 +5434,27 @@ void RGWCopyObj::execute(optional_yield y)
     if (op_ret < 0) {
       return;
     }
+
+    /* Check if the src object is cloud-tiered */
+    bufferlist bl;
+    if (astate->get_attr(RGW_ATTR_MANIFEST, bl)) {
+      RGWObjManifest m;
+      decode(m, bl);
+      if (m.get_tier_type() == "cloud-s3") {
+        op_ret = -ERR_INVALID_OBJECT_STATE;
+        ldpp_dout(this, 0) << "ERROR: Cannot copy cloud tiered object. Failing with "
+		       << op_ret << dendl;
+        return;
+      }
+    }
+
     obj_size = astate->size;
   
     if (!s->system_request) { // no quota enforcement for system requests
+      if (astate->accounted_size > static_cast<size_t>(s->cct->_conf->rgw_max_put_size)) {
+        op_ret = -ERR_TOO_LARGE;
+        return;
+      }
       // enforce quota against the destination bucket owner
       op_ret = dest_bucket->check_quota(this, user_quota, bucket_quota,
 				      astate->accounted_size, y);
@@ -6060,7 +6092,6 @@ int RGWInitMultipart::verify_permission(optional_yield y)
 
   if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
     if (identity_policy_res == Effect::Deny) {
@@ -6082,7 +6113,6 @@ int RGWInitMultipart::verify_permission(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
       if (session_policy_res == Effect::Deny) {
@@ -6125,7 +6155,7 @@ void RGWInitMultipart::pre_exec()
 
 void RGWInitMultipart::execute(optional_yield y)
 {
-  bufferlist aclbl;
+  bufferlist aclbl, tracebl;
   rgw::sal::Attrs attrs;
 
   if (get_params(y) < 0)
@@ -6133,6 +6163,11 @@ void RGWInitMultipart::execute(optional_yield y)
 
   if (rgw::sal::Object::empty(s->object.get()))
     return;
+
+  if (multipart_trace) {
+    tracing::encode(multipart_trace->GetContext(), tracebl);
+    attrs[RGW_ATTR_TRACE] = tracebl;
+  }
 
   policy.encode(aclbl);
   attrs[RGW_ATTR_ACL] = aclbl;
@@ -6158,6 +6193,7 @@ void RGWInitMultipart::execute(optional_yield y)
     upload_id = upload->get_upload_id();
   }
   s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);
+  multipart_trace->UpdateName(tracing::rgw::MULTIPART + upload_id);
 
 }
 
@@ -6169,7 +6205,6 @@ int RGWCompleteMultipart::verify_permission(optional_yield y)
 
   if (s->iam_policy || ! s->iam_user_policies.empty() || ! s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
     if (identity_policy_res == Effect::Deny) {
@@ -6191,7 +6226,6 @@ int RGWCompleteMultipart::verify_permission(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
       if (session_policy_res == Effect::Deny) {
@@ -6267,9 +6301,15 @@ void RGWCompleteMultipart::execute(optional_yield y)
 
   parts = static_cast<RGWMultiCompleteUpload *>(parser.find_first("CompleteMultipartUpload"));
   if (!parts || parts->parts.empty()) {
+    // CompletedMultipartUpload is incorrect but some versions of some libraries use it, see PR #41700
+    parts = static_cast<RGWMultiCompleteUpload *>(parser.find_first("CompletedMultipartUpload"));
+  }
+
+  if (!parts || parts->parts.empty()) {
     op_ret = -ERR_MALFORMED_XML;
     return;
   }
+
 
   if ((int)parts->parts.size() >
       s->cct->_conf->rgw_multipart_part_upload_limit) {
@@ -6278,8 +6318,6 @@ void RGWCompleteMultipart::execute(optional_yield y)
   }
 
   upload = s->bucket->get_multipart_upload(s->object->get_name(), upload_id);
-
-  s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);
 
   RGWCompressionInfo cs_info;
   bool compressed = false;
@@ -6317,10 +6355,15 @@ void RGWCompleteMultipart::execute(optional_yield y)
 		     << " ret=" << op_ret << dendl;
     return;
   }
+  s->trace->SetAttribute(tracing::rgw::UPLOAD_ID, upload_id);
+  jspan_context trace_ctx(false, false);
+  extract_span_context(meta_obj->get_attrs(), trace_ctx);
+  multipart_trace = tracing::rgw::tracer.add_span(name(), trace_ctx);
   
+
   // make reservation for notification if needed
-  std::unique_ptr<rgw::sal::Notification> res = store->get_notification(meta_obj.get(),
-				s, rgw::notify::ObjectCreatedCompleteMultipartUpload, &s->object->get_name());
+  std::unique_ptr<rgw::sal::Notification> res
+    = store->get_notification(meta_obj.get(), nullptr, s, rgw::notify::ObjectCreatedCompleteMultipartUpload, &s->object->get_name());
   op_ret = res->publish_reserve(this);
   if (op_ret < 0) {
     return;
@@ -6420,7 +6463,6 @@ int RGWAbortMultipart::verify_permission(optional_yield y)
 
   if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3AbortMultipartUpload,
                                               s->object->get_obj());
     if (identity_policy_res == Effect::Deny) {
@@ -6442,7 +6484,6 @@ int RGWAbortMultipart::verify_permission(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject,
                                               s->object->get_obj());
       if (session_policy_res == Effect::Deny) {
@@ -6488,7 +6529,7 @@ void RGWAbortMultipart::execute(optional_yield y)
   op_ret = -EINVAL;
   string upload_id;
   upload_id = s->info.args.get("uploadId");
-  rgw_obj meta_obj;
+  std::unique_ptr<rgw::sal::Object> meta_obj;
   std::unique_ptr<rgw::sal::MultipartUpload> upload;
 
   if (upload_id.empty() || rgw::sal::Object::empty(s->object.get()))
@@ -6496,6 +6537,17 @@ void RGWAbortMultipart::execute(optional_yield y)
 
   upload = s->bucket->get_multipart_upload(s->object->get_name(), upload_id);
   RGWObjectCtx *obj_ctx = static_cast<RGWObjectCtx *>(s->obj_ctx);
+
+  jspan_context trace_ctx(false, false);
+  if (tracing::rgw::tracer.is_enabled()) {
+    // read meta object attributes for trace info
+    meta_obj = upload->get_meta_obj();
+    meta_obj->set_in_extra_data(true);
+    meta_obj->get_obj_attrs(obj_ctx, s->yield, this);
+    extract_span_context(meta_obj->get_attrs(), trace_ctx);
+  }
+  multipart_trace = tracing::rgw::tracer.add_span(name(), trace_ctx);
+
   op_ret = upload->abort(this, s->cct, obj_ctx);
 }
 
@@ -6525,7 +6577,7 @@ void RGWListMultipart::execute(optional_yield y)
   upload = s->bucket->get_multipart_upload(s->object->get_name(), upload_id);
 
   rgw::sal::Attrs attrs;
-  op_ret = upload->get_info(this, s->yield, s->obj_ctx, nullptr, &attrs);
+  op_ret = upload->get_info(this, s->yield, s->obj_ctx, &placement, &attrs);
   /* decode policy */
   map<string, bufferlist>::iterator iter = attrs.find(RGW_ATTR_ACL);
   if (iter != attrs.end()) {
@@ -6619,7 +6671,7 @@ int RGWDeleteMultiObj::verify_permission(optional_yield y)
   if (s->iam_policy || ! s->iam_user_policies.empty() || ! s->session_policies.empty()) {
     if (s->bucket->get_info().obj_lock_enabled() && bypass_governance_mode) {
       ARN bucket_arn(s->bucket->get_key());
-      auto r = eval_identity_or_session_policies(s->iam_user_policies, s->env, boost::none,
+      auto r = eval_identity_or_session_policies(s->iam_user_policies, s->env,
                                                rgw::IAM::s3BypassGovernanceRetention, ARN(s->bucket->get_key()));
       if (r == Effect::Deny) {
         bypass_perm = false;
@@ -6630,7 +6682,7 @@ int RGWDeleteMultiObj::verify_permission(optional_yield y)
           bypass_perm = false;
         }
       } else if (r == Effect::Pass && !s->session_policies.empty()) {
-        r = eval_identity_or_session_policies(s->session_policies, s->env, boost::none,
+        r = eval_identity_or_session_policies(s->session_policies, s->env,
                                                rgw::IAM::s3BypassGovernanceRetention, ARN(s->bucket->get_key()));
         if (r == Effect::Deny) {
           bypass_perm = false;
@@ -6641,7 +6693,6 @@ int RGWDeleteMultiObj::verify_permission(optional_yield y)
     bool not_versioned = rgw::sal::Object::empty(s->object.get()) || s->object->get_instance().empty();
 
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               not_versioned ?
                                               rgw::IAM::s3DeleteObject :
                                               rgw::IAM::s3DeleteObjectVersion,
@@ -6666,7 +6717,6 @@ int RGWDeleteMultiObj::verify_permission(optional_yield y)
 
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               not_versioned ?
                                               rgw::IAM::s3DeleteObject :
                                               rgw::IAM::s3DeleteObjectVersion,
@@ -6779,7 +6829,6 @@ void RGWDeleteMultiObj::execute(optional_yield y)
     std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(*iter);
     if (s->iam_policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
       auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               iter->instance.empty() ?
                                               rgw::IAM::s3DeleteObject :
                                               rgw::IAM::s3DeleteObjectVersion,
@@ -6808,7 +6857,6 @@ void RGWDeleteMultiObj::execute(optional_yield y)
 
       if (!s->session_policies.empty()) {
         auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                                boost::none,
                                               iter->instance.empty() ?
                                               rgw::IAM::s3DeleteObject :
                                               rgw::IAM::s3DeleteObjectVersion,
@@ -6880,10 +6928,11 @@ void RGWDeleteMultiObj::execute(optional_yield y)
 
     // make reservation for notification if needed
     const auto versioned_object = s->bucket->versioning_enabled();
-    const auto event_type = versioned_object && obj->get_instance().empty() ? 
-        rgw::notify::ObjectRemovedDeleteMarkerCreated : rgw::notify::ObjectRemovedDelete;
-    std::unique_ptr<rgw::sal::Notification> res = store->get_notification(obj.get(),
-									s, event_type);
+    const auto event_type = versioned_object && obj->get_instance().empty() ?
+      rgw::notify::ObjectRemovedDeleteMarkerCreated :
+      rgw::notify::ObjectRemovedDelete;
+    std::unique_ptr<rgw::sal::Notification> res
+      = store->get_notification(obj.get(), s->src_object.get(), s, event_type);
     op_ret = res->publish_reserve(this);
     if (op_ret < 0) {
       send_partial_response(*iter, false, "", op_ret);
@@ -6987,7 +7036,7 @@ bool RGWBulkDelete::Deleter::delete_single(const acct_path_t& path, optional_yie
       goto delop_fail;
     }
   } else {
-    ret = bucket->remove_bucket(dpp, false, string(), string(), true, &s->info, s->yield);
+    ret = bucket->remove_bucket(dpp, false, true, &s->info, s->yield);
     if (ret < 0) {
       goto delop_fail;
     }
@@ -6995,7 +7044,6 @@ bool RGWBulkDelete::Deleter::delete_single(const acct_path_t& path, optional_yie
 
   num_deleted++;
   return true;
-
 
 binfo_fail:
     if (-ENOENT == ret) {
@@ -7274,7 +7322,6 @@ bool RGWBulkUploadOp::handle_file_verify_permission(RGWBucketInfo& binfo,
   bucket_owner = bacl.get_owner();
   if (policy || ! s->iam_user_policies.empty() || !s->session_policies.empty()) {
     auto identity_policy_res = eval_identity_or_session_policies(s->iam_user_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject, obj);
     if (identity_policy_res == Effect::Deny) {
       return false;
@@ -7290,7 +7337,6 @@ bool RGWBulkUploadOp::handle_file_verify_permission(RGWBucketInfo& binfo,
   
     if (!s->session_policies.empty()) {
       auto session_policy_res = eval_identity_or_session_policies(s->session_policies, s->env,
-                                              boost::none,
                                               rgw::IAM::s3PutObject, obj);
       if (session_policy_res == Effect::Deny) {
           return false;
@@ -7343,9 +7389,10 @@ int RGWBulkUploadOp::handle_file(const std::string_view path,
   ACLOwner bowner;
 
   op_ret = store->get_bucket(this, s->user.get(), rgw_bucket(rgw_bucket_key(s->user->get_tenant(), bucket_name)), &bucket, y);
-  if (op_ret == -ENOENT) {
-    ldpp_dout(this, 20) << "non existent directory=" << bucket_name << dendl;
-  } else if (op_ret < 0) {
+  if (op_ret < 0) {
+    if (op_ret == -ENOENT) {
+      ldpp_dout(this, 20) << "non existent directory=" << bucket_name << dendl;
+    }
     return op_ret;
   }
 
@@ -8689,3 +8736,11 @@ void RGWDeleteBucketEncryption::execute(optional_yield y)
     return op_ret;
   });
 }
+
+void rgw_slo_entry::decode_json(JSONObj *obj)
+{
+  JSONDecoder::decode_json("path", path, obj);
+  JSONDecoder::decode_json("etag", etag, obj);
+  JSONDecoder::decode_json("size_bytes", size_bytes, obj);
+};
+

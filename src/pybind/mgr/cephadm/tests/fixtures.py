@@ -14,8 +14,14 @@ except ImportError:
     pass
 
 from cephadm import CephadmOrchestrator
-from orchestrator import raise_if_exception, OrchResult, HostSpec
+from orchestrator import raise_if_exception, OrchResult, HostSpec, DaemonDescriptionStatus
 from tests import mock
+
+
+def async_side_effect(result):
+    async def side_effect(*args, **kwargs):
+        return result
+    return side_effect
 
 
 def get_ceph_option(_, key):
@@ -23,7 +29,7 @@ def get_ceph_option(_, key):
 
 
 def _run_cephadm(ret):
-    def foo(s, host, entity, cmd, e, **kwargs):
+    async def foo(s, host, entity, cmd, e, **kwargs):
         if cmd == 'gather-facts':
             return '{}', '', 0
         return [ret], '', 0
@@ -58,7 +64,7 @@ def receive_agent_metadata(m: CephadmOrchestrator, host: str, ops: List[str] = N
     }
     if ops:
         for op in ops:
-            out = CephadmServe(m)._run_cephadm_json(host, cephadmNoImage, op, [])
+            out = m.wait_async(CephadmServe(m)._run_cephadm_json(host, cephadmNoImage, op, []))
             to_update[op](host, out)
     m.cache.last_daemon_update[host] = datetime_now()
     m.cache.last_facts_update[host] = datetime_now()
@@ -80,7 +86,6 @@ def with_cephadm_module(module_options=None, store=None):
     with mock.patch("cephadm.module.CephadmOrchestrator.get_ceph_option", get_ceph_option),\
             mock.patch("cephadm.services.osd.RemoveUtil._run_mon_cmd"), \
             mock.patch("cephadm.module.CephadmOrchestrator.get_osdmap"), \
-            mock.patch("cephadm.services.osd.OSDService.get_osdspec_affinity", return_value='test_spec'), \
             mock.patch("cephadm.module.CephadmOrchestrator.remote"), \
             mock.patch("cephadm.agent.CephadmAgentHelpers._request_agent_acks"), \
             mock.patch("cephadm.agent.CephadmAgentHelpers._apply_agent", return_value=False), \
@@ -124,15 +129,14 @@ def wait(m, c):
 
 
 @contextmanager
-def with_host(m: CephadmOrchestrator, name, addr='1::4', refresh_hosts=True):
-    # type: (CephadmOrchestrator, str) -> None
+def with_host(m: CephadmOrchestrator, name, addr='1::4', refresh_hosts=True, rm_with_force=True):
     with mock.patch("cephadm.utils.resolve_ip", return_value=addr):
         wait(m, m.add_host(HostSpec(hostname=name)))
         if refresh_hosts:
             CephadmServe(m)._refresh_hosts_and_daemons()
             receive_agent_metadata(m, name)
         yield
-        wait(m, m.remove_host(name))
+        wait(m, m.remove_host(name, force=rm_with_force))
 
 
 def assert_rm_service(cephadm: CephadmOrchestrator, srv_name):
@@ -152,7 +156,7 @@ def assert_rm_service(cephadm: CephadmOrchestrator, srv_name):
 
 
 @contextmanager
-def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=None, host: str = '') -> Iterator[List[str]]:
+def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=None, host: str = '', status_running=False) -> Iterator[List[str]]:
     if spec.placement.is_empty() and host:
         spec.placement = PlacementSpec(hosts=[host], count=1)
     if meth is not None:
@@ -167,9 +171,12 @@ def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=No
 
     CephadmServe(cephadm_module)._apply_all_services()
 
+    if status_running:
+        make_daemons_running(cephadm_module, spec.service_name())
+
     dds = wait(cephadm_module, cephadm_module.list_daemons())
     own_dds = [dd for dd in dds if dd.service_name() == spec.service_name()]
-    if host:
+    if host and spec.service_type != 'osd':
         assert own_dds
 
     yield [dd.name() for dd in own_dds]
@@ -177,7 +184,7 @@ def with_service(cephadm_module: CephadmOrchestrator, spec: ServiceSpec, meth=No
     assert_rm_service(cephadm_module, spec.service_name())
 
 
-def _deploy_cephadm_binary(host):
-    def foo(*args, **kwargs):
-        return True
-    return foo
+def make_daemons_running(cephadm_module, service_name):
+    own_dds = cephadm_module.cache.get_daemons_by_service(service_name)
+    for dd in own_dds:
+        dd.status = DaemonDescriptionStatus.running  # We're changing the reference

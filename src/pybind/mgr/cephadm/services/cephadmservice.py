@@ -986,6 +986,18 @@ class CrashService(CephService):
 class CephfsMirrorService(CephService):
     TYPE = 'cephfs-mirror'
 
+    def config(self, spec: ServiceSpec) -> None:
+        # make sure mirroring module is enabled
+        mgr_map = self.mgr.get('mgr_map')
+        mod_name = 'mirroring'
+        if mod_name not in mgr_map.get('services', {}):
+            self.mgr.check_mon_command({
+                'prefix': 'mgr module enable',
+                'module': mod_name
+            })
+            # we shouldn't get here (mon will tell the mgr to respawn), but no
+            # harm done if we do.
+
     def prepare_create(self, daemon_spec: CephadmDaemonDeploySpec) -> CephadmDaemonDeploySpec:
         assert self.TYPE == daemon_spec.daemon_type
 
@@ -1035,7 +1047,7 @@ class CephadmAgent(CephService):
                'refresh_period': self.mgr.agent_refresh_rate,
                'listener_port': self.mgr.agent_starting_port,
                'host': daemon_spec.host,
-               'device_enhanced_scan': str(self.mgr.get_module_option('device_enhanced_scan'))}
+               'device_enhanced_scan': str(self.mgr.device_enhanced_scan)}
 
         listener_cert, listener_key = self.mgr.cherrypy_thread.ssl_certs.generate_cert(
             self.mgr.inventory.get_addr(daemon_spec.host))

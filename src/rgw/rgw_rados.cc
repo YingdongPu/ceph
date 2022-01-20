@@ -1311,8 +1311,10 @@ int RGWRados::init_complete(const DoutPrefixProvider *dpp)
       sync_log_trimmer->start();
     }
   }
-  data_notifier = new RGWDataNotifier(this);
-  data_notifier->start();
+  if (cct->_conf->rgw_data_notify_interval_msec) {
+    data_notifier = new RGWDataNotifier(this);
+    data_notifier->start();
+  }
 
   binfo_cache = new RGWChainedCacheImpl<bucket_info_entry>;
   binfo_cache->init(svc.cache);
@@ -2420,6 +2422,11 @@ bool RGWRados::obj_to_raw(const rgw_placement_rule& placement_rule, const rgw_ob
   return get_obj_data_pool(placement_rule, obj, &raw_obj->pool);
 }
 
+std::string RGWRados::get_cluster_fsid(const DoutPrefixProvider *dpp, optional_yield y)
+{
+  return svc.rados->cluster_fsid();
+}
+
 int RGWRados::get_obj_head_ioctx(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj, librados::IoCtx *ioctx)
 {
   string oid, key;
@@ -3339,7 +3346,7 @@ int RGWRados::Object::Write::_do_write_meta(const DoutPrefixProvider *dpp,
   return 0;
 
 done_cancel:
-  int ret = index_op->cancel(dpp);
+  int ret = index_op->cancel(dpp, meta.remove_objs);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << "ERROR: index_op.cancel()() returned ret=" << ret << dendl;
   }
@@ -5324,7 +5331,7 @@ int RGWRados::Object::Delete::delete_obj(optional_yield y, const DoutPrefixProvi
     }
     /* other than that, no need to propagate error */
   } else {
-    int ret = index_op.cancel(dpp);
+    int ret = index_op.cancel(dpp, params.remove_objs);
     if (ret < 0) {
       ldpp_dout(dpp, 0) << "ERROR: index_op.cancel() returned ret=" << ret << dendl;
     }
@@ -6022,7 +6029,7 @@ int RGWRados::set_attrs(const DoutPrefixProvider *dpp, void *ctx, const RGWBucke
                             mtime, etag, content_type, storage_class, &acl_bl,
                             RGWObjCategory::Main, NULL);
     } else {
-      int ret = index_op.cancel(dpp);
+      int ret = index_op.cancel(dpp, nullptr);
       if (ret < 0) {
         ldpp_dout(dpp, 0) << "ERROR: complete_update_index_cancel() returned ret=" << ret << dendl;
       }
@@ -6327,7 +6334,8 @@ int RGWRados::Bucket::UpdateIndex::complete_del(const DoutPrefixProvider *dpp,
 }
 
 
-int RGWRados::Bucket::UpdateIndex::cancel(const DoutPrefixProvider *dpp)
+int RGWRados::Bucket::UpdateIndex::cancel(const DoutPrefixProvider *dpp,
+                                          list<rgw_obj_index_key> *remove_objs)
 {
   if (blind) {
     return 0;
@@ -6336,7 +6344,7 @@ int RGWRados::Bucket::UpdateIndex::cancel(const DoutPrefixProvider *dpp)
   BucketShard *bs;
 
   int ret = guard_reshard(dpp, &bs, [&](BucketShard *bs) -> int {
-				 return store->cls_obj_complete_cancel(*bs, optag, obj, bilog_flags, zones_trace);
+				 return store->cls_obj_complete_cancel(*bs, optag, obj, remove_objs, bilog_flags, zones_trace);
 			       });
 
   /*
@@ -8222,7 +8230,14 @@ int RGWRados::bi_put(BucketShard& bs, rgw_cls_bi_entry& entry)
 
 int RGWRados::bi_put(const DoutPrefixProvider *dpp, rgw_bucket& bucket, rgw_obj& obj, rgw_cls_bi_entry& entry)
 {
+  // make sure incomplete multipart uploads are hashed correctly
+  if (obj.key.ns == RGW_OBJ_NS_MULTIPART) {
+    RGWMPObj mp;
+    mp.from_meta(obj.key.name);
+    obj.index_hash_source = mp.get_key();
+  }
   BucketShard bs(this);
+
   int ret = bs.init(bucket, obj, nullptr /* no RGWBucketInfo */, dpp);
   if (ret < 0) {
     ldpp_dout(dpp, 5) << "bs.init() returned ret=" << ret << dendl;
@@ -8328,12 +8343,12 @@ int RGWRados::list_lc_progress(string& marker, uint32_t max_entries,
   return lc->list_lc_progress(marker, max_entries, progress_map, index);
 }
 
-int RGWRados::process_lc()
+int RGWRados::process_lc(const std::unique_ptr<rgw::sal::Bucket>& optional_bucket)
 {
   RGWLC lc;
   lc.initialize(cct, this->store);
   RGWLC::LCWorker worker(&lc, cct, &lc, 0);
-  auto ret = lc.process(&worker, true /* once */);
+  auto ret = lc.process(&worker, optional_bucket, true /* once */);
   lc.stop_processor(); // sets down_flag, but returns immediately
   return ret;
 }
@@ -8415,13 +8430,15 @@ int RGWRados::cls_obj_complete_del(BucketShard& bs, string& tag,
 			     bilog_flags, zones_trace);
 }
 
-int RGWRados::cls_obj_complete_cancel(BucketShard& bs, string& tag, rgw_obj& obj, uint16_t bilog_flags, rgw_zone_set *zones_trace)
+int RGWRados::cls_obj_complete_cancel(BucketShard& bs, string& tag, rgw_obj& obj,
+                                      list<rgw_obj_index_key> *remove_objs,
+                                      uint16_t bilog_flags, rgw_zone_set *zones_trace)
 {
   rgw_bucket_dir_entry ent;
   obj.key.get_index_key(&ent.key);
   return cls_obj_complete_op(bs, obj, CLS_RGW_OP_CANCEL, tag,
 			     -1 /* pool id */, 0, ent,
-			     RGWObjCategory::None, NULL, bilog_flags,
+			     RGWObjCategory::None, remove_objs, bilog_flags,
 			     zones_trace);
 }
 
@@ -8759,8 +8776,9 @@ int RGWRados::cls_bucket_list_ordered(const DoutPrefixProvider *dpp,
 }
 
 
-// A helper function to retrieve the hash source from an incomplete multipart entry
-// by removing everything from the second last dot to the end.
+// A helper function to retrieve the hash source from an incomplete
+// multipart entry by removing everything from the second to last
+// period on.
 static int parse_index_hash_source(const std::string& oid_wo_ns, std::string *index_hash_source) {
   std::size_t found = oid_wo_ns.rfind('.');
   if (found == std::string::npos || found < 1) {
@@ -8830,7 +8848,7 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
     rgw_obj_key obj_key;
     bool parsed = rgw_obj_key::parse_raw_oid(start_after.name, &obj_key);
     if (!parsed) {
-      ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	" received an invalid start marker: \"" << start_after << "\"" <<
 	dendl;
       return -EINVAL;
@@ -8851,8 +8869,9 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
         string index_hash_source;
         r = parse_index_hash_source(obj_key.name, &index_hash_source);
         if (r < 0) {
-	  ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
-	    " error in parse_index_hash_source, r=" << r << dendl;
+	  ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
+	    " parse_index_hash_source unable to parse \"" << obj_key.name <<
+	    "\", r=" << r << dendl;
           return r;
         }
         current_shard = svc.bi_rados->bucket_shard_index(index_hash_source, num_shards);
@@ -8878,7 +8897,7 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
                            list_versions, &result);
     r = rgw_rados_operate(dpp, ioctx, oid, &op, nullptr, null_yield);
     if (r < 0) {
-      ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+      ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	" error in rgw_rados_operate (bucket list op), r=" << r << dendl;
       return r;
     }
@@ -8897,7 +8916,7 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
 	sub_ctx.dup(ioctx);
 	r = check_disk_state(dpp, sub_ctx, bucket_info, dirent, dirent, updates[oid], y);
 	if (r < 0 && r != -ENOENT) {
-	  ldpp_dout(dpp, 0) << "ERROR: " << __PRETTY_FUNCTION__ <<
+	  ldpp_dout(dpp, 0) << "ERROR: " << __func__ <<
 	    " error in check_disk_state, r=" << r << dendl;
 	  return r;
 	}
@@ -8907,7 +8926,7 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
 
       // at this point either r >= 0 or r == -ENOENT
       if (r >= 0) { // i.e., if r != -ENOENT
-	ldpp_dout(dpp, 10) << __PRETTY_FUNCTION__ << ": got " <<
+	ldpp_dout(dpp, 10) << __func__ << ": got " <<
 	  dirent.key << dendl;
 
 	if (count < num_entries) {
@@ -8917,7 +8936,7 @@ int RGWRados::cls_bucket_list_unordered(const DoutPrefixProvider *dpp,
 	} else {
 	  last_added_entry = dirent.key;
 	  *is_truncated = true;
-	  ldpp_dout(dpp, 10) << "ERROR: " << __PRETTY_FUNCTION__ <<
+	  ldpp_dout(dpp, 10) << "INFO: " << __func__ <<
 	    ": reached max entries (" << num_entries << ") to return at \"" <<
 	    dirent.key << "\"" << dendl;
 	  goto check_updates;
@@ -9440,3 +9459,46 @@ int RGWRados::delete_obj_aio(const DoutPrefixProvider *dpp, const rgw_obj& obj,
   }
   return ret;
 }
+
+void objexp_hint_entry::generate_test_instances(list<objexp_hint_entry*>& o)
+{
+  auto it = new objexp_hint_entry;
+  it->tenant = "tenant1";
+  it->bucket_name = "bucket1";
+  it->bucket_id = "1234";
+  it->obj_key = rgw_obj_key("obj");
+  o.push_back(it);
+  o.push_back(new objexp_hint_entry);
+}
+
+void objexp_hint_entry::dump(Formatter *f) const
+{
+  f->open_object_section("objexp_hint_entry");
+  encode_json("tenant", tenant, f);
+  encode_json("bucket_name", bucket_name, f);
+  encode_json("bucket_id", bucket_id, f);
+  encode_json("rgw_obj_key", obj_key, f);
+  utime_t ut(exp_time);
+  encode_json("exp_time", ut, f);
+  f->close_section();
+}
+
+void RGWOLHInfo::generate_test_instances(list<RGWOLHInfo*> &o)
+{
+  RGWOLHInfo *olh = new RGWOLHInfo;
+  olh->removed = false;
+  o.push_back(olh);
+  o.push_back(new RGWOLHInfo);
+}
+
+void RGWOLHInfo::dump(Formatter *f) const
+{
+  encode_json("target", target, f);
+}
+
+void RGWOLHPendingInfo::dump(Formatter *f) const
+{
+  utime_t ut(time);
+  encode_json("time", ut, f);
+}
+

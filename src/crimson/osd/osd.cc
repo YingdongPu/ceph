@@ -21,12 +21,7 @@
 #include "messages/MOSDMap.h"
 #include "messages/MOSDMarkMeDown.h"
 #include "messages/MOSDOp.h"
-#include "messages/MOSDPGLog.h"
-#include "messages/MOSDPGPull.h"
-#include "messages/MOSDPGPush.h"
-#include "messages/MOSDPGPushReply.h"
-#include "messages/MOSDPGRecoveryDelete.h"
-#include "messages/MOSDPGRecoveryDeleteReply.h"
+#include "messages/MOSDPeeringOp.h"
 #include "messages/MOSDRepOpReply.h"
 #include "messages/MOSDScrub2.h"
 #include "messages/MPGStats.h"
@@ -226,6 +221,7 @@ seastar::future<> OSD::_write_superblock()
         ceph::os::Transaction t;
         meta_coll->create(t);
         meta_coll->store_superblock(t, superblock);
+        logger().debug("OSD::_write_superblock: do_transaction...");
         return store.do_transaction(meta_coll->collection(), std::move(t));
       });
     }
@@ -451,15 +447,29 @@ seastar::future<> OSD::_send_boot()
 {
   state.set_booting();
 
-  logger().info("hb_back_msgr: {}", heartbeat->get_back_addrs());
-  logger().info("hb_front_msgr: {}", heartbeat->get_front_addrs());
-  logger().info("cluster_msgr: {}", cluster_msgr->get_myaddr());
+  entity_addrvec_t public_addrs = public_msgr->get_myaddrs();
+  entity_addrvec_t cluster_addrs = cluster_msgr->get_myaddrs();
+  entity_addrvec_t hb_back_addrs = heartbeat->get_back_addrs();
+  entity_addrvec_t hb_front_addrs = heartbeat->get_front_addrs();
+  if (cluster_msgr->set_addr_unknowns(public_addrs)) {
+    cluster_addrs = cluster_msgr->get_myaddrs();
+  }
+  if (heartbeat->get_back_msgr()->set_addr_unknowns(cluster_addrs)) {
+    hb_back_addrs = heartbeat->get_back_addrs();
+  }
+  if (heartbeat->get_front_msgr()->set_addr_unknowns(public_addrs)) {
+    hb_front_addrs = heartbeat->get_front_addrs();
+  }
+  logger().info("hb_back_msgr: {}", hb_back_addrs);
+  logger().info("hb_front_msgr: {}", hb_front_addrs);
+  logger().info("cluster_msgr: {}", cluster_addrs);
+
   auto m = crimson::make_message<MOSDBoot>(superblock,
                                   osdmap->get_epoch(),
                                   boot_epoch,
-                                  heartbeat->get_back_addrs(),
-                                  heartbeat->get_front_addrs(),
-                                  cluster_msgr->get_myaddrs(),
+                                  hb_back_addrs,
+                                  hb_front_addrs,
+                                  cluster_addrs,
                                   CEPH_FEATURES_ALL);
   collect_sys_info(&m->metadata, NULL);
   return monc->send_message(std::move(m));
@@ -1097,6 +1107,7 @@ seastar::future<> OSD::handle_osd_map(crimson::net::ConnectionRef conn,
         superblock.clean_thru = last;
       }
       meta_coll->store_superblock(t, superblock);
+      logger().debug("OSD::handle_osd_map: do_transaction...");
       return store.do_transaction(meta_coll->collection(), std::move(t));
     });
   }).then([=] {

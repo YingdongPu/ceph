@@ -15,7 +15,6 @@
 #include "include/buffer.h"
 #include "include/denc.h"
 
-#include "crimson/common/log.h"
 #include "crimson/os/seastore/extent_reader.h"
 #include "crimson/os/seastore/segment_manager.h"
 #include "crimson/os/seastore/ordering_handle.h"
@@ -64,9 +63,7 @@ public:
     crimson::ct_error::input_output_error
     >;
   using open_for_write_ret = open_for_write_ertr::future<journal_seq_t>;
-  open_for_write_ret open_for_write() {
-    return journal_segment_manager.open();
-  }
+  open_for_write_ret open_for_write();
 
   /**
    * close journal
@@ -75,40 +72,36 @@ public:
    */
   using close_ertr = crimson::errorator<
     crimson::ct_error::input_output_error>;
-  close_ertr::future<> close() {
-    metrics.clear();
-    return journal_segment_manager.close();
-  }
+  close_ertr::future<> close();
 
   /**
    * submit_record
    *
    * write record with the ordering handle
    */
-  struct write_result_t {
-    journal_seq_t start_seq;
-    segment_off_t length;
-
-    journal_seq_t get_end_seq() const {
-      return start_seq.add_offset(length);
-    }
-  };
-  struct submit_result_t {
-    paddr_t record_block_base;
-    write_result_t write_result;
-  };
   using submit_record_ertr = crimson::errorator<
     crimson::ct_error::erange,
     crimson::ct_error::input_output_error
     >;
   using submit_record_ret = submit_record_ertr::future<
-    submit_result_t
+    record_locator_t
     >;
   submit_record_ret submit_record(
     record_t &&record,
     OrderingHandle &handle
   ) {
     return record_submitter.submit(std::move(record), handle);
+  }
+
+  /**
+   * flush
+   *
+   * Wait for all outstanding IOs on handle to commit.
+   * Note, flush() machinery must go through the same pipeline
+   * stages and locks as submit_record.
+   */
+  seastar::future<> flush(OrderingHandle &handle) {
+    return record_submitter.flush(handle);
   }
 
   /**
@@ -120,7 +113,7 @@ public:
   using replay_ertr = SegmentManager::read_ertr;
   using replay_ret = replay_ertr::future<>;
   using delta_handler_t = std::function<
-    replay_ret(const submit_result_t&,
+    replay_ret(const record_locator_t&,
 	       const delta_info_t&)>;
   replay_ret replay(
     std::vector<std::pair<segment_id_t, segment_header_t>>&& segment_headers,
@@ -141,6 +134,10 @@ private:
       return segment_manager.get_segment_size() -
              p2align(ceph::encoded_sizeof_bounded<segment_header_t>(),
                      size_t(segment_manager.get_block_size()));
+    }
+
+    device_id_t get_device_id() const {
+      return segment_manager.get_device_id();
     }
 
     segment_off_t get_block_size() const {
@@ -169,11 +166,7 @@ private:
 
     using open_ertr = base_ertr;
     using open_ret = open_ertr::future<journal_seq_t>;
-    open_ret open() {
-      return roll().safe_then([this] {
-        return get_current_write_seq();
-      });
-    }
+    open_ret open();
 
     using close_ertr = base_ertr;
     close_ertr::future<> close();
@@ -202,7 +195,8 @@ private:
       assert(current_journal_segment);
       return journal_seq_t{
         get_segment_seq(),
-        {current_journal_segment->get_segment_id(), written_to}
+        paddr_t::make_seg_paddr(current_journal_segment->get_segment_id(),
+	  written_to)
       };
     }
 
@@ -261,19 +255,22 @@ private:
     }
 
     std::size_t get_num_records() const {
-      return records.size();
+      return pending.get_size();
     }
 
-    // return the expected write size if allows to batch,
-    // otherwise, return 0
-    std::size_t can_batch(const record_size_t& rsize) const {
+    // return the expected write sizes if allows to batch,
+    // otherwise, return nullopt
+    std::optional<record_group_size_t> can_batch(
+        const record_t& record,
+        extent_len_t block_size) const {
       assert(state != state_t::SUBMITTING);
-      if (records.size() >= batch_capacity ||
-          static_cast<std::size_t>(encoded_length) > batch_flush_size) {
+      if (pending.get_size() >= batch_capacity ||
+          (pending.get_size() > 0 &&
+           pending.size.get_encoded_length() > batch_flush_size)) {
         assert(state == state_t::PENDING);
-        return 0;
+        return std::nullopt;
       }
-      return get_encoded_length(rsize);
+      return get_encoded_length_after(record, block_size);
     }
 
     void initialize(std::size_t i,
@@ -283,8 +280,7 @@ private:
       index = i;
       batch_capacity = _batch_capacity;
       batch_flush_size = _batch_flush_size;
-      records.reserve(batch_capacity);
-      record_sizes.reserve(batch_capacity);
+      pending.reserve(batch_capacity);
     }
 
     // Add to the batch, the future will be resolved after the batch is
@@ -293,12 +289,14 @@ private:
     // Set write_result_t::write_length to 0 if the record is not the first one
     // in the batch.
     using add_pending_ertr = JournalSegmentManager::write_ertr;
-    using add_pending_ret = add_pending_ertr::future<submit_result_t>;
-    add_pending_ret add_pending(record_t&&, const record_size_t&);
+    using add_pending_ret = add_pending_ertr::future<record_locator_t>;
+    add_pending_ret add_pending(
+        record_t&&,
+        OrderingHandle&,
+        extent_len_t block_size);
 
     // Encode the batched records for write.
-    ceph::bufferlist encode_records(
-        size_t block_size,
+    std::pair<ceph::bufferlist, record_group_size_t> encode_batch(
         const journal_seq_t& committed_to,
         segment_nonce_t segment_nonce);
 
@@ -309,32 +307,40 @@ private:
     // The fast path that is equivalent to submit a single record as a batch.
     //
     // Essentially, equivalent to the combined logic of:
-    // add_pending(), encode_records() and set_result() above without
+    // add_pending(), encode_batch() and set_result() above without
     // the intervention of the shared io_promise.
     //
     // Note the current RecordBatch can be reused afterwards.
-    ceph::bufferlist submit_pending_fast(
+    std::pair<ceph::bufferlist, record_group_size_t> submit_pending_fast(
         record_t&&,
-        const record_size_t&,
-        size_t block_size,
+        extent_len_t block_size,
         const journal_seq_t& committed_to,
         segment_nonce_t segment_nonce);
 
   private:
-    std::size_t get_encoded_length(const record_size_t& rsize) const {
-      auto ret = encoded_length + rsize.mdlength + rsize.dlength;
-      assert(ret > 0);
-      return ret;
+    record_group_size_t get_encoded_length_after(
+        const record_t& record,
+        extent_len_t block_size) const {
+      return pending.size.get_encoded_length_after(
+          record.size, block_size);
     }
 
     state_t state = state_t::EMPTY;
     std::size_t index = 0;
     std::size_t batch_capacity = 0;
     std::size_t batch_flush_size = 0;
-    segment_off_t encoded_length = 0;
-    std::vector<record_t> records;
-    std::vector<record_size_t> record_sizes;
-    std::optional<seastar::shared_promise<maybe_result_t> > io_promise;
+
+    record_group_t pending;
+    std::size_t submitting_size = 0;
+    segment_off_t submitting_length = 0;
+    segment_off_t submitting_mdlength = 0;
+
+    struct promise_result_t {
+      write_result_t write_result;
+      segment_off_t mdlength;
+    };
+    using maybe_promise_result_t = std::optional<promise_result_t>;
+    std::optional<seastar::shared_promise<maybe_promise_result_t> > io_promise;
   };
 
   class RecordSubmitter {
@@ -359,19 +365,31 @@ private:
     RecordSubmitter(std::size_t io_depth,
                     std::size_t batch_capacity,
                     std::size_t batch_flush_size,
+                    double preferred_fullness,
                     JournalSegmentManager&);
 
     grouped_io_stats get_record_batch_stats() const {
-      return record_batch_stats;
+      return stats.record_batch_stats;
     }
 
     grouped_io_stats get_io_depth_stats() const {
-      return io_depth_stats;
+      return stats.io_depth_stats;
+    }
+
+    uint64_t get_record_group_padding_bytes() const {
+      return stats.record_group_padding_bytes;
+    }
+
+    uint64_t get_record_group_metadata_bytes() const {
+      return stats.record_group_metadata_bytes;
+    }
+
+    uint64_t get_record_group_data_bytes() const {
+      return stats.record_group_data_bytes;
     }
 
     void reset_stats() {
-      record_batch_stats = {};
-      io_depth_stats = {};
+      stats = {};
     }
 
     void set_write_pipeline(WritePipeline *_write_pipeline) {
@@ -380,34 +398,18 @@ private:
 
     using submit_ret = Journal::submit_record_ret;
     submit_ret submit(record_t&&, OrderingHandle&);
+    seastar::future<> flush(OrderingHandle &handle);
 
   private:
     void update_state();
 
     void increment_io() {
       ++num_outstanding_io;
-      io_depth_stats.increment(num_outstanding_io);
+      stats.io_depth_stats.increment(num_outstanding_io);
       update_state();
     }
 
-    void decrement_io_with_flush() {
-      assert(num_outstanding_io > 0);
-      --num_outstanding_io;
-#ifndef NDEBUG
-      auto prv_state = state;
-#endif
-      update_state();
-
-      if (wait_submit_promise.has_value()) {
-        assert(prv_state == state_t::FULL);
-        wait_submit_promise->set_value();
-        wait_submit_promise.reset();
-      }
-
-      if (!p_current_batch->is_empty()) {
-        flush_current_batch();
-      }
-    }
+    void decrement_io_with_flush();
 
     void pop_free_batch() {
       assert(p_current_batch == nullptr);
@@ -418,6 +420,8 @@ private:
       free_batch_ptrs.pop_front();
     }
 
+    void account_submission(std::size_t, const record_group_size_t&);
+
     using maybe_result_t = RecordBatch::maybe_result_t;
     void finish_submit_batch(RecordBatch*, maybe_result_t);
 
@@ -425,17 +429,18 @@ private:
 
     using submit_pending_ertr = JournalSegmentManager::write_ertr;
     using submit_pending_ret = submit_pending_ertr::future<
-      submit_result_t>;
+      record_locator_t>;
     submit_pending_ret submit_pending(
-        record_t&&, const record_size_t&, OrderingHandle &handle, bool flush);
+        record_t&&, OrderingHandle &handle, bool flush);
 
     using do_submit_ret = submit_pending_ret;
     do_submit_ret do_submit(
-        record_t&&, const record_size_t&, OrderingHandle&);
+        record_t&&, OrderingHandle&);
 
     state_t state = state_t::IDLE;
     std::size_t num_outstanding_io = 0;
     std::size_t io_depth_limit;
+    double preferred_fullness;
 
     WritePipeline* write_pipeline = nullptr;
     JournalSegmentManager& journal_segment_manager;
@@ -446,8 +451,13 @@ private:
     seastar::circular_buffer<RecordBatch*> free_batch_ptrs;
     std::optional<seastar::promise<> > wait_submit_promise;
 
-    grouped_io_stats record_batch_stats;
-    grouped_io_stats io_depth_stats;
+    struct {
+      grouped_io_stats record_batch_stats;
+      grouped_io_stats io_depth_stats;
+      uint64_t record_group_padding_bytes = 0;
+      uint64_t record_group_metadata_bytes = 0;
+      uint64_t record_group_data_bytes = 0;
+    } stats;
   };
 
   SegmentProvider* segment_provider = nullptr;
@@ -466,11 +476,6 @@ private:
     replay_segments_t>;
   prep_replay_segments_fut prep_replay_segments(
     std::vector<std::pair<segment_id_t, segment_header_t>> segments);
-
-  /// attempts to decode deltas from bl, return nullopt if unsuccessful
-  std::optional<std::vector<delta_info_t>> try_decode_deltas(
-    record_header_t header,
-    const bufferlist &bl);
 
   /// replays records starting at start through end of segment
   replay_ertr::future<>

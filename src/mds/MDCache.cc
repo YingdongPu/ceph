@@ -157,6 +157,8 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   export_ephemeral_random_config =  g_conf().get_val<bool>("mds_export_ephemeral_random");
   export_ephemeral_random_max = g_conf().get_val<double>("mds_export_ephemeral_random_max");
 
+  symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
+
   lru.lru_set_midpoint(g_conf().get_val<double>("mds_cache_mid"));
 
   bottom_lru.lru_set_midpoint(0);
@@ -212,6 +214,10 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
     lru.lru_set_midpoint(g_conf().get_val<double>("mds_cache_mid"));
   if (changed.count("mds_cache_trim_decay_rate")) {
     trim_counter = DecayCounter(g_conf().get_val<double>("mds_cache_trim_decay_rate"));
+  }
+  if (changed.count("mds_symlink_recovery")) {
+    symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
+    dout(10) << "Storing symlink targets on file object's head " << symlink_recovery << dendl;
   }
 
   migrator->handle_conf_change(changed, mdsmap);
@@ -8554,10 +8560,12 @@ CInode *MDCache::cache_traverse(const filepath& fp)
 
   CInode *in;
   unsigned depth = 0;
+  char mdsdir_name[16];
+  sprintf(mdsdir_name, "~mds%d", mds->get_nodeid());
 
   if (fp.get_ino()) {
     in = get_inode(fp.get_ino());
-  } else if (fp.depth() > 0 && fp[0] == "~mdsdir") {
+  } else if (fp.depth() > 0 && (fp[0] == "~mdsdir" || fp[0] == mdsdir_name)) {
     in = myin;
     depth = 1;
   } else {

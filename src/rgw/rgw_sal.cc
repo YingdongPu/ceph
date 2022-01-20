@@ -80,9 +80,10 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
 #ifdef WITH_RADOSGW_DBSTORE
     rgw::sal::Store* store = newDBStore(cct);
 
-    /* Initialize the dbstore with cct & dpp */
-    DB *db = static_cast<rgw::sal::DBStore *>(store)->getDB();
-    db->set_context(cct);
+    if ((*(rgw::sal::DBStore*)store).set_run_lc_thread(use_lc_thread)
+                                    .initialize(cct, dpp) < 0) {
+      delete store; store = nullptr;
+    }
 
     /* XXX: temporary - create testid user */
     rgw_user testid_user("", "testid", "");
@@ -91,6 +92,7 @@ rgw::sal::Store* StoreManager::init_storage_provider(const DoutPrefixProvider* d
     user->get_info().user_email = "tester@ceph.com";
     RGWAccessKey k1("0555b35654ad1656d804", "h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==");
     user->get_info().access_keys["0555b35654ad1656d804"] = k1;
+    user->get_info().max_buckets = RGW_DEFAULT_MAX_BUCKETS;
 
     int r = user->store_user(dpp, null_yield, true);
     if (r < 0) {

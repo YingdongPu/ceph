@@ -17,8 +17,8 @@
 #################################################################################
 # conditional build section
 #
-# please read http://rpm.org/user_doc/conditional_builds.html for explanation of
-# bcond syntax!
+# please read this for explanation of bcond syntax:
+# https://rpm-software-management.github.io/rpm/manual/conditionalbuilds.html
 #################################################################################
 %bcond_with make_check
 %bcond_with zbd
@@ -200,7 +200,6 @@ BuildRequires:	gperftools-devel >= 2.6.1
 BuildRequires:	gperftools-devel >= 2.4
 %endif
 %endif
-BuildRequires:	leveldb-devel > 1.2
 BuildRequires:	libaio-devel
 BuildRequires:	libblkid-devel >= 2.17
 BuildRequires:	cryptsetup-devel
@@ -465,6 +464,8 @@ Summary:        Utility to bootstrap Ceph clusters
 BuildArch:      noarch
 Requires:       lvm2
 Requires:       python%{python3_pkgversion}
+Requires:       openssh-server
+Requires:       which
 %if 0%{?weak_deps}
 Recommends:     podman >= 2.0.2
 %endif
@@ -486,9 +487,6 @@ Requires:	python%{python3_pkgversion}-cephfs = %{_epoch_prefix}%{version}-%{rele
 Requires:	python%{python3_pkgversion}-rgw = %{_epoch_prefix}%{version}-%{release}
 Requires:	python%{python3_pkgversion}-ceph-argparse = %{_epoch_prefix}%{version}-%{release}
 Requires:	python%{python3_pkgversion}-ceph-common = %{_epoch_prefix}%{version}-%{release}
-%if 0%{with jaeger}
-Requires:	libjaeger = %{_epoch_prefix}%{version}-%{release}
-%endif
 %if 0%{?fedora} || 0%{?rhel}
 Requires:	python%{python3_pkgversion}-prettytable
 %endif
@@ -524,9 +522,6 @@ Group:		System/Filesystems
 %endif
 Provides:	ceph-test:/usr/bin/ceph-monstore-tool
 Requires:	ceph-base = %{_epoch_prefix}%{version}-%{release}
-%if 0%{with jaeger}
-Requires:	libjaeger = %{_epoch_prefix}%{version}-%{release}
-%endif
 %description mon
 ceph-mon is the cluster monitor daemon for the Ceph distributed file
 system. One or more instances of ceph-mon form a Paxos part-time
@@ -662,14 +657,15 @@ Group:          System/Filesystems
 %endif
 Requires:       ceph-mgr = %{_epoch_prefix}%{version}-%{release}
 Requires:       python%{python3_pkgversion}-asyncssh
-Requires:       python%{python3_pkgversion}-cherrypy
 Requires:       cephadm = %{_epoch_prefix}%{version}-%{release}
 %if 0%{?suse_version}
 Requires:       openssh
+Requires:       python%{python3_pkgversion}-CherryPy
 Requires:       python%{python3_pkgversion}-Jinja2
 %endif
 %if 0%{?rhel} || 0%{?fedora}
 Requires:       openssh-clients
+Requires:       python%{python3_pkgversion}-cherrypy
 Requires:       python%{python3_pkgversion}-jinja2
 %endif
 %description mgr-cephadm
@@ -1056,19 +1052,6 @@ Obsoletes:	libcephfs2-devel < %{_epoch_prefix}%{version}-%{release}
 This package contains libraries and headers needed to develop programs
 that use Ceph distributed file system.
 
-%if 0%{with jaeger}
-%package -n libjaeger
-Summary:	Ceph distributed file system tracing library
-%if 0%{?suse_version}
-Group:		System/Libraries
-%endif
-Provides: 	libjaegertracing.so.0()(64bit)
-Provides:	libopentracing.so.1()(64bit)
-%description -n libjaeger
-This package contains libraries needed to provide distributed
-tracing for Ceph.
-%endif
-
 %package -n python%{python3_pkgversion}-cephfs
 Summary:	Python 3 libraries for Ceph distributed file system
 %if 0%{?suse_version}
@@ -1282,7 +1265,7 @@ cmake .. \
     -DCMAKE_INSTALL_MANDIR:PATH=%{_mandir} \
     -DCMAKE_INSTALL_DOCDIR:PATH=%{_docdir}/ceph \
     -DCMAKE_INSTALL_INCLUDEDIR:PATH=%{_includedir} \
-    -DCMAKE_INSTALL_SYSTEMD_SERVICEDIR:PATH=%{_unitdir} \
+    -DSYSTEMD_SYSTEM_UNIT_DIR:PATH=%{_unitdir} \
     -DWITH_MANPAGE:BOOL=ON \
     -DWITH_PYTHON3:STRING=%{python3_version} \
     -DWITH_MGR_DASHBOARD_FRONTEND:BOOL=OFF \
@@ -2329,14 +2312,6 @@ fi
 %dir %{_includedir}/cephfs/metrics
 %{_includedir}/cephfs/metrics/Types.h
 %{_libdir}/libcephfs.so
-
-%if %{with jaeger}
-%files -n libjaeger
-%{_libdir}/libopentracing.so.*
-%{_libdir}/libjaegertracing.so.*
-%post -n libjaeger -p /sbin/ldconfig
-%postun -n libjaeger -p /sbin/ldconfig
-%endif
 
 %files -n python%{python3_pkgversion}-cephfs
 %{python3_sitearch}/cephfs.cpython*.so

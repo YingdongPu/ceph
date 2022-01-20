@@ -17,6 +17,7 @@
 
 #include "rgw_user.h"
 #include "rgw_notify_event_type.h"
+#include "common/tracer.h"
 
 class RGWGetDataCB;
 struct RGWObjState;
@@ -243,6 +244,10 @@ class Store {
     Store() {}
     virtual ~Store() = default;
 
+    /** Name of this store provider (e.g., RADOS") */
+    virtual const char* get_name() const = 0;
+    /** Get cluster unique identifier */
+    virtual std::string get_cluster_id(const DoutPrefixProvider* dpp,  optional_yield y) = 0;
     /** Get a User from a rgw_user.  Does not query store for user info, so quick */
     virtual std::unique_ptr<User> get_user(const rgw_user& u) = 0;
     /** Lookup a User by access key.  Queries store for user info. */
@@ -279,10 +284,18 @@ class Store {
     virtual std::unique_ptr<Lifecycle> get_lifecycle(void) = 0;
     /** Get a @a Completions object.  Used for Async I/O tracking */
     virtual std::unique_ptr<Completions> get_completions(void) = 0;
-    /** Get a @a Notification object.  Used to communicate with non-RGW daemons, such as
-     * management/tracking software */
-    virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, struct req_state* s, 
+
+     /** Get a @a Notification object.  Used to communicate with non-RGW daemons, such as
+      * management/tracking software */
+    /** RGWOp variant */
+    virtual std::unique_ptr<Notification> get_notification(rgw::sal::Object* obj, rgw::sal::Object* src_obj, struct req_state* s, 
         rgw::notify::EventType event_type, const std::string* object_name=nullptr) = 0;
+    /** No-req_state variant (e.g., rgwlc) */
+    virtual std::unique_ptr<Notification> get_notification(
+    const DoutPrefixProvider* dpp, rgw::sal::Object* obj, rgw::sal::Object* src_obj, RGWObjectCtx* rctx,
+    rgw::notify::EventType event_type, rgw::sal::Bucket* _bucket, std::string& _user_id, std::string& _user_tenant,
+    std::string& _req_id, optional_yield y) = 0;
+
     /** Get access to the lifecycle management thread */
     virtual RGWLC* get_rgwlc(void) = 0;
     /** Get access to the coroutine registry.  Used to create new coroutine managers */
@@ -298,6 +311,8 @@ class Store {
 					const std::map<std::string, std::string>& meta) = 0;
     /** Get default quota info.  Used as fallback if a user or bucket has no quota set*/
     virtual void get_quota(RGWQuotaInfo& bucket_quota, RGWQuotaInfo& user_quota) = 0;
+    /** Get global rate limit configuration*/
+    virtual void get_ratelimit(RGWRateLimitInfo& bucket_ratelimit, RGWRateLimitInfo& user_ratelimit, RGWRateLimitInfo& anon_ratelimit) = 0;
     /** Enable or disable a set of bucket.  e.g. if a User is suspended */
     virtual int set_buckets_enabled(const DoutPrefixProvider* dpp, std::vector<rgw_bucket>& buckets, bool enabled) = 0;
     /** Get a new request ID */
@@ -471,7 +486,9 @@ class User {
     static bool empty(std::unique_ptr<User>& u) { return (!u || u->info.user_id.id.empty()); }
     /** Read the User attributes from the backing Store */
     virtual int read_attrs(const DoutPrefixProvider* dpp, optional_yield y) = 0;
-    /** Read the User stats from the backing Store, synchronous */
+    /** Set the attributes in attrs, leaving any other existing attrs set, and
+     * write them to the backing store; a merge operation */
+    virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y) = 0;
     virtual int read_stats(const DoutPrefixProvider *dpp,
                            optional_yield y, RGWStorageStats* stats,
 			   ceph::real_time* last_stats_sync = nullptr,
@@ -553,6 +570,20 @@ class Bucket {
       bool list_versions{false};
       bool allow_unordered{false};
       int shard_id{RGW_NO_SHARD};
+
+      friend std::ostream& operator<<(std::ostream& out, const ListParams& p) {
+	out << "rgw::sal::Bucket::ListParams{ prefix=\"" << p.prefix <<
+	  "\", delim=\"" << p.delim <<
+	  "\", marker=\"" << p.marker <<
+	  "\", end_marker=\"" << p.end_marker <<
+	  "\", ns=\"" << p.ns <<
+	  "\", enforce_ns=" << p.enforce_ns <<
+	  ", list_versions=" << p.list_versions <<
+	  ", allow_unordered=" << p.allow_unordered <<
+	  ", shard_id=" << p.shard_id <<
+	  " }";
+	return out;
+      }
     };
     /**
      * @brief Results from a bucket list operation
@@ -601,7 +632,7 @@ class Bucket {
     /** Set the cached attributes on this bucket */
     virtual int set_attrs(Attrs a) { attrs = a; return 0; }
     /** Remove this bucket from the backing store */
-    virtual int remove_bucket(const DoutPrefixProvider* dpp, bool delete_children, std::string prefix, std::string delimiter, bool forward_to_master, req_info* req_info, optional_yield y) = 0;
+    virtual int remove_bucket(const DoutPrefixProvider* dpp, bool delete_children, bool forward_to_master, req_info* req_info, optional_yield y) = 0;
     /** Remove this bucket, bypassing garbage collection.  May be removed */
     virtual int remove_bucket_bypass_gc(int concurrent_max, bool
 					keep_index_consistent,
@@ -611,8 +642,15 @@ class Bucket {
     virtual RGWAccessControlPolicy& get_acl(void) = 0;
     /** Set the ACL for this bucket */
     virtual int set_acl(const DoutPrefixProvider* dpp, RGWAccessControlPolicy& acl, optional_yield y) = 0;
-    /** Load this bucket from the backing store.  Requires the key to be set, fills other fields */
-    virtual int load_bucket(const DoutPrefixProvider* dpp, optional_yield y) = 0;
+
+    // XXXX hack
+    void set_owner(rgw::sal::User* _owner) {
+      owner = _owner;
+    }
+
+    /** Load this bucket from the backing store.  Requires the key to be set, fills other fields.
+     * If @a get_stats is true, then statistics on the bucket are also looked up. */
+    virtual int load_bucket(const DoutPrefixProvider* dpp, optional_yield y, bool get_stats = false) = 0;
     /** Read the bucket stats from the backing Store, synchronous */
     virtual int read_stats(const DoutPrefixProvider *dpp, int shard_id,
 				 std::string* bucket_ver, std::string* master_ver,
@@ -643,12 +681,7 @@ class Bucket {
     virtual int check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_quota, RGWQuotaInfo& bucket_quota, uint64_t obj_size, optional_yield y, bool check_size_only = false) = 0;
     /** Set the attributes in attrs, leaving any other existing attrs set, and
      * write them to the backing store; a merge operation */
-    virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y) {
-      for(auto& it : new_attrs) {
-	attrs[it.first] = it.second;
-      }
-      return 0;
-    }
+    virtual int merge_and_store_attrs(const DoutPrefixProvider* dpp, Attrs& new_attrs, optional_yield y) = 0;
     /** Try to refresh the cached bucket info from the backing store.  Used in
      * read-modify-update loop. */
     virtual int try_refresh_info(const DoutPrefixProvider* dpp, ceph::real_time* pmtime) = 0;
@@ -719,10 +752,9 @@ class Bucket {
 				std::vector<std::unique_ptr<MultipartUpload>>& uploads,
 				std::map<std::string, bool> *common_prefixes,
 				bool *is_truncated) = 0;
-    /** Abort multipart uploads matching the prefix and delimiter */
-    virtual int abort_multiparts(const DoutPrefixProvider *dpp,
-				 CephContext *cct,
-				 std::string& prefix, std::string& delim) = 0;
+    /** Abort multipart uploads in a bucket */
+    virtual int abort_multiparts(const DoutPrefixProvider* dpp,
+				 CephContext* cct) = 0;
 
     /* dang - This is temporary, until the API is completed */
     rgw_bucket& get_key() { return info.bucket; }
@@ -1128,7 +1160,7 @@ class MultipartUpload {
 protected:
   Bucket* bucket;
   std::map<uint32_t, std::unique_ptr<MultipartPart>> parts;
-
+  jspan_context trace_ctx{false, false};
 public:
   MultipartUpload(Bucket* _bucket) : bucket(_bucket) {}
   virtual ~MultipartUpload() = default;
@@ -1146,6 +1178,9 @@ public:
 
   /** Get all the cached parts that make up this upload */
   std::map<uint32_t, std::unique_ptr<MultipartPart>>& get_parts() { return parts; }
+
+  /** Get the trace context of this upload */
+  const jspan_context& get_trace() { return trace_ctx; }
 
   /** Get the Object that represents this upload */
   virtual std::unique_ptr<rgw::sal::Object> get_meta_obj() = 0;
@@ -1298,10 +1333,14 @@ public:
 class Notification {
 protected:
   Object* obj;
+  Object* src_obj;
   rgw::notify::EventType event_type;
 
   public:
-    Notification(Object* _obj, rgw::notify::EventType _type) : obj(_obj), event_type(_type) {}
+    Notification(Object* _obj, Object* _src_obj, rgw::notify::EventType _type)
+      : obj(_obj), src_obj(_src_obj), event_type(_type)
+    {}
+
     virtual ~Notification() = default;
 
     /** Indicate the start of the event associated with this notification */

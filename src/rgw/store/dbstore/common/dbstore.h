@@ -15,7 +15,6 @@
 #define FMT_HEADER_ONLY 1
 #include "fmt/format.h"
 #include <map>
-#include "dbstore_log.h"
 #include "rgw/rgw_sal.h"
 #include "rgw/rgw_common.h"
 #include "rgw/rgw_bucket.h"
@@ -23,6 +22,7 @@
 #include "global/global_init.h"
 #include "common/ceph_context.h"
 #include "rgw/rgw_obj_manifest.h"
+#include "rgw/rgw_multi.h"
 
 using namespace std;
 
@@ -83,19 +83,37 @@ struct DBOpObjectInfo {
 
   /* Extra fields */
   bool is_multipart;
+  std::list<RGWUploadPartInfo> mp_parts;
+
   bufferlist head_data;
   string min_marker;
   string max_marker;
   list<rgw_bucket_dir_entry> list_entries;
+  /* Below used to update mp_parts obj name
+   * from meta object to src object on completion */
+  rgw_obj_key new_obj_key;
 };
 
 struct DBOpObjectDataInfo {
   RGWObjState state;
   uint64_t part_num;
-  uint64_t multipart_part_num;
+  string multipart_part_str;
   uint64_t offset;
   uint64_t size;
   bufferlist data{};
+};
+
+struct DBOpLCHeadInfo {
+  string index;
+  rgw::sal::Lifecycle::LCHead head;
+};
+
+struct DBOpLCEntryInfo {
+  string index;
+  rgw::sal::Lifecycle::LCEntry entry;
+  // used for list query
+  string min_marker;
+  list<rgw::sal::Lifecycle::LCEntry> list_entries;
 };
 
 struct DBOpInfo {
@@ -110,6 +128,8 @@ struct DBOpInfo {
   DBOpBucketInfo bucket;
   DBOpObjectInfo obj;
   DBOpObjectDataInfo obj_data;
+  DBOpLCHeadInfo lc_head;
+  DBOpLCEntryInfo lc_entry;
   uint64_t list_max_count;
 };
 
@@ -127,6 +147,8 @@ struct DBOpParams {
   /* Below are subject to change */
   string objectdata_table;
   string quota_table;
+  string lc_head_table;
+  string lc_entry_table;
   string obj;
 };
 
@@ -257,9 +279,15 @@ struct DBOpObjectPrepareInfo {
   string manifest_part_rules = ":manifest_part_rules";
   string omap = ":omap";
   string is_multipart = ":is_multipart";
+  string mp_parts = ":mp_parts";
   string head_data = ":head_data";
   string min_marker = ":min_marker";
   string max_marker = ":max_marker";
+  /* Below used to update mp_parts obj name
+   * from meta object to src object on completion */
+  string new_obj_name = ":new_obj_name";
+  string new_obj_instance = ":new_obj_instance";
+  string new_obj_ns  = ":new_obj_ns";
 };
 
 struct DBOpObjectDataPrepareInfo {
@@ -267,7 +295,21 @@ struct DBOpObjectDataPrepareInfo {
   string offset = ":offset";
   string data = ":data";
   string size = ":size";
-  string multipart_part_num = ":multipart_part_num";
+  string multipart_part_str = ":multipart_part_str";
+};
+
+struct DBOpLCEntryPrepareInfo {
+  string index = ":index";
+  string bucket_name = ":bucket_name";
+  string start_time = ":start_time";
+  string status = ":status";
+  string min_marker = ":min_marker";
+};
+
+struct DBOpLCHeadPrepareInfo {
+  string index = ":index";
+  string start_date = ":start_date";
+  string marker = ":marker";
 };
 
 struct DBOpPrepareInfo {
@@ -276,6 +318,8 @@ struct DBOpPrepareInfo {
   DBOpBucketPrepareInfo bucket;
   DBOpObjectPrepareInfo obj;
   DBOpObjectDataPrepareInfo obj_data;
+  DBOpLCHeadPrepareInfo lc_head;
+  DBOpLCEntryPrepareInfo lc_entry;
   string list_max_count = ":list_max_count";
 };
 
@@ -292,6 +336,8 @@ struct DBOpPrepareParams {
   /* below subject to change */
   string objectdata_table;
   string quota_table;
+  string lc_head_table;
+  string lc_entry_table;
 };
 
 struct DBOps {
@@ -303,6 +349,13 @@ struct DBOps {
   class RemoveBucketOp *RemoveBucket;
   class GetBucketOp *GetBucket;
   class ListUserBucketsOp *ListUserBuckets;
+  class InsertLCEntryOp *InsertLCEntry;
+  class RemoveLCEntryOp *RemoveLCEntry;
+  class GetLCEntryOp *GetLCEntry;
+  class ListLCEntriesOp *ListLCEntries;
+  class InsertLCHeadOp *InsertLCHead;
+  class RemoveLCHeadOp *RemoveLCHead;
+  class GetLCHeadOp *GetLCHead;
 };
 
 class ObjectOp {
@@ -317,6 +370,7 @@ class ObjectOp {
     class UpdateObjectOp *UpdateObject;
     class ListBucketObjectsOp *ListBucketObjects;
     class PutObjectDataOp *PutObjectData;
+    class UpdateObjectDataOp *UpdateObjectData;
     class GetObjectDataOp *GetObjectData;
     class DeleteObjectDataOp *DeleteObjectData;
 
@@ -504,14 +558,15 @@ class DBOp {
       ManifestPartRules   BLOB,   \
       Omap    BLOB,   \
       IsMultipart     BOOL,   \
+      MPPartsList    BLOB,   \
       HeadData  BLOB,   \
       PRIMARY KEY (ObjName, ObjInstance, BucketName), \
       FOREIGN KEY (BucketName) \
       REFERENCES '{}' (BucketName) ON DELETE CASCADE ON UPDATE CASCADE \n);";
 
     const string CreateObjectDataTableQ =
-      /* Extra field 'MultipartPartNum' added which signifies multipart upload
-       * part number.  For regular object, it is '0'
+      /* Extra field 'MultipartPartStr' added which signifies multipart
+       * <uploadid + partnum>. For regular object, it is '0.0'
        *
        *  - part: a collection of stripes that make a contiguous part of an
        object. A regular object will only have one part (although might have
@@ -524,12 +579,12 @@ class DBOp {
       ObjInstance TEXT, \
       ObjNS TEXT, \
       BucketName TEXT NOT NULL , \
+      MultipartPartStr TEXT, \
       PartNum  INTEGER NOT NULL, \
       Offset   INTEGER, \
-      Data     BLOB,             \
       Size 	 INTEGER, \
-      MultipartPartNum INTEGER, \
-      PRIMARY KEY (ObjName, BucketName, ObjInstance, MultipartPartNum, PartNum), \
+      Data     BLOB,             \
+      PRIMARY KEY (ObjName, BucketName, ObjInstance, MultipartPartStr, PartNum), \
       FOREIGN KEY (BucketName, ObjName, ObjInstance) \
       REFERENCES '{}' (BucketName, ObjName, ObjInstance) ON DELETE CASCADE ON UPDATE CASCADE \n);";
 
@@ -543,12 +598,30 @@ class DBOp {
       Enabled Boolean ,		\
       CheckOnRaw Boolean \n);";
 
+    const string CreateLCEntryTableQ =
+      "CREATE TABLE IF NOT EXISTS '{}' ( \
+      LCIndex  TEXT NOT NULL , \
+      BucketName TEXT NOT NULL , \
+      StartTime  INTEGER , \
+      Status     INTEGER , \
+      PRIMARY KEY (LCIndex, BucketName), \
+      FOREIGN KEY (BucketName) \
+      REFERENCES '{}' (BucketName) ON DELETE CASCADE ON UPDATE CASCADE \n);";
+
+    const string CreateLCHeadTableQ =
+      "CREATE TABLE IF NOT EXISTS '{}' ( \
+      LCIndex  TEXT NOT NULL , \
+      Marker TEXT , \
+      StartDate  INTEGER , \
+      PRIMARY KEY (LCIndex) \n);";
+
     const string DropQ = "DROP TABLE IF EXISTS '{}'";
     const string ListAllQ = "SELECT  * from '{}'";
 
   public:
-    DBOp() {};
-    virtual ~DBOp() {};
+    DBOp() {}
+    virtual ~DBOp() {}
+    std::mutex mtx; // to protect prepared stmt
 
     string CreateTableSchema(string type, DBOpParams *params) {
       if (!type.compare("User"))
@@ -569,8 +642,15 @@ class DBOp {
       if (!type.compare("Quota"))
         return fmt::format(CreateQuotaTableQ.c_str(),
             params->quota_table.c_str());
+      if (!type.compare("LCHead"))
+        return fmt::format(CreateLCHeadTableQ.c_str(),
+            params->lc_head_table.c_str());
+      if (!type.compare("LCEntry"))
+        return fmt::format(CreateLCEntryTableQ.c_str(),
+            params->lc_entry_table.c_str(),
+            params->bucket_table.c_str());
 
-      ldout(params->cct, 0) << "Incorrect table type("<<type<<") specified" << dendl;
+      lsubdout(params->cct, rgw, 0) << "rgw dbstore: Incorrect table type("<<type<<") specified" << dendl;
 
       return NULL;
     }
@@ -583,10 +663,11 @@ class DBOp {
     }
 
     virtual int Prepare(const DoutPrefixProvider *dpp, DBOpParams *params) { return 0; }
+    virtual int Bind(const DoutPrefixProvider *dpp, DBOpParams *params) { return 0; }
     virtual int Execute(const DoutPrefixProvider *dpp, DBOpParams *params) { return 0; }
 };
 
-class InsertUserOp : public DBOp {
+class InsertUserOp : virtual public DBOp {
   private:
     /* For existing entires, -
      * (1) INSERT or REPLACE - it will delete previous entry and then
@@ -631,7 +712,7 @@ class InsertUserOp : public DBOp {
 
 };
 
-class RemoveUserOp: public DBOp {
+class RemoveUserOp: virtual public DBOp {
   private:
     const string Query =
       "DELETE from '{}' where UserID = {}";
@@ -645,7 +726,7 @@ class RemoveUserOp: public DBOp {
     }
 };
 
-class GetUserOp: public DBOp {
+class GetUserOp: virtual public DBOp {
   private:
     /* If below query columns are updated, make sure to update the indexes
      * in list_user() cbk in sqliteDB.cc */
@@ -706,7 +787,7 @@ class GetUserOp: public DBOp {
     }
 };
 
-class InsertBucketOp: public DBOp {
+class InsertBucketOp: virtual public DBOp {
   private:
     const string Query =
       "INSERT OR REPLACE INTO '{}' \
@@ -742,7 +823,7 @@ class InsertBucketOp: public DBOp {
     }
 };
 
-class UpdateBucketOp: public DBOp {
+class UpdateBucketOp: virtual public DBOp {
   private:
     // Updates Info, Mtime, Version
     const string InfoQuery =
@@ -795,7 +876,7 @@ class UpdateBucketOp: public DBOp {
     }
 };
 
-class RemoveBucketOp: public DBOp {
+class RemoveBucketOp: virtual public DBOp {
   private:
     const string Query =
       "DELETE from '{}' where BucketName = {}";
@@ -809,7 +890,7 @@ class RemoveBucketOp: public DBOp {
     }
 };
 
-class GetBucketOp: public DBOp {
+class GetBucketOp: virtual public DBOp {
   private:
     const string Query = "SELECT  \
                           BucketName, BucketTable.Tenant, Marker, BucketID, Size, SizeRounded, CreationTime, \
@@ -832,7 +913,7 @@ class GetBucketOp: public DBOp {
     }
 };
 
-class ListUserBucketsOp: public DBOp {
+class ListUserBucketsOp: virtual public DBOp {
   private:
     // once we have stats also stored, may have to update this query to join
     // these two tables.
@@ -855,7 +936,7 @@ class ListUserBucketsOp: public DBOp {
     }
 };
 
-class PutObjectOp: public DBOp {
+class PutObjectOp: virtual public DBOp {
   private:
     const string Query =
       "INSERT OR REPLACE INTO '{}' \
@@ -867,10 +948,10 @@ class PutObjectOp: public DBOp {
        ObjVersion, ObjVersionTag, ObjAttrs, HeadSize, MaxHeadSize, \
        Prefix, TailInstance, HeadPlacementRuleName, HeadPlacementRuleStorageClass, \
        TailPlacementRuleName, TailPlacementStorageClass, \
-       ManifestPartObjs, ManifestPartRules, Omap, IsMultipart, HeadData )     \
+       ManifestPartObjs, ManifestPartRules, Omap, IsMultipart, MPPartsList, HeadData )     \
       VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
           {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, \
-          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})";
+          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})";
 
   public:
     virtual ~PutObjectOp() {}
@@ -900,11 +981,11 @@ class PutObjectOp: public DBOp {
           params.op.obj.tail_placement_storage_class,
           params.op.obj.manifest_part_objs,
           params.op.obj.manifest_part_rules, params.op.obj.omap,
-          params.op.obj.is_multipart, params.op.obj.head_data);
+          params.op.obj.is_multipart, params.op.obj.mp_parts, params.op.obj.head_data);
     }
 };
 
-class DeleteObjectOp: public DBOp {
+class DeleteObjectOp: virtual public DBOp {
   private:
     const string Query =
       "DELETE from '{}' where BucketName = {} and ObjName = {} and ObjInstance = {}";
@@ -920,7 +1001,7 @@ class DeleteObjectOp: public DBOp {
     }
 };
 
-class GetObjectOp: public DBOp {
+class GetObjectOp: virtual public DBOp {
   private:
     const string Query =
       "SELECT  \
@@ -932,7 +1013,7 @@ class GetObjectOp: public DBOp {
       ObjVersion, ObjVersionTag, ObjAttrs, HeadSize, MaxHeadSize, \
       Prefix, TailInstance, HeadPlacementRuleName, HeadPlacementRuleStorageClass, \
       TailPlacementRuleName, TailPlacementStorageClass, \
-      ManifestPartObjs, ManifestPartRules, Omap, IsMultipart, HeadData from '{}' \
+      ManifestPartObjs, ManifestPartRules, Omap, IsMultipart, MPPartsList, HeadData from '{}' \
       where BucketName = {} and ObjName = {} and ObjInstance = {}";
 
   public:
@@ -947,7 +1028,7 @@ class GetObjectOp: public DBOp {
     }
 };
 
-class ListBucketObjectsOp: public DBOp {
+class ListBucketObjectsOp: virtual public DBOp {
   private:
     // once we have stats also stored, may have to update this query to join
     // these two tables.
@@ -961,7 +1042,7 @@ class ListBucketObjectsOp: public DBOp {
       ObjVersion, ObjVersionTag, ObjAttrs, HeadSize, MaxHeadSize, \
       Prefix, TailInstance, HeadPlacementRuleName, HeadPlacementRuleStorageClass, \
       TailPlacementRuleName, TailPlacementStorageClass, \
-      ManifestPartObjs, ManifestPartRules, Omap, IsMultipart, HeadData from '{}' \
+      ManifestPartObjs, ManifestPartRules, Omap, IsMultipart, MPPartsList, HeadData from '{}' \
       where BucketName = {} and ObjName > {} ORDER BY ObjName ASC LIMIT {}";
   public:
     virtual ~ListBucketObjectsOp() {}
@@ -976,7 +1057,7 @@ class ListBucketObjectsOp: public DBOp {
     }
 };
 
-class UpdateObjectOp: public DBOp {
+class UpdateObjectOp: virtual public DBOp {
   private:
     // Updates Omap
     const string OmapQuery =
@@ -984,6 +1065,9 @@ class UpdateObjectOp: public DBOp {
       where BucketName = {} and ObjName = {} and ObjInstance = {}";
     const string AttrsQuery =
       "UPDATE '{}' SET ObjAttrs = {}, Mtime = {}  \
+      where BucketName = {} and ObjName = {} and ObjInstance = {}";
+    const string MPQuery =
+      "UPDATE '{}' SET MPPartsList = {}, Mtime = {}  \
       where BucketName = {} and ObjName = {} and ObjInstance = {}";
     const string MetaQuery =
       "UPDATE '{}' SET \
@@ -998,7 +1082,7 @@ class UpdateObjectOp: public DBOp {
        HeadPlacementRuleName = {}, HeadPlacementRuleStorageClass = {}, \
        TailPlacementRuleName = {}, TailPlacementStorageClass = {}, \
        ManifestPartObjs = {}, ManifestPartRules = {}, Omap = {}, \
-       IsMultipart = {}, HeadData = {} \
+       IsMultipart = {}, MPPartsList = {}, HeadData = {} \
        WHERE ObjName = {} and ObjInstance = {} and BucketName = {}";
 
   public:
@@ -1016,6 +1100,14 @@ class UpdateObjectOp: public DBOp {
       if (params.op.query_str == "attrs") {
         return fmt::format(AttrsQuery.c_str(),
             params.object_table.c_str(), params.op.obj.obj_attrs.c_str(),
+            params.op.obj.mtime.c_str(),
+            params.op.bucket.bucket_name.c_str(),
+            params.op.obj.obj_name.c_str(),
+            params.op.obj.obj_instance.c_str());
+      }
+      if (params.op.query_str == "mp") {
+        return fmt::format(MPQuery.c_str(),
+            params.object_table.c_str(), params.op.obj.mp_parts.c_str(),
             params.op.obj.mtime.c_str(),
             params.op.bucket.bucket_name.c_str(),
             params.op.obj.obj_name.c_str(),
@@ -1045,7 +1137,7 @@ class UpdateObjectOp: public DBOp {
           params.op.obj.tail_placement_storage_class,
           params.op.obj.manifest_part_objs,
           params.op.obj.manifest_part_rules, params.op.obj.omap,
-          params.op.obj.is_multipart, params.op.obj.head_data,
+          params.op.obj.is_multipart, params.op.obj.mp_parts, params.op.obj.head_data,
           params.op.obj.obj_name, params.op.obj.obj_instance,
           params.op.bucket.bucket_name);
       }
@@ -1053,11 +1145,11 @@ class UpdateObjectOp: public DBOp {
     }
 };
 
-class PutObjectDataOp: public DBOp {
+class PutObjectDataOp: virtual public DBOp {
   private:
     const string Query =
       "INSERT OR REPLACE INTO '{}' \
-      (ObjName, ObjInstance, ObjNS, BucketName, PartNum, Offset, Data, Size, MultipartPartNum) \
+      (ObjName, ObjInstance, ObjNS, BucketName, MultipartPartStr, PartNum, Offset, Size, Data) \
       VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})";
 
   public:
@@ -1069,18 +1161,41 @@ class PutObjectDataOp: public DBOp {
           params.op.obj.obj_name, params.op.obj.obj_instance,
           params.op.obj.obj_ns,
           params.op.bucket.bucket_name.c_str(),
+          params.op.obj_data.multipart_part_str.c_str(),
           params.op.obj_data.part_num,
-          params.op.obj_data.offset.c_str(), params.op.obj_data.data.c_str(),
-          params.op.obj_data.size, params.op.obj_data.multipart_part_num);
+          params.op.obj_data.offset.c_str(),
+          params.op.obj_data.size,
+          params.op.obj_data.data.c_str());
     }
 };
 
-class GetObjectDataOp: public DBOp {
+class UpdateObjectDataOp: virtual public DBOp {
+  private:
+    const string Query =
+      "UPDATE '{}' \
+      SET ObjName = {}, ObjInstance = {}, ObjNS = {} \
+      WHERE ObjName = {} and ObjInstance = {} and ObjNS = {} and \
+      BucketName = {}";
+
+  public:
+    virtual ~UpdateObjectDataOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(),
+          params.objectdata_table.c_str(),
+          params.op.obj.new_obj_name, params.op.obj.new_obj_instance,
+          params.op.obj.new_obj_ns,
+          params.op.obj.obj_name, params.op.obj.obj_instance,
+          params.op.obj.obj_ns,
+          params.op.bucket.bucket_name.c_str());
+    }
+};
+class GetObjectDataOp: virtual public DBOp {
   private:
     const string Query =
       "SELECT  \
-      ObjName, ObjInstance, ObjNS, BucketName, PartNum, Offset, Data, Size, \
-      MultipartPartNum from '{}' where BucketName = {} and ObjName = {} and ObjInstance = {}";
+      ObjName, ObjInstance, ObjNS, BucketName, MultipartPartStr, PartNum, Offset, Size, Data \
+      from '{}' where BucketName = {} and ObjName = {} and ObjInstance = {} ORDER BY MultipartPartStr, PartNum";
 
   public:
     virtual ~GetObjectDataOp() {}
@@ -1094,7 +1209,7 @@ class GetObjectDataOp: public DBOp {
     }
 };
 
-class DeleteObjectDataOp: public DBOp {
+class DeleteObjectDataOp: virtual public DBOp {
   private:
     const string Query =
       "DELETE from '{}' where BucketName = {} and ObjName = {} and ObjInstance = {}";
@@ -1108,6 +1223,122 @@ class DeleteObjectDataOp: public DBOp {
           params.op.bucket.bucket_name.c_str(),
           params.op.obj.obj_name.c_str(),
           params.op.obj.obj_instance.c_str());
+    }
+};
+
+class InsertLCEntryOp: virtual public DBOp {
+  private:
+    const string Query =
+      "INSERT OR REPLACE INTO '{}' \
+      (LCIndex, BucketName, StartTime, Status) \
+      VALUES ({}, {}, {}, {})";
+
+  public:
+    virtual ~InsertLCEntryOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(), params.lc_entry_table.c_str(),
+          params.op.lc_entry.index, params.op.lc_entry.bucket_name,
+          params.op.lc_entry.start_time, params.op.lc_entry.status);
+    }
+};
+
+class RemoveLCEntryOp: virtual public DBOp {
+  private:
+    const string Query =
+      "DELETE from '{}' where LCIndex = {} and BucketName = {}";
+
+  public:
+    virtual ~RemoveLCEntryOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(), params.lc_entry_table.c_str(),
+          params.op.lc_entry.index, params.op.lc_entry.bucket_name);
+    }
+};
+
+class GetLCEntryOp: virtual public DBOp {
+  private:
+    const string Query = "SELECT  \
+                          LCIndex, BucketName, StartTime, Status \
+                          from '{}' where LCIndex = {} and BucketName = {}";
+    const string NextQuery = "SELECT  \
+                          LCIndex, BucketName, StartTime, Status \
+                          from '{}' where LCIndex = {} and BucketName > {} ORDER BY BucketName ASC";
+
+  public:
+    virtual ~GetLCEntryOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      if (params.op.query_str == "get_next_entry") {
+        return fmt::format(NextQuery.c_str(), params.lc_entry_table.c_str(),
+            params.op.lc_entry.index, params.op.lc_entry.bucket_name);
+      }
+      // default 
+      return fmt::format(Query.c_str(), params.lc_entry_table.c_str(),
+          params.op.lc_entry.index, params.op.lc_entry.bucket_name);
+    }
+};
+
+class ListLCEntriesOp: virtual public DBOp {
+  private:
+    const string Query = "SELECT  \
+                          LCIndex, BucketName, StartTime, Status \
+                          FROM '{}' WHERE LCIndex = {} AND BucketName > {} ORDER BY BucketName ASC LIMIT {}";
+
+  public:
+    virtual ~ListLCEntriesOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(), params.lc_entry_table.c_str(),
+          params.op.lc_entry.index.c_str(), params.op.lc_entry.min_marker.c_str(),
+          params.op.list_max_count.c_str());
+    }
+};
+
+class InsertLCHeadOp: virtual public DBOp {
+  private:
+    const string Query =
+      "INSERT OR REPLACE INTO '{}' \
+      (LCIndex, Marker, StartDate) \
+      VALUES ({}, {}, {})";
+
+  public:
+    virtual ~InsertLCHeadOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(), params.lc_head_table.c_str(),
+          params.op.lc_head.index, params.op.lc_head.marker,
+          params.op.lc_head.start_date);
+    }
+};
+
+class RemoveLCHeadOp: virtual public DBOp {
+  private:
+    const string Query =
+      "DELETE from '{}' where LCIndex = {}";
+
+  public:
+    virtual ~RemoveLCHeadOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(), params.lc_head_table.c_str(),
+          params.op.lc_head.index);
+    }
+};
+
+class GetLCHeadOp: virtual public DBOp {
+  private:
+    const string Query = "SELECT  \
+                          LCIndex, Marker, StartDate \
+                          from '{}' where LCIndex = {}";
+
+  public:
+    virtual ~GetLCHeadOp() {}
+
+    string Schema(DBOpPrepareParams &params) {
+      return fmt::format(Query.c_str(), params.lc_head_table.c_str(),
+          params.op.lc_head.index);
     }
 };
 
@@ -1139,13 +1370,9 @@ class DB {
     const string user_table;
     const string bucket_table;
     const string quota_table;
+    const string lc_head_table;
+    const string lc_entry_table;
     static map<string, class ObjectOp*> objectmap;
-    pthread_mutex_t mutex; // to protect objectmap and other shared
-    // objects if any. This mutex is taken
-    // before processing every fop (i.e, in
-    // ProcessOp()). If required this can be
-    // made further granular by taking separate
-    // locks for objectmap and db operations etc.
 
   protected:
     void *db;
@@ -1155,14 +1382,19 @@ class DB {
     // XXX: default ObjStripeSize or ObjChunk size - 4M, make them configurable?
     uint64_t ObjHeadSize = 1024; /* 1K - default head data size */
     uint64_t ObjChunkSize = (get_blob_limit() - 1000); /* 1000 to accommodate other fields */
+    // Below mutex is to protect objectmap and other shared
+    // objects if any.
+    std::mutex mtx;
 
   public:	
     DB(string db_name, CephContext *_cct) : db_name(db_name),
     user_table(db_name+".user.table"),
     bucket_table(db_name+".bucket.table"),
     quota_table(db_name+".quota.table"),
+    lc_head_table(db_name+".lc_head.table"),
+    lc_entry_table(db_name+".lc_entry.table"),
     cct(_cct),
-    dp(_cct, dout_subsys, "rgw DBStore backend: ")
+    dp(_cct, ceph_subsys_rgw, "rgw DBStore backend: ")
   {}
     /*	DB() {}*/
 
@@ -1170,8 +1402,10 @@ class DB {
     user_table(db_name+".user.table"),
     bucket_table(db_name+".bucket.table"),
     quota_table(db_name+".quota.table"),
+    lc_head_table(db_name+".lc_head.table"),
+    lc_entry_table(db_name+".lc_entry.table"),
     cct(_cct),
-    dp(_cct, dout_subsys, "rgw DBStore backend: ")
+    dp(_cct, ceph_subsys_rgw, "rgw DBStore backend: ")
   {}
     virtual	~DB() {}
 
@@ -1180,6 +1414,8 @@ class DB {
     const string getUserTable() { return user_table; }
     const string getBucketTable() { return bucket_table; }
     const string getQuotaTable() { return quota_table; }
+    const string getLCHeadTable() { return lc_head_table; }
+    const string getLCEntryTable() { return lc_entry_table; }
     const string getObjectTable(string bucket) {
       return db_name+"."+bucket+".object.table"; }
     const string getObjectDataTable(string bucket) {
@@ -1210,7 +1446,7 @@ class DB {
     int InitializeParams(const DoutPrefixProvider *dpp, string Op, DBOpParams *params);
     int ProcessOp(const DoutPrefixProvider *dpp, string Op, DBOpParams *params);
     DBOp* getDBOp(const DoutPrefixProvider *dpp, string Op, struct DBOpParams *params);
-    int objectmapInsert(const DoutPrefixProvider *dpp, string bucket, void *ptr);
+    int objectmapInsert(const DoutPrefixProvider *dpp, string bucket, class ObjectOp* ptr);
     int objectmapDelete(const DoutPrefixProvider *dpp, string bucket);
 
     virtual uint64_t get_blob_limit() { return 0; };
@@ -1220,6 +1456,7 @@ class DB {
     virtual int InitializeDBOps(const DoutPrefixProvider *dpp) { return 0; }
     virtual int FreeDBOps(const DoutPrefixProvider *dpp) { return 0; }
     virtual int InitPrepareParams(const DoutPrefixProvider *dpp, DBOpPrepareParams &params) = 0;
+    virtual int createLCTables(const DoutPrefixProvider *dpp) = 0;
 
     virtual int ListAllBuckets(const DoutPrefixProvider *dpp, DBOpParams *params) = 0;
     virtual int ListAllUsers(const DoutPrefixProvider *dpp, DBOpParams *params) = 0;
@@ -1269,28 +1506,28 @@ class DB {
         const rgw_user* powner_id, map<std::string, bufferlist>* pattrs,
         ceph::real_time* pmtime, RGWObjVersionTracker* pobjv);
 
-    int get_max_head_size() { return ObjHeadSize; }
-    int get_max_chunk_size() { return ObjChunkSize; }
+    uint64_t get_max_head_size() { return ObjHeadSize; }
+    uint64_t get_max_chunk_size() { return ObjChunkSize; }
     void gen_rand_obj_instance_name(rgw_obj_key *target_key);
 
     // db raw obj string is of format -
-    // "<bucketname>_<objname>_<objinstance>_<multipart-partnum>_<partnum>"
+    // "<bucketname>_<objname>_<objinstance>_<multipart-part-str>_<partnum>"
     const string raw_obj_oid = "{0}_{1}_{2}_{3}_{4}";
 
     inline string to_oid(const string& bucket, const string& obj_name, const string& obj_instance,
-        uint64_t mp_num, uint64_t partnum) {
-      string s = fmt::format(raw_obj_oid.c_str(), bucket, obj_name, obj_instance, mp_num, partnum);
+        string mp_str, uint64_t partnum) {
+      string s = fmt::format(raw_obj_oid.c_str(), bucket, obj_name, obj_instance, mp_str, partnum);
       return s;
     }
     inline int from_oid(const string& oid, string& bucket, string& obj_name,
         string& obj_instance,
-        uint64_t& mp_num, uint64_t& partnum) {
+        string& mp_str, uint64_t& partnum) {
       vector<std::string> result;
       boost::split(result, oid, boost::is_any_of("_"));
       bucket = result[0];
       obj_name = result[1];
       obj_instance = result[2];
-      mp_num = stoi(result[3]);
+      mp_str = result[3];
       partnum = stoi(result[4]);
 
       return 0;
@@ -1303,7 +1540,7 @@ class DB {
       string obj_name;
       string obj_instance;
       string obj_ns;
-      uint64_t multipart_partnum;
+      string multipart_part_str;
       uint64_t part_num;
 
       string obj_table;
@@ -1314,13 +1551,13 @@ class DB {
       }
 
       raw_obj(DB* _db, string& _bname, string& _obj_name, string& _obj_instance,
-          string& _obj_ns, int _mp_partnum, int _part_num) {
+          string& _obj_ns, string _mp_part_str, int _part_num) {
         db = _db;
         bucket_name = _bname;
         obj_name = _obj_name;
         obj_instance = _obj_instance;
         obj_ns = _obj_ns;
-        multipart_partnum = _mp_partnum;
+        multipart_part_str = _mp_part_str;
         part_num = _part_num;
 
         obj_table = bucket_name+".object.table";
@@ -1331,10 +1568,10 @@ class DB {
         int r;
 
         db = _db;
-        r = db->from_oid(oid, bucket_name, obj_name, obj_instance, multipart_partnum,
+        r = db->from_oid(oid, bucket_name, obj_name, obj_instance, multipart_part_str,
             part_num);
         if (r < 0) {
-          multipart_partnum = 0;
+          multipart_part_str = "0.0";
           part_num = 0;
         }
 
@@ -1468,6 +1705,7 @@ class DB {
       struct Write {
         DB::Object *target;
         RGWObjState obj_state;
+        string mp_part_str = "0.0"; // multipart num
 
         struct MetaParams {
           ceph::real_time *mtime;
@@ -1499,6 +1737,7 @@ class DB {
 
         explicit Write(DB::Object *_target) : target(_target) {}
 
+        void set_mp_part_str(string _mp_part_str) { mp_part_str = _mp_part_str;}
         int prepare(const DoutPrefixProvider* dpp);
         int write_data(const DoutPrefixProvider* dpp,
                                bufferlist& data, uint64_t ofs);
@@ -1508,6 +1747,11 @@ class DB {
             bool assume_noent, bool modify_tail);
         int write_meta(const DoutPrefixProvider *dpp, uint64_t size,
             uint64_t accounted_size, map<string, bufferlist>& attrs);
+        /* Below are used to update mp data rows object name
+         * from meta to src object name on multipart upload
+         * completion
+         */
+        int update_mp_parts(const DoutPrefixProvider *dpp, rgw_obj_key new_obj_key);
       };
 
       struct Delete {
@@ -1573,6 +1817,8 @@ class DB {
           std::map<std::string, bufferlist> *m, bool* pmore);
       using iterate_obj_cb = int (*)(const DoutPrefixProvider*, const raw_obj&, off_t, off_t,
           bool, RGWObjState*, void*);
+      int add_mp_part(const DoutPrefixProvider *dpp, RGWUploadPartInfo info);
+      int get_mp_parts_list(const DoutPrefixProvider *dpp, std::list<RGWUploadPartInfo>& info);
 
       int iterate_obj(const DoutPrefixProvider *dpp,
           const RGWBucketInfo& bucket_info, const rgw_obj& obj,
@@ -1583,6 +1829,17 @@ class DB {
         const raw_obj& read_obj, off_t obj_ofs,
         off_t len, bool is_head_obj,
         RGWObjState *astate, void *arg);
+
+    int get_entry(const std::string& oid, const std::string& marker,
+                  rgw::sal::Lifecycle::LCEntry& entry);
+    int get_next_entry(const std::string& oid, std::string& marker,
+                  rgw::sal::Lifecycle::LCEntry& entry);
+    int set_entry(const std::string& oid, const rgw::sal::Lifecycle::LCEntry& entry);
+    int list_entries(const std::string& oid, const std::string& marker,
+			   uint32_t max_entries, std::vector<rgw::sal::Lifecycle::LCEntry>& entries);
+    int rm_entry(const std::string& oid, const rgw::sal::Lifecycle::LCEntry& entry);
+    int get_head(const std::string& oid, rgw::sal::Lifecycle::LCHead& head);
+    int put_head(const std::string& oid, const rgw::sal::Lifecycle::LCHead& head);
 };
 
 struct db_get_obj_data {

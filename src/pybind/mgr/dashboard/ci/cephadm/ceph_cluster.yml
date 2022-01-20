@@ -1,5 +1,5 @@
 parameters:
- nodes: 3
+ nodes: 4
  pool: ceph-dashboard
  network: ceph-dashboard
  domain: cephlab.com
@@ -11,6 +11,7 @@ parameters:
  admin_password: password
  disks:
  - 15
+ - 5
  - 5
 
 {% for number in range(0, nodes) %}
