@@ -38,6 +38,9 @@
 #include "mon/MonClient.h"
 #include "common/HeartbeatMap.h"
 #include "ScrubStack.h"
+#include "events/ESubtreeMap.h"
+#include "events/ELid.h"
+#include "Mutation.h"
 
 
 #include "MDSRank.h"
@@ -89,7 +92,8 @@ private:
 
     // I need to seal off the current segment, and then mark all
     // previous segments for expiry
-    mdlog->start_new_segment();
+    auto sle = mdcache->create_subtree_map();
+    mdlog->submit_entry(sle);
 
     Context *ctx = new LambdaContext([this](int r) {
         handle_flush_mdlog(r);
@@ -514,6 +518,7 @@ MDSRank::MDSRank(
     messenger(msgr), monc(monc_), mgrc(mgrc),
     respawn_hook(respawn_hook_),
     suicide_hook(suicide_hook_),
+    inject_journal_corrupt_dentry_first(g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
     starttime(mono_clock::now()),
     ioc(ioc)
 {
@@ -543,11 +548,14 @@ MDSRank::MDSRank(
   server = new Server(this, &metrics_handler);
   locker = new Locker(this, mdcache);
 
+  _heartbeat_reset_grace = g_conf().get_val<uint64_t>("mds_heartbeat_reset_grace");
   heartbeat_grace = g_conf().get_val<double>("mds_heartbeat_grace");
   op_tracker.set_complaint_and_threshold(cct->_conf->mds_op_complaint_time,
                                          cct->_conf->mds_op_log_threshold);
   op_tracker.set_history_size_and_duration(cct->_conf->mds_op_history_size,
                                            cct->_conf->mds_op_history_duration);
+  op_tracker.set_history_slow_op_size_and_threshold(cct->_conf->mds_op_history_slow_op_size,
+                                                    cct->_conf->mds_op_history_slow_op_threshold);
 
   schedule_update_timer_task();
 }
@@ -741,6 +749,7 @@ void MDSRankDispatcher::tick()
 
   // ...
   if (is_clientreplay() || is_active() || is_stopping()) {
+    server->clear_laggy_clients();
     server->find_idle_sessions();
     server->evict_cap_revoke_non_responders();
     locker->tick();
@@ -927,6 +936,12 @@ void MDSRank::respawn()
     respawn_hook->complete(0);
     respawn_hook = NULL;
   }
+}
+
+void MDSRank::abort(std::string_view msg)
+{
+  monc->flush_log();
+  ceph_abort(msg);
 }
 
 void MDSRank::damaged()
@@ -1391,7 +1406,7 @@ Session *MDSRank::get_session(const cref_t<Message> &m)
     dout(20) << "get_session have " << session << " " << session->info.inst
 	     << " state " << session->get_state_name() << dendl;
     // Check if we've imported an open session since (new sessions start closed)
-    if (session->is_closed()) {
+    if (session->is_closed() && m->get_type() == CEPH_MSG_CLIENT_SESSION) {
       Session *imported_session = sessionmap.get_session(session->info.inst.name);
       if (imported_session && imported_session != session) {
         dout(10) << __func__ << " replacing connection bootstrap session "
@@ -1466,9 +1481,11 @@ void MDSRank::send_message_mds(const ref_t<Message>& m, const entity_addrvec_t &
   messenger->send_to_mds(ref_t<Message>(m).detach(), addr);
 }
 
-void MDSRank::forward_message_mds(const cref_t<MClientRequest>& m, mds_rank_t mds)
+void MDSRank::forward_message_mds(MDRequestRef& mdr, mds_rank_t mds)
 {
   ceph_assert(mds != whoami);
+
+  auto m = mdr->release_client_request();
 
   /*
    * don't actually forward if non-idempotent!
@@ -1481,6 +1498,10 @@ void MDSRank::forward_message_mds(const cref_t<MClientRequest>& m, mds_rank_t md
 
   // tell the client where it should go
   auto session = get_session(m);
+  if (!session) {
+    dout(1) << "no session found, failed to forward client request " << mdr << dendl;
+    return;
+  }
   auto f = make_message<MClientRequestForward>(m->get_tid(), mds, m->get_num_fwd()+1, client_must_resend);
   send_message_client(f, session);
 }
@@ -1729,7 +1750,8 @@ void MDSRank::starting_done()
   ceph_assert(is_starting());
   request_state(MDSMap::STATE_ACTIVE);
 
-  mdlog->start_new_segment();
+  auto sle = mdcache->create_subtree_map();
+  mdlog->submit_entry(sle);
 
   // sync snaptable cache
   snapclient->sync(new C_MDSInternalNoop);
@@ -1948,8 +1970,8 @@ void MDSRank::resolve_done()
 }
 
 void MDSRank::apply_blocklist(const std::set<entity_addr_t> &addrs, epoch_t epoch) {
-  auto victims = server->apply_blocklist(addrs);
-  dout(4) << __func__ << ": killed " << victims << " blocklisted sessions ("
+  auto victims = server->apply_blocklist();
+  dout(4) << __func__ << ": killed " << victims << ", blocklisted sessions ("
           << addrs.size() << " blocklist entries, "
           << sessionmap.get_sessions().size() << ")" << dendl;
   if (victims) {
@@ -1970,9 +1992,10 @@ void MDSRank::reconnect_start()
   // into reconnect, so that we don't wait for them.
   objecter->enable_blocklist_events();
   std::set<entity_addr_t> blocklist;
+  std::set<entity_addr_t> range;
   epoch_t epoch = 0;
-  objecter->with_osdmap([&blocklist, &epoch](const OSDMap& o) {
-      o.get_blocklist(&blocklist);
+  objecter->with_osdmap([&blocklist, &range, &epoch](const OSDMap& o) {
+    o.get_blocklist(&blocklist, &range);
       epoch = o.get_epoch();
   });
 
@@ -2146,7 +2169,8 @@ void MDSRank::boot_create()
   mdlog->create(fin.new_sub());
 
   // open new journal segment, but do not journal subtree map (yet)
-  mdlog->prepare_new_segment();
+  auto le = new ELid();
+  mdlog->submit_entry(le);
 
   if (whoami == mdsmap->get_root()) {
     dout(3) << "boot_create creating fresh hierarchy" << dendl;
@@ -2181,8 +2205,10 @@ void MDSRank::boot_create()
   ceph_assert(g_conf()->mds_kill_create_at != 1);
 
   // ok now journal it
-  mdlog->journal_segment_subtree_map(fin.new_sub());
+  auto sle = mdcache->create_subtree_map();
+  mdlog->submit_entry(sle);
   mdlog->flush();
+  mdlog->wait_for_safe(fin.new_sub());
 
   // Usually we do this during reconnect, but creation skips that.
   objecter->enable_blocklist_events();
@@ -2236,8 +2262,15 @@ void MDSRankDispatcher::handle_mds_map(
   // I am only to be passed MDSMaps in which I hold a rank
   ceph_assert(whoami != MDS_RANK_NONE);
 
-  MDSMap::DaemonState oldstate = state;
   mds_gid_t mds_gid = mds_gid_t(monc->get_global_id());
+  MDSMap::DaemonState oldstate = oldmap.get_state_gid(mds_gid);
+  if (oldstate == MDSMap::STATE_NULL) {
+    // monitor may skip sending me the STANDBY map (e.g. if paxos_propose_interval is high)
+    // Assuming I have passed STANDBY state if I got a rank in the first map.
+    oldstate = MDSMap::STATE_STANDBY;
+  }
+  // I should not miss map update
+  ceph_assert(state == oldstate);
   state = mdsmap->get_state_gid(mds_gid);
   if (state != oldstate) {
     last_state = oldstate;
@@ -2272,11 +2305,11 @@ void MDSRankDispatcher::handle_mds_map(
       // "bootstrapping" state.
       usleep(sleep_rank_change);
     } if (state == MDSMap::STATE_STANDBY_REPLAY) {
-      dout(1) << "handle_mds_map i am now mds." << mds_gid << "." << incarnation
+      dout(1) << "handle_mds_map I am now mds." << mds_gid << "." << incarnation
           << " replaying mds." << whoami << "." << incarnation << dendl;
       messenger->set_myname(entity_name_t::MDS(mds_gid));
     } else {
-      dout(1) << "handle_mds_map i am now mds." << whoami << "." << incarnation << dendl;
+      dout(1) << "handle_mds_map I am now mds." << whoami << "." << incarnation << dendl;
       messenger->set_myname(entity_name_t::MDS(whoami));
     }
   }
@@ -2592,13 +2625,37 @@ void MDSRankDispatcher::handle_asok_command(
   int r = 0;
   CachedStackStringStream css;
   bufferlist outbl;
-  if (command == "dump_ops_in_flight" ||
-      command == "ops") {
+  dout(10) << __func__ << ": " << command << dendl;
+  if (command == "dump_ops_in_flight") {
     if (!op_tracker.dump_ops_in_flight(f)) {
+      *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
+    }
+  } else if (command == "ops") {
+    vector<string> flags;
+    cmd_getval(cmdmap, "flags", flags);
+    std::unique_lock l(mds_lock, std::defer_lock);
+    auto lambda = OpTracker::default_dumper;
+    if (flags.size()) {
+      /* use std::function if we actually want to capture flags someday */
+      lambda = [](const TrackedOp& op, Formatter* f) {
+        auto* req = dynamic_cast<const MDRequestImpl*>(&op);
+        if (req) {
+          req->dump_with_mds_lock(f);
+        } else {
+          op.dump_type(f);
+        }
+      };
+      l.lock();
+    }
+    if (!op_tracker.dump_ops_in_flight(f, false, {""}, false, lambda)) {
       *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
     }
   } else if (command == "dump_blocked_ops") {
     if (!op_tracker.dump_ops_in_flight(f, true)) {
+      *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
+    }
+  } else if (command == "dump_blocked_ops_count") {
+    if (!op_tracker.dump_ops_in_flight(f, true, {""}, true)) {
       *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
     }
   } else if (command == "dump_historic_ops") {
@@ -2829,7 +2886,12 @@ void MDSRankDispatcher::handle_asok_command(
     command_dump_tree(cmdmap, *css, f);
   } else if (command == "dump loads") {
     std::lock_guard l(mds_lock);
-    r = balancer->dump_loads(f);
+    int64_t depth = -1;
+    bool got = cmd_getval(cmdmap, "depth", depth);
+    if (!got || depth < 0) {
+      dout(10) << "no depth limit when dirfrags dump_load" << dendl;
+    }
+    r = balancer->dump_loads(f, depth);
   } else if (command == "dump snaps") {
     std::lock_guard l(mds_lock);
     string server;
@@ -2857,6 +2919,8 @@ void MDSRankDispatcher::handle_asok_command(
     command_openfiles_ls(f);
   } else if (command == "dump inode") {
     command_dump_inode(f, cmdmap, *css);
+  } else if (command == "dump dir") {
+    command_dump_dir(f, cmdmap, *css);
   } else if (command == "damage ls") {
     std::lock_guard l(mds_lock);
     damage_table.dump(f);
@@ -2952,6 +3016,7 @@ void MDSRank::command_scrub_start(Formatter *f,
   bool force = false;
   bool recursive = false;
   bool repair = false;
+  bool scrub_mdsdir = false;
   for (auto &op : scrubop_vec) {
     if (op == "force")
       force = true;
@@ -2959,10 +3024,13 @@ void MDSRank::command_scrub_start(Formatter *f,
       recursive = true;
     else if (op == "repair")
       repair = true;
+    else if (op == "scrub_mdsdir" && path == "/")
+      scrub_mdsdir = true;
   }
 
   std::lock_guard l(mds_lock);
-  mdcache->enqueue_scrub(path, tag, force, recursive, repair, f, on_finish);
+  mdcache->enqueue_scrub(path, tag, force, recursive, repair, scrub_mdsdir,
+                         f, on_finish);
   // scrub_dentry() finishers will dump the data for us; we're done!
 }
 
@@ -2972,7 +3040,7 @@ void MDSRank::command_tag_path(Formatter *f,
   C_SaferCond scond;
   {
     std::lock_guard l(mds_lock);
-    mdcache->enqueue_scrub(path, tag, true, true, false, f, &scond);
+    mdcache->enqueue_scrub(path, tag, true, true, false, false, f, &scond);
   }
   scond.wait();
 }
@@ -3293,6 +3361,36 @@ void MDSRank::command_dump_inode(Formatter *f, const cmdmap_t &cmdmap, std::ostr
   }
 }
 
+void MDSRank::command_dump_dir(Formatter *f, const cmdmap_t &cmdmap, std::ostream &ss)
+{
+  std::lock_guard l(mds_lock);
+  std::string path;
+  bool got = cmd_getval(cmdmap, "path", path);
+  if (!got) {
+    ss << "missing path argument";
+    return;
+  }
+
+  bool dentry_dump = false;
+  cmd_getval(cmdmap, "dentry_dump", dentry_dump);
+
+  CInode *in = mdcache->cache_traverse(filepath(path.c_str()));
+  if (!in) {
+    ss << "directory inode not in cache";
+    return;
+  }
+
+  f->open_array_section("dirs");
+  frag_vec_t leaves;
+  in->dirfragtree.get_leaves_under(frag_t(), leaves);
+  for (const auto& leaf : leaves) {
+    CDir *dir = in->get_dirfrag(leaf);
+    if (dir)
+      mdcache->dump_dir(f, dir, dentry_dump);
+  }
+  f->close_section();
+}
+
 void MDSRank::dump_status(Formatter *f) const
 {
   f->dump_string("fs_name", std::string(mdsmap->get_fs_name()));
@@ -3346,6 +3444,8 @@ void MDSRank::create_logger()
                             "exi", PerfCountersBuilder::PRIO_INTERESTING);
     mds_plb.add_u64_counter(l_mds_imported_inodes, "imported_inodes", "Imported inodes",
                             "imi", PerfCountersBuilder::PRIO_INTERESTING);
+    mds_plb.add_u64_counter(l_mds_slow_reply, "slow_reply", "Slow replies", "slr",
+                              PerfCountersBuilder::PRIO_INTERESTING);
 
     // caps msg stats
     mds_plb.add_u64_counter(l_mdss_handle_client_caps, "handle_client_caps",
@@ -3374,7 +3474,10 @@ void MDSRank::create_logger()
     mds_plb.add_u64(l_mds_root_rfiles, "root_rfiles", "root inode rfiles");
     mds_plb.add_u64(l_mds_root_rbytes, "root_rbytes", "root inode rbytes");
     mds_plb.add_u64(l_mds_root_rsnaps, "root_rsnaps", "root inode rsnaps");
-    mds_plb.add_u64_counter(l_mds_dir_fetch, "dir_fetch", "Directory fetch");
+    mds_plb.add_u64_counter(l_mds_dir_fetch_complete,
+			    "dir_fetch_complete", "Fetch complete dirfrag");
+    mds_plb.add_u64_counter(l_mds_dir_fetch_keys,
+			    "dir_fetch_keys", "Fetch keys from dirfrag");
     mds_plb.add_u64_counter(l_mds_dir_commit, "dir_commit", "Directory commit");
     mds_plb.add_u64_counter(l_mds_dir_split, "dir_split", "Directory split");
     mds_plb.add_u64_counter(l_mds_dir_merge, "dir_merge", "Directory merge");
@@ -3502,7 +3605,7 @@ void MDSRankDispatcher::handle_osd_map()
   // reconnect state will journal blocklisted clients (journal
   // is opened for writing in `replay_done` before moving to
   // up:resolve).
-  if (!is_replay()) {
+  if (!is_any_replay()) {
     std::set<entity_addr_t> newly_blocklisted;
     objecter->consume_blocklist_events(&newly_blocklisted);
     auto epoch = objecter->with_osdmap([](const OSDMap &o){return o.get_epoch();});
@@ -3654,6 +3757,7 @@ bool MDSRank::evict_client(int64_t session_id,
     if (!session) {
       dout(1) << "session " << session_id << " was removed while we waited "
                  "for blocklist" << dendl;
+      client_eviction_dump = true;
       return true;
     }
     kill_client_session();
@@ -3665,6 +3769,7 @@ bool MDSRank::evict_client(int64_t session_id,
     }
   }
 
+  client_eviction_dump = true;
   return true;
 }
 
@@ -3713,6 +3818,7 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "clog_to_syslog_level",
     "fsid",
     "host",
+    "mds_alternate_name_max",
     "mds_bal_fragment_dirs",
     "mds_bal_fragment_interval",
     "mds_bal_fragment_size_max",
@@ -3720,19 +3826,36 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_cache_mid",
     "mds_cache_reservation",
     "mds_cache_trim_decay_rate",
+    "mds_cap_acquisition_throttle_retry_request_time",
     "mds_cap_revoke_eviction_timeout",
+    "mds_debug_subtrees",
+    "mds_dir_max_entries",
     "mds_dump_cache_threshold_file",
     "mds_dump_cache_threshold_formatter",
     "mds_enable_op_tracker",
+    "mds_export_ephemeral_distributed",
     "mds_export_ephemeral_random",
     "mds_export_ephemeral_random_max",
-    "mds_export_ephemeral_distributed",
+    "mds_extraordinary_events_dump_interval",
+    "mds_forward_all_requests_to_auth",
     "mds_health_cache_threshold",
+    "mds_heartbeat_grace",
+    "mds_heartbeat_reset_grace",
+    "mds_inject_journal_corrupt_dentry_first",
     "mds_inject_migrator_session_race",
+    "mds_inject_rename_corrupt_dentry_first",
+    "mds_kill_shutdown_at",
+    "mds_log_event_large_threshold",
+    "mds_log_events_per_segment",
+    "mds_log_major_segment_event_ratio",
+    "mds_log_max_events",
+    "mds_log_max_segments",
     "mds_log_pause",
+    "mds_log_skip_corrupt_events",
+    "mds_log_skip_unbounded_events",
+    "mds_max_caps_per_client",
     "mds_max_export_size",
     "mds_max_purge_files",
-    "mds_forward_all_requests_to_auth",
     "mds_max_purge_ops",
     "mds_max_purge_ops_per_pg",
     "mds_max_snaps_per_dir",
@@ -3744,15 +3867,11 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_recall_warning_decay_rate",
     "mds_request_load_average_decay_rate",
     "mds_session_cache_liveness_decay_rate",
-    "mds_heartbeat_grace",
     "mds_session_cap_acquisition_decay_rate",
-    "mds_max_caps_per_client",
     "mds_session_cap_acquisition_throttle",
     "mds_session_max_caps_throttle_ratio",
-    "mds_cap_acquisition_throttle_retry_request_time",
-    "mds_alternate_name_max",
-    "mds_dir_max_entries",
     "mds_symlink_recovery",
+    "mds_session_metadata_threshold",
     NULL
   };
   return KEYS;
@@ -3762,6 +3881,9 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
 {
   // XXX with or without mds_lock!
 
+  if (changed.count("mds_heartbeat_reset_grace")) {
+    _heartbeat_reset_grace = conf.get_val<uint64_t>("mds_heartbeat_reset_grace");
+  }
   if (changed.count("mds_heartbeat_grace")) {
     heartbeat_grace = conf.get_val<double>("mds_heartbeat_grace");
   }
@@ -3771,8 +3893,40 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
   if (changed.count("mds_op_history_size") || changed.count("mds_op_history_duration")) {
     op_tracker.set_history_size_and_duration(conf->mds_op_history_size, conf->mds_op_history_duration);
   }
+  if (changed.count("mds_op_history_slow_op_size") || changed.count("mds_op_history_slow_op_threshold")) {
+    op_tracker.set_history_slow_op_size_and_threshold(conf->mds_op_history_slow_op_size, conf->mds_op_history_slow_op_threshold);
+  }
   if (changed.count("mds_enable_op_tracker")) {
     op_tracker.set_tracking(conf->mds_enable_op_tracker);
+  }
+  if (changed.count("mds_extraordinary_events_dump_interval")) {
+    reset_event_flags();
+    extraordinary_events_dump_interval = conf.get_val<std::chrono::seconds>
+      ("mds_extraordinary_events_dump_interval").count();
+
+    //Enable the logging only during low level debugging
+    if (extraordinary_events_dump_interval) {
+      uint64_t log_level, gather_level;
+      std::string debug_mds = g_conf().get_val<std::string>("debug_mds");
+      auto delim = debug_mds.find("/");
+      std::istringstream(debug_mds.substr(0, delim)) >> log_level;
+      std::istringstream(debug_mds.substr(delim + 1)) >> gather_level;
+
+      if (log_level < 10 && gather_level >= 10) {
+        dout(0) << __func__ << " Enabling in-memory log dump..." << dendl;
+        std::scoped_lock lock(mds_lock);
+        schedule_inmemory_logger();
+      }
+      else {
+        dout(0) << __func__ << " Enabling in-memory log dump failed. debug_mds=" << log_level
+                << "/" << gather_level << dendl;
+        extraordinary_events_dump_interval = 0;
+      }
+    }
+    else {
+      //The user set mds_extraordinary_events_dump_interval = 0
+      dout(0) << __func__ << " In-memory log dump disabled" << dendl;
+    }
   }
   if (changed.count("clog_to_monitors") ||
       changed.count("clog_to_syslog") ||
@@ -3785,18 +3939,19 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
       changed.count("fsid")) {
     update_log_config();
   }
+  if (changed.count("mds_inject_journal_corrupt_dentry_first")) {
+    inject_journal_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first");
+  }
 
   finisher->queue(new LambdaContext([this, changed](int) {
     std::scoped_lock lock(mds_lock);
 
     dout(10) << "flushing conf change to components: " << changed << dendl;
 
-    if (changed.count("mds_log_pause") && !g_conf()->mds_log_pause) {
-      mdlog->kick_submitter();
-    }
     sessionmap.handle_conf_change(changed);
     server->handle_conf_change(changed);
     mdcache->handle_conf_change(changed, *mdsmap);
+    mdlog->handle_conf_change(changed, *mdsmap);
     purge_queue.handle_conf_change(changed, *mdsmap);
   }));
 }
@@ -3839,4 +3994,37 @@ void MDSRank::send_task_status() {
   }
 
   schedule_update_timer_task();
+}
+
+void MDSRank::schedule_inmemory_logger() {
+  dout(20) << __func__ << dendl;
+  timer.add_event_after(extraordinary_events_dump_interval,
+                        new LambdaContext([this]() {
+                          inmemory_logger();
+                        }));
+}
+
+void MDSRank::inmemory_logger() {
+  if (client_eviction_dump ||
+      beacon.missed_beacon_ack_dump ||
+      beacon.missed_internal_heartbeat_dump) {
+    //dump the in-memory logs if any of these events occured recently
+    dout(0) << __func__ << " client_eviction_dump "<< client_eviction_dump
+            << ", missed_beacon_ack_dump " << beacon.missed_beacon_ack_dump
+            << ", missed_internal_heartbeat_dump " << beacon.missed_internal_heartbeat_dump
+            << dendl;
+    reset_event_flags();
+    g_ceph_context->_log->dump_recent();
+  }
+
+  //reschedule if it's enabled
+  if (extraordinary_events_dump_interval) {
+    schedule_inmemory_logger();
+  }
+}
+
+void MDSRank::reset_event_flags() {
+  client_eviction_dump = false;
+  beacon.missed_beacon_ack_dump = false;
+  beacon.missed_internal_heartbeat_dump = false;
 }

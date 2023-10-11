@@ -178,12 +178,21 @@ class AuthManagerTool(cherrypy.Tool):
     def _check_authentication(self):
         JwtManager.reset_user()
         token = JwtManager.get_token_from_header()
-        self.logger.debug("token: %s", token)
         if token:
             user = JwtManager.get_user(token)
             if user:
                 self._check_authorization(user.username)
                 return
+
+        resp_head = cherrypy.response.headers
+        req_head = cherrypy.request.headers
+        req_header_cross_origin_url = req_head.get('Access-Control-Allow-Origin')
+        cross_origin_urls = mgr.get_module_option('cross_origin_url', '')
+        cross_origin_url_list = [url.strip() for url in cross_origin_urls.split(',')]
+
+        if req_header_cross_origin_url in cross_origin_url_list:
+            resp_head['Access-Control-Allow-Origin'] = req_header_cross_origin_url
+
         self.logger.debug('Unauthorized access to %s',
                           cherrypy.url(relative='server'))
         raise cherrypy.HTTPError(401, 'You are not authorized to access '

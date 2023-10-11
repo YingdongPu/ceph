@@ -296,7 +296,7 @@ struct CephXTicketHandler {
   bool need_key() const;
 
   void invalidate_ticket() {
-    have_key_flag = 0;
+    have_key_flag = false;
   }
 private:
   CephContext *cct;
@@ -379,7 +379,7 @@ struct CephXServiceTicketInfo {
 WRITE_CLASS_ENCODER(CephXServiceTicketInfo)
 
 struct CephXAuthorizeChallenge : public AuthAuthorizerChallenge {
-  uint64_t server_challenge;
+  uint64_t server_challenge = 0;
   void encode(ceph::buffer::list& bl) const {
     using ceph::encode;
     __u8 struct_v = 1;
@@ -396,7 +396,7 @@ struct CephXAuthorizeChallenge : public AuthAuthorizerChallenge {
 WRITE_CLASS_ENCODER(CephXAuthorizeChallenge)
 
 struct CephXAuthorize {
-  uint64_t nonce;
+  uint64_t nonce = 0;
   bool have_challenge = false;
   uint64_t server_challenge_plus_one = 0;
   void encode(ceph::buffer::list& bl) const {

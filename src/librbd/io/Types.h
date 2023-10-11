@@ -66,7 +66,6 @@ enum ImageDispatchLayer {
   IMAGE_DISPATCH_LAYER_JOURNAL,
   IMAGE_DISPATCH_LAYER_WRITE_BLOCK,
   IMAGE_DISPATCH_LAYER_WRITEBACK_CACHE,
-  IMAGE_DISPATCH_LAYER_CRYPTO,
   IMAGE_DISPATCH_LAYER_CORE,
   IMAGE_DISPATCH_LAYER_LAST
 };
@@ -95,6 +94,10 @@ enum {
   IMAGE_DISPATCH_FLAG_QOS_MASK                = (
     IMAGE_DISPATCH_FLAG_QOS_BPS_MASK |
     IMAGE_DISPATCH_FLAG_QOS_IOPS_MASK),
+
+  // TODO: pass area through ImageDispatchInterface and remove
+  // this flag
+  IMAGE_DISPATCH_FLAG_CRYPTO_HEADER           = 1 << 6
 };
 
 enum {
@@ -110,11 +113,6 @@ enum {
     RBD_IO_OPERATION_DISCARD |
     RBD_IO_OPERATION_WRITE_SAME |
     RBD_IO_OPERATION_COMPARE_AND_WRITE)
-};
-
-enum ImageExtentsMapType {
-    IMAGE_EXTENTS_MAP_TYPE_LOGICAL_TO_PHYSICAL,
-    IMAGE_EXTENTS_MAP_TYPE_PHYSICAL_TO_LOGICAL,
 };
 
 enum ObjectDispatchLayer {
@@ -274,6 +272,13 @@ using striper::LightweightObjectExtents;
 
 typedef std::pair<uint64_t,uint64_t> Extent;
 typedef std::vector<Extent> Extents;
+
+enum class ImageArea {
+  DATA,
+  CRYPTO_HEADER
+};
+
+std::ostream& operator<<(std::ostream& os, ImageArea area);
 
 struct ReadExtent {
     const uint64_t offset;

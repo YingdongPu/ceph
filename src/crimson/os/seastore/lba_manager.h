@@ -19,7 +19,6 @@
 
 #include "crimson/os/seastore/cache.h"
 #include "crimson/os/seastore/seastore_types.h"
-#include "crimson/os/seastore/segment_manager.h"
 
 namespace crimson::os::seastore {
 
@@ -40,6 +39,8 @@ public:
    * Fetches mappings for laddr_t in range [offset, offset + len)
    *
    * Future will not resolve until all pins have resolved (set_paddr called)
+   * For indirect lba mappings, get_mappings will always retrieve the original
+   * lba value.
    */
   using get_mappings_iertr = base_iertr;
   using get_mappings_ret = get_mappings_iertr::future<lba_pin_list_t>;
@@ -51,6 +52,8 @@ public:
    * Fetches mappings for a list of laddr_t in range [offset, offset + len)
    *
    * Future will not resolve until all pins have resolved (set_paddr called)
+   * For indirect lba mappings, get_mappings will always retrieve the original
+   * lba value.
    */
   virtual get_mappings_ret get_mappings(
     Transaction &t,
@@ -60,10 +63,12 @@ public:
    * Fetches the mapping for laddr_t
    *
    * Future will not resolve until the pin has resolved (set_paddr called)
+   * For indirect lba mappings, get_mapping will always retrieve the original
+   * lba value.
    */
   using get_mapping_iertr = base_iertr::extend<
     crimson::ct_error::enoent>;
-  using get_mapping_ret = get_mapping_iertr::future<LBAPinRef>;
+  using get_mapping_ret = get_mapping_iertr::future<LBAMappingRef>;
   virtual get_mapping_ret get_mapping(
     Transaction &t,
     laddr_t offset) = 0;
@@ -73,19 +78,33 @@ public:
    *
    * Offset will be relative to the block offset of the record
    * This mapping will block from transaction submission until set_paddr
-   * is called on the LBAPin.
+   * is called on the LBAMapping.
    */
   using alloc_extent_iertr = base_iertr;
-  using alloc_extent_ret = alloc_extent_iertr::future<LBAPinRef>;
+  using alloc_extent_ret = alloc_extent_iertr::future<LBAMappingRef>;
   virtual alloc_extent_ret alloc_extent(
     Transaction &t,
     laddr_t hint,
     extent_len_t len,
-    paddr_t addr) = 0;
+    paddr_t addr,
+    LogicalCachedExtent &nextent) = 0;
+
+  virtual alloc_extent_ret clone_extent(
+    Transaction &t,
+    laddr_t hint,
+    extent_len_t len,
+    laddr_t intermediate_key,
+    paddr_t actual_addr,
+    laddr_t intermediate_base) = 0;
+
+  virtual alloc_extent_ret reserve_region(
+    Transaction &t,
+    laddr_t hint,
+    extent_len_t len) = 0;
 
   struct ref_update_result_t {
     unsigned refcount = 0;
-    paddr_t addr;
+    pladdr_t addr;
     extent_len_t length = 0;
   };
   using ref_iertr = base_iertr::extend<
@@ -99,7 +118,8 @@ public:
    */
   virtual ref_ret decref_extent(
     Transaction &t,
-    laddr_t addr) = 0;
+    laddr_t addr,
+    bool cascade_remove) = 0;
 
   /**
    * Increments ref count on extent
@@ -110,12 +130,19 @@ public:
     Transaction &t,
     laddr_t addr) = 0;
 
-  virtual void complete_transaction(
-    Transaction &t) = 0;
+  /**
+   * Increments ref count on extent
+   *
+   * @return returns resulting refcount
+   */
+  virtual ref_ret incref_extent(
+    Transaction &t,
+    laddr_t addr,
+    int delta) = 0;
 
   /**
    * Should be called after replay on each cached extent.
-   * Implementation must initialize the LBAPin on any
+   * Implementation must initialize the LBAMapping on any
    * LogicalCachedExtent's and may also read in any dependent
    * structures, etc.
    *
@@ -126,6 +153,9 @@ public:
   virtual init_cached_extent_ret init_cached_extent(
     Transaction &t,
     CachedExtentRef e) = 0;
+
+  using check_child_trackers_ret = base_iertr::future<>;
+  virtual check_child_trackers_ret check_child_trackers(Transaction &t) = 0;
 
   /**
    * Calls f for each mapping in [begin, end)
@@ -141,18 +171,6 @@ public:
     scan_mappings_func_t &&f) = 0;
 
   /**
-   * Calls f for each mapped space usage
-   */
-  using scan_mapped_space_iertr = base_iertr::extend_ertr<
-    SegmentManager::read_ertr>;
-  using scan_mapped_space_ret = scan_mapped_space_iertr::future<>;
-  using scan_mapped_space_func_t = std::function<
-    void(paddr_t, extent_len_t)>;
-  virtual scan_mapped_space_ret scan_mapped_space(
-    Transaction &t,
-    scan_mapped_space_func_t &&f) = 0;
-
-  /**
    * rewrite_extent
    *
    * rewrite extent into passed transaction
@@ -164,17 +182,30 @@ public:
     CachedExtentRef extent) = 0;
 
   /**
-   * delayed_update_mapping
+   * update_mapping
    *
-   * update lba mapping for delayed allocated extents
+   * update lba mapping for a delayed allocated extent
    */
-  using update_le_mapping_iertr = base_iertr;
-  using update_le_mapping_ret = base_iertr::future<>;
-  virtual update_le_mapping_ret update_mapping(
+  using update_mapping_iertr = base_iertr;
+  using update_mapping_ret = base_iertr::future<>;
+  virtual update_mapping_ret update_mapping(
     Transaction& t,
     laddr_t laddr,
     paddr_t prev_addr,
-    paddr_t paddr) = 0;
+    paddr_t paddr,
+    LogicalCachedExtent *nextent) = 0;
+
+  /**
+   * update_mappings
+   *
+   * update lba mappings for delayed allocated extents
+   */
+  using update_mappings_iertr = update_mapping_iertr;
+  using update_mappings_ret = update_mapping_ret;
+  update_mappings_ret update_mappings(
+    Transaction& t,
+    const std::list<LogicalCachedExtentRef>& extents);
+
   /**
    * get_physical_extent_if_live
    *
@@ -192,9 +223,7 @@ public:
     extent_types_t type,
     paddr_t addr,
     laddr_t laddr,
-    seastore_off_t len) = 0;
-
-  virtual void add_pin(LBAPin &pin) = 0;
+    extent_len_t len) = 0;
 
   virtual ~LBAManager() {}
 };
@@ -202,9 +231,7 @@ using LBAManagerRef = std::unique_ptr<LBAManager>;
 
 class Cache;
 namespace lba_manager {
-LBAManagerRef create_lba_manager(
-  SegmentManager &segment_manager,
-  Cache &cache);
+LBAManagerRef create_lba_manager(Cache &cache);
 }
 
 }

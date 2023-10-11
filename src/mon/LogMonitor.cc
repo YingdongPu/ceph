@@ -42,6 +42,7 @@
 
 #include <boost/algorithm/string/predicate.hpp>
 
+#include <iterator>
 #include <sstream>
 #include <syslog.h>
 
@@ -60,6 +61,7 @@
 #include "include/str_list.h"
 #include "include/str_map.h"
 #include "include/compat.h"
+#include "include/utime_fmt.h"
 
 #define dout_subsys ceph_subsys_mon
 
@@ -354,10 +356,6 @@ void LogMonitor::log_external(const LogEntry& le)
     channel = CLOG_CHANNEL_CLUSTER;
   }
 
-  if (g_conf().get_val<bool>("mon_cluster_log_to_stderr")) {
-    cerr << channel << " " << le << std::endl;
-  }
-
   if (channels.do_log_to_syslog(channel)) {
     string level = channels.get_level(channel);
     string facility = channels.get_facility(channel);
@@ -386,17 +384,19 @@ void LogMonitor::log_external(const LogEntry& le)
     dout(7) << "journald: " << channel << dendl;
   }
 
+  bool do_stderr = g_conf().get_val<bool>("mon_cluster_log_to_stderr");
+  int fd = -1;
   if (g_conf()->mon_cluster_log_to_file) {
+    if (this->log_rotated.exchange(false)) {
+      this->log_external_close_fds();
+    }
+
     auto p = channel_fds.find(channel);
-    int fd;
     if (p == channel_fds.end()) {
       string log_file = channels.get_log_file(channel);
       dout(20) << __func__ << " logging for channel '" << channel
 	       << "' to file '" << log_file << "'" << dendl;
-      if (log_file.empty()) {
-	// do not log this channel
-	fd = -1;
-      } else {
+      if (!log_file.empty()) {
 	fd = ::open(log_file.c_str(), O_WRONLY|O_APPEND|O_CREAT|O_CLOEXEC, 0600);
 	if (fd < 0) {
 	  int err = -errno;
@@ -409,11 +409,12 @@ void LogMonitor::log_external(const LogEntry& le)
     } else {
       fd = p->second;
     }
+  }
+  if (do_stderr || fd >= 0) {
+    fmt::format_to(std::back_inserter(log_buffer), "{}\n", le);
 
     if (fd >= 0) {
-      fmt::format_to(file_log_buffer, "{}\n", le);
-      int err = safe_write(fd, file_log_buffer.data(), file_log_buffer.size());
-      file_log_buffer.clear();
+      int err = safe_write(fd, log_buffer.data(), log_buffer.size());
       if (err < 0) {
 	dout(1) << "error writing to '" << channels.get_log_file(channel)
 		<< "' for channel '" << channel
@@ -422,6 +423,12 @@ void LogMonitor::log_external(const LogEntry& le)
 	channel_fds.erase(channel);
       }
     }
+
+    if (do_stderr) {
+      fmt::print(std::cerr, "{} {}", channel, std::string_view(log_buffer.data(), log_buffer.size()));
+    }
+
+    log_buffer.clear();
   }
 }
 
@@ -737,7 +744,7 @@ bool LogMonitor::prepare_log(MonOpRequestRef op)
       pending_log.insert(pair<utime_t,LogEntry>(p->stamp, *p));
     }
   }
-  wait_for_finished_proposal(op, new C_Log(this, op));
+  wait_for_commit(op, new C_Log(this, op));
   return true;
 }
 
@@ -909,7 +916,7 @@ bool LogMonitor::preprocess_command(MonOpRequestRef op)
 	  } else {
 	    start = from;
 	  }
-	  dout(10) << __func__ << " channnel " << p.first
+	  dout(10) << __func__ << " channel " << p.first
 		   << " from " << from << " to " << to << dendl;
 	  for (version_t v = start; v < to; ++v) {
 	    bufferlist ebl;
@@ -930,6 +937,9 @@ bool LogMonitor::preprocess_command(MonOpRequestRef op)
 	  entries.erase(entries.begin());
 	}
 	for (auto& p : entries) {
+	  if (!match(p.second)) {
+	    continue;
+	  }
 	  if (f) {
 	    f->dump_object("entry", p.second);
 	  } else {
@@ -961,10 +971,12 @@ bool LogMonitor::preprocess_command(MonOpRequestRef op)
 	    LogEntry le;
 	    auto p = ebl.cbegin();
 	    decode(le, p);
-	    if (f) {
-	      f->dump_object("entry", le);
-	    } else {
-	      ss << le << "\n";
+	    if (match(le)) {
+	      if (f) {
+	        f->dump_object("entry", le);
+	      } else {
+	        ss << le << "\n";
+	      }
 	    }
 	  }
 	}
@@ -1028,7 +1040,7 @@ bool LogMonitor::prepare_command(MonOpRequestRef op)
     le.msg = str_join(logtext, " ");
     pending_keys.insert(le.key());
     pending_log.insert(pair<utime_t,LogEntry>(le.stamp, le));
-    wait_for_finished_proposal(op, new Monitor::C_Command(
+    wait_for_commit(op, new Monitor::C_Command(
           mon, op, 0, string(), get_last_committed() + 1));
     return true;
   }
@@ -1038,6 +1050,11 @@ bool LogMonitor::prepare_command(MonOpRequestRef op)
   return false;
 }
 
+void LogMonitor::dump_info(Formatter *f)
+{
+  f->dump_unsigned("logm_first_committed", get_first_committed());
+  f->dump_unsigned("logm_last_committed", get_last_committed());
+}
 
 int LogMonitor::sub_name_to_id(const string& n)
 {

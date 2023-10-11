@@ -13,6 +13,7 @@
 
 #include "mds/flock.h"
 #include "mds/mdstypes.h" // hrm
+#include "include/cephfs/types.h"
 
 #include "osdc/ObjectCacher.h"
 
@@ -96,9 +97,6 @@ struct CapSnap {
   bool writing = false, dirty_data = false;
   uint64_t flush_tid = 0;
 
-  int64_t cap_dirtier_uid = -1;
-  int64_t cap_dirtier_gid = -1;
-
   explicit CapSnap(Inode *i)
     : in(i)
   {}
@@ -115,6 +113,7 @@ struct CapSnap {
 #define I_ERROR_FILELOCK	(1 << 5)
 
 struct Inode : RefCountedObject {
+  ceph::coarse_mono_time hold_caps_until;
   Client *client;
 
   // -- the actual inode --
@@ -163,7 +162,11 @@ struct Inode : RefCountedObject {
   version_t  inline_version = 0;
   bufferlist inline_data;
 
-  bool fscrypt = false; // fscrypt enabled ?
+  std::vector<uint8_t> fscrypt_auth;
+  std::vector<uint8_t> fscrypt_file;
+  bool is_fscrypt_enabled() {
+    return !!fscrypt_auth.size();
+  }
 
   bool is_root()    const { return ino == CEPH_INO_ROOT; }
   bool is_symlink() const { return (mode & S_IFMT) == S_IFLNK; }
@@ -211,7 +214,6 @@ struct Inode : RefCountedObject {
   int cache_gen = 0;
   int snap_caps = 0;
   int snap_cap_refs = 0;
-  utime_t hold_caps_until;
   xlist<Inode*>::item delay_cap_item, dirty_cap_item, flushing_cap_item;
 
   SnapRealm *snaprealm = 0;
@@ -236,8 +238,9 @@ struct Inode : RefCountedObject {
   std::map<frag_t,int> fragmap;  // known frag -> mds mappings
   std::map<frag_t, std::vector<mds_rank_t>> frag_repmap; // non-auth mds mappings
 
-  std::list<ceph::condition_variable*> waitfor_caps;
-  std::list<ceph::condition_variable*> waitfor_commit;
+  std::list<Context*> waitfor_caps;
+  std::list<Context*> waitfor_caps_pending;
+  std::list<Context*> waitfor_commit;
   std::list<ceph::condition_variable*> waitfor_deleg;
 
   Dentry *get_first_parent() {
@@ -247,6 +250,7 @@ struct Inode : RefCountedObject {
 
   void make_long_path(filepath& p);
   void make_short_path(filepath& p);
+  bool make_path_string(std::string& s);
   void make_nosnap_relative_path(filepath& p);
 
   // The ref count. 1 for each dentry, fh, inode_map,

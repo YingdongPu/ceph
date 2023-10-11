@@ -4,9 +4,8 @@ import { AbstractControl } from '@angular/forms';
 import { By } from '@angular/platform-browser';
 import { BrowserDynamicTestingModule } from '@angular/platform-browser-dynamic/testing';
 
-import { NgbModal, NgbNav, NgbNavItem } from '@ng-bootstrap/ng-bootstrap';
+import { NgbModal, NgbNav, NgbNavItem, NgbNavLink } from '@ng-bootstrap/ng-bootstrap';
 import _ from 'lodash';
-import { configureTestSuite } from 'ng-bullet';
 import { of } from 'rxjs';
 
 import { InventoryDevice } from '~/app/ceph/cluster/inventory/inventory-devices/inventory-device.model';
@@ -31,15 +30,18 @@ import {
 } from '~/app/shared/models/prometheus-alerts';
 
 export function configureTestBed(configuration: any, entryComponents?: any) {
-  configureTestSuite(() => {
+  beforeEach(async () => {
     if (entryComponents) {
       // Declare entryComponents without having to add them to a module
       // This is needed since Jest doesn't yet support not declaring entryComponents
-      TestBed.configureTestingModule(configuration).overrideModule(BrowserDynamicTestingModule, {
-        set: { entryComponents: entryComponents }
-      });
+      await TestBed.configureTestingModule(configuration).overrideModule(
+        BrowserDynamicTestingModule,
+        {
+          set: { entryComponents: entryComponents }
+        }
+      );
     } else {
-      TestBed.configureTestingModule(configuration);
+      await TestBed.configureTestingModule(configuration);
     }
   });
 }
@@ -622,7 +624,7 @@ export class TabHelper {
 
   private static getNgbNavItemsDebugElems(fixture: ComponentFixture<any>) {
     const debugElem: DebugElement = fixture.debugElement;
-    return debugElem.queryAll(By.directive(NgbNavItem));
+    return debugElem.queryAll(By.directive(NgbNavLink));
   }
 }
 
@@ -675,7 +677,7 @@ export class TableActionHelper {
       const actionElement = getActionElement(action);
       if (expectResult[action.name]) {
         actions[action.name] = {
-          disabled: actionElement.classes.disabled,
+          disabled: actionElement.classes.disabled ? true : false,
           disableDesc: actionElement.properties.title
         };
       }

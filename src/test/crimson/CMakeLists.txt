@@ -21,12 +21,12 @@ target_link_libraries(unittest-seastar-denc crimson GTest::Main)
 
 add_executable(unittest-seastar-socket test_socket.cc)
 add_ceph_unittest(unittest-seastar-socket
-  --memory 256M --smp 2)
+  --memory 256M --smp 4)
 target_link_libraries(unittest-seastar-socket crimson)
 
 add_executable(unittest-seastar-messenger test_messenger.cc)
 add_ceph_unittest(unittest-seastar-messenger
-  --memory 256M --smp 1)
+  --memory 256M --smp 4)
 target_link_libraries(unittest-seastar-messenger crimson)
 
 add_executable(test-seastar-messenger-peer test_messenger_peer.cc)
@@ -41,7 +41,8 @@ add_executable(test-async-echo
 target_link_libraries(test-async-echo ceph-common global)
 
 add_executable(unittest-seastar-alienstore-thread-pool
-  test_alienstore_thread_pool.cc)
+  test_alienstore_thread_pool.cc
+  ${PROJECT_SOURCE_DIR}/src/crimson/osd/lsan_suppressions.cc)
 add_ceph_unittest(unittest-seastar-alienstore-thread-pool
   --memory 256M --smp 1)
 target_link_libraries(unittest-seastar-alienstore-thread-pool
@@ -82,6 +83,11 @@ add_ceph_unittest(unittest-interruptible-future
 target_link_libraries(
   unittest-interruptible-future
   crimson-common)
+
+add_executable(unittest-seastar-messenger-thrash test_messenger_thrash.cc)
+add_ceph_unittest(unittest-seastar-messenger-thrash
+  --memory 256M --smp 1)
+target_link_libraries(unittest-seastar-messenger-thrash crimson)
 
 add_subdirectory(seastore)
 

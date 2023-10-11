@@ -15,6 +15,7 @@
  *
  */
 
+#include <algorithm>
 #include <list>
 #include <map>
 #include <ostream>
@@ -1323,6 +1324,9 @@ void pool_snap_info_t::generate_test_instances(list<pool_snap_info_t*>& o)
 
 // -- pool_opts_t --
 
+// The order of items in the list is important, therefore,
+// you should always add to the end of the list when adding new options.
+
 typedef std::map<std::string, pool_opts_t::opt_desc_t> opt_mapping_t;
 static opt_mapping_t opt_mapping = boost::assign::map_list_of
 	   ("scrub_min_interval", pool_opts_t::opt_desc_t(
@@ -1357,8 +1361,6 @@ static opt_mapping_t opt_mapping = boost::assign::map_list_of
 	     pool_opts_t::FINGERPRINT_ALGORITHM, pool_opts_t::STR))
            ("pg_num_min", pool_opts_t::opt_desc_t(
 	     pool_opts_t::PG_NUM_MIN, pool_opts_t::INT))
-           ("pg_num_max", pool_opts_t::opt_desc_t(
-	     pool_opts_t::PG_NUM_MAX, pool_opts_t::INT))
            ("target_size_bytes", pool_opts_t::opt_desc_t(
 	     pool_opts_t::TARGET_SIZE_BYTES, pool_opts_t::INT))
            ("target_size_ratio", pool_opts_t::opt_desc_t(
@@ -1372,7 +1374,9 @@ static opt_mapping_t opt_mapping = boost::assign::map_list_of
            ("dedup_chunk_algorithm", pool_opts_t::opt_desc_t(
 	     pool_opts_t::DEDUP_CHUNK_ALGORITHM, pool_opts_t::STR))
            ("dedup_cdc_chunk_size", pool_opts_t::opt_desc_t(
-	     pool_opts_t::DEDUP_CDC_CHUNK_SIZE, pool_opts_t::INT));
+	     pool_opts_t::DEDUP_CDC_CHUNK_SIZE, pool_opts_t::INT))
+	   ("pg_num_max", pool_opts_t::opt_desc_t(
+             pool_opts_t::PG_NUM_MAX, pool_opts_t::INT));
 
 bool pool_opts_t::is_opt_name(const std::string& name)
 {
@@ -2859,6 +2863,7 @@ void pg_stat_t::dump(Formatter *f) const
   f->dump_stream("last_clean_scrub_stamp") << last_clean_scrub_stamp;
   f->dump_int("objects_scrubbed", objects_scrubbed);
   f->dump_int("log_size", log_size);
+  f->dump_int("log_dups_size", log_dups_size);
   f->dump_int("ondisk_log_size", ondisk_log_size);
   f->dump_bool("stats_invalid", stats_invalid);
   f->dump_bool("dirty_stats_invalid", dirty_stats_invalid);
@@ -2870,6 +2875,9 @@ void pg_stat_t::dump(Formatter *f) const
   f->dump_unsigned("snaptrimq_len", snaptrimq_len);
   f->dump_int("last_scrub_duration", last_scrub_duration);
   f->dump_string("scrub_schedule", dump_scrub_schedule());
+  f->dump_float("scrub_duration", scrub_duration);
+  f->dump_int("objects_trimmed", objects_trimmed);
+  f->dump_float("snaptrim_duration", snaptrim_duration);
   stats.dump(f);
   f->open_array_section("up");
   for (auto p = up.cbegin(); p != up.cend(); ++p)
@@ -2925,10 +2933,17 @@ void pg_stat_t::dump_brief(Formatter *f) const
 std::string pg_stat_t::dump_scrub_schedule() const
 {
   if (scrub_sched_status.m_is_active) {
-    return fmt::format(
-      "{}scrubbing for {}s",
-      ((scrub_sched_status.m_is_deep == scrub_level_t::deep) ? "deep " : ""),
-      scrub_sched_status.m_duration_seconds);
+    // are we blocked (in fact, stuck) on some locked object?
+    if (scrub_sched_status.m_sched_status == pg_scrub_sched_status_t::blocked) {
+      return fmt::format(
+	"Blocked! locked objects (for {}s)",
+	scrub_sched_status.m_duration_seconds);
+    } else {
+      return fmt::format(
+	"{}scrubbing for {}s",
+	((scrub_sched_status.m_is_deep == scrub_level_t::deep) ? "deep " : ""),
+	scrub_sched_status.m_duration_seconds);
+    }
   }
   switch (scrub_sched_status.m_sched_status) {
     case pg_scrub_sched_status_t::unknown:
@@ -2965,7 +2980,7 @@ bool operator==(const pg_scrubbing_status_t& l, const pg_scrubbing_status_t& r)
 
 void pg_stat_t::encode(ceph::buffer::list &bl) const
 {
-  ENCODE_START(27, 22, bl);
+  ENCODE_START(29, 22, bl);
   encode(version, bl);
   encode(reported_seq, bl);
   encode(reported_epoch, bl);
@@ -3021,6 +3036,10 @@ void pg_stat_t::encode(ceph::buffer::list &bl) const
   encode((scrub_sched_status.m_is_deep==scrub_level_t::deep), bl);
   encode(scrub_sched_status.m_is_periodic, bl);
   encode(objects_scrubbed, bl);
+  encode(scrub_duration, bl);
+  encode(objects_trimmed, bl);
+  encode(snaptrim_duration, bl);
+  encode(log_dups_size, bl);
 
   ENCODE_FINISH(bl);
 }
@@ -3029,7 +3048,7 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
 {
   bool tmp;
   uint32_t old_state;
-  DECODE_START(27, bl);
+  DECODE_START(29, bl);
   decode(version, bl);
   decode(reported_seq, bl);
   decode(reported_epoch, bl);
@@ -3111,6 +3130,14 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
       scrub_sched_status.m_is_periodic = tmp;
       decode(objects_scrubbed, bl);
     }
+    if (struct_v >= 28) {
+      decode(scrub_duration, bl);
+      decode(objects_trimmed, bl);
+      decode(snaptrim_duration, bl);
+    }
+    if (struct_v >= 29) {
+      decode(log_dups_size, bl);
+    }
   }
   DECODE_FINISH(bl);
 }
@@ -3144,8 +3171,11 @@ void pg_stat_t::generate_test_instances(list<pg_stat_t*>& o)
   a.last_deep_scrub_stamp = utime_t(15, 16);
   a.last_clean_scrub_stamp = utime_t(17, 18);
   a.last_scrub_duration = 3617;
+  a.scrub_duration = 0.003;
   a.snaptrimq_len = 1048576;
   a.objects_scrubbed = 0;
+  a.objects_trimmed = 0;
+  a.snaptrim_duration = 0.123;
   list<object_stat_collection_t*> l;
   object_stat_collection_t::generate_test_instances(l);
   a.stats = *l.back();
@@ -3200,6 +3230,7 @@ bool operator==(const pg_stat_t& l, const pg_stat_t& r)
     l.stats == r.stats &&
     l.stats_invalid == r.stats_invalid &&
     l.log_size == r.log_size &&
+    l.log_dups_size == r.log_dups_size &&
     l.ondisk_log_size == r.ondisk_log_size &&
     l.up == r.up &&
     l.acting == r.acting &&
@@ -3221,7 +3252,10 @@ bool operator==(const pg_stat_t& l, const pg_stat_t& r)
     l.snaptrimq_len == r.snaptrimq_len &&
     l.last_scrub_duration == r.last_scrub_duration &&
     l.scrub_sched_status == r.scrub_sched_status &&
-    l.objects_scrubbed == r.objects_scrubbed;
+    l.objects_scrubbed == r.objects_scrubbed &&
+    l.scrub_duration == r.scrub_duration &&
+    l.objects_trimmed == r.objects_trimmed &&
+    l.snaptrim_duration == r.snaptrim_duration;
 }
 
 // -- store_statfs_t --
@@ -3754,6 +3788,18 @@ void PastIntervals::pg_interval_t::dump(Formatter *f) const
   f->dump_int("up_primary", up_primary);
 }
 
+ostream& operator<<(ostream& out, const PastIntervals::pg_interval_t& i)
+{
+  return out << i.fmt_print();
+}
+
+std::string PastIntervals::pg_interval_t::fmt_print() const
+{
+  return fmt::format(
+      "interval({}-{} up {}({}) acting {}({}){})", first, last, up, up_primary,
+      acting, primary, maybe_went_rw ? " maybe_went_rw" : "");
+}
+
 void PastIntervals::pg_interval_t::generate_test_instances(list<pg_interval_t*>& o)
 {
   o.push_back(new pg_interval_t);
@@ -3818,14 +3864,16 @@ struct compact_interval_t {
     decode(acting, bl);
     DECODE_FINISH(bl);
   }
+  std::string fmt_print() const {
+    return fmt::format("([{},{}] acting={})", first, last, acting);
+  }
   static void generate_test_instances(list<compact_interval_t*> & o) {
     /* Not going to be used, we'll generate pi_compact_rep directly */
   }
 };
 ostream &operator<<(ostream &o, const compact_interval_t &rhs)
 {
-  return o << "([" << rhs.first << "," << rhs.last
-	   << "] acting " << rhs.acting << ")";
+  return o << rhs.fmt_print();
 }
 WRITE_CLASS_ENCODER(compact_interval_t)
 
@@ -3902,6 +3950,10 @@ public:
     return out << "([" << first << "," << last
 	       << "] all_participants=" << all_participants
 	       << " intervals=" << intervals << ")";
+  }
+  std::string print() const override {
+    return fmt::format("([{},{}] all_participants={} intervals={})",
+                       first, last, all_participants, intervals);
   }
   void encode(ceph::buffer::list &bl) const override {
     ENCODE_START(1, 1, bl);
@@ -3995,22 +4047,29 @@ PastIntervals &PastIntervals::operator=(const PastIntervals &rhs)
 
 ostream& operator<<(ostream& out, const PastIntervals &i)
 {
-  if (i.past_intervals) {
-    return i.past_intervals->print(out);
-  } else {
-    return out << "(empty)";
-  }
+  return out << i.fmt_print();
 }
 
-ostream& operator<<(ostream& out, const PastIntervals::PriorSet &i)
+std::string PastIntervals::fmt_print() const {
+  return past_intervals ? past_intervals->print() : "(empty)";
+}
+
+
+std::string PastIntervals::PriorSet::fmt_print() const
 {
-  return out << "PriorSet("
-	     << "ec_pool: " << i.ec_pool
-	     << ", probe: " << i.probe
-	     << ", down: " << i.down
-	     << ", blocked_by: " << i.blocked_by
-	     << ", pg_down: " << i.pg_down
-	     << ")";
+  return fmt::format(
+      "PriorSet("
+      "ec_pool: {}, "
+      "probe: {}, "
+      "down: {}, "
+      "blocked_by: {}, "
+      "pg_down: {})",
+      ec_pool, probe, down, blocked_by, pg_down);
+}
+
+ostream& operator<<(ostream& out, const PastIntervals::PriorSet &pset)
+{
+  return out << pset.fmt_print();
 }
 
 void PastIntervals::decode(ceph::buffer::list::const_iterator &bl)
@@ -4355,19 +4414,6 @@ bool PastIntervals::PriorSet::affected_by_map(
 
   return false;
 }
-
-ostream& operator<<(ostream& out, const PastIntervals::pg_interval_t& i)
-{
-  out << "interval(" << i.first << "-" << i.last
-      << " up " << i.up << "(" << i.up_primary << ")"
-      << " acting " << i.acting << "(" << i.primary << ")";
-  if (i.maybe_went_rw)
-    out << " maybe_went_rw";
-  out << ")";
-  return out;
-}
-
-
 
 // -- pg_query_t --
 
@@ -4771,11 +4817,15 @@ void ObjectCleanRegions::generate_test_instances(list<ObjectCleanRegions*>& o)
   o.back()->mark_object_new();
 }
 
+std::string ObjectCleanRegions::fmt_print() const
+{
+  return fmt::format("clean_offsets: {}, clean_omap: {}, new_object: {}",
+                     clean_offsets, clean_omap, new_object);
+}
+
 ostream& operator<<(ostream& out, const ObjectCleanRegions& ocr)
 {
-  return out << "clean_offsets: " << ocr.clean_offsets
-             << ", clean_omap: " << ocr.clean_omap
-             << ", new_object: " << ocr.new_object;
+  return out << ocr.fmt_print();
 }
 
 // -- pg_log_entry_t --
@@ -4989,26 +5039,33 @@ void pg_log_entry_t::generate_test_instances(list<pg_log_entry_t*>& o)
 
 ostream& operator<<(ostream& out, const pg_log_entry_t& e)
 {
-  out << e.version << " (" << e.prior_version << ") "
-      << std::left << std::setw(8) << e.get_op_name() << ' '
-      << e.soid << " by " << e.reqid << " " << e.mtime
-      << " " << e.return_code;
-  if (!e.op_returns.empty()) {
-    out << " " << e.op_returns;
+  return out << e.fmt_print();
+}
+
+std::string pg_log_entry_t::fmt_print() const
+{
+  std::string pos_op_returns{};
+  if (!op_returns.empty()) {
+    pos_op_returns = fmt::format(" {}", op_returns);
   }
-  if (e.snaps.length()) {
-    vector<snapid_t> snaps;
-    ceph::buffer::list c = e.snaps;
+
+  std::string pos_snaps{};
+  if (snaps.length()) {
+    std::vector<snapid_t> decoded_snaps;
+    ceph::buffer::list c = snaps;
     auto p = c.cbegin();
     try {
-      decode(snaps, p);
+      ::decode(decoded_snaps, p);
     } catch (...) {
-      snaps.clear();
+      decoded_snaps.clear();
     }
-    out << " snaps " << snaps;
+    pos_snaps = fmt::format(" snaps {}", decoded_snaps);
   }
-  out << " ObjectCleanRegions " << e.clean_regions;
-  return out;
+
+  return fmt::format(
+      "{} ({}) {:<8} {} by {} {} {}{}{} ObjectCleanRegions {}", version,
+      prior_version, get_op_name(), soid, reqid, mtime, return_code,
+      pos_op_returns, pos_snaps, clean_regions);
 }
 
 // -- pg_log_dup_t --
@@ -5206,7 +5263,8 @@ static void _handle_dups(CephContext* cct, pg_log_t &target, const pg_log_t &oth
 {
   auto earliest_dup_version =
 	        target.head.version < maxdups ? 0u : target.head.version - maxdups + 1;
-  lgeneric_subdout(cct, osd, 20) << "copy_up_to/copy_after earliest_dup_version " << earliest_dup_version << dendl;
+  lgeneric_subdout(cct, osd, 20) << __func__ << " earliest_dup_version "
+				 << earliest_dup_version << dendl;
 
   for (auto d = other.dups.cbegin(); d != other.dups.cend(); ++d) {
     if (d->version.version >= earliest_dup_version) {
@@ -5236,7 +5294,9 @@ void pg_log_t::copy_after(CephContext* cct, const pg_log_t &other, eversion_t v)
   can_rollback_to = other.can_rollback_to;
   head = other.head;
   tail = other.tail;
-  lgeneric_subdout(cct, osd, 20) << __func__ << " v " << v << dendl;
+  lgeneric_subdout(cct, osd, 20) << __func__ << " v " << v
+				 << " dups.size()=" << dups.size()
+				 << " other.dups.size()=" << other.dups.size() << dendl;
   for (auto i = other.log.crbegin(); i != other.log.crend(); ++i) {
     ceph_assert(i->version > other.tail);
     if (i->version <= v) {
@@ -5248,6 +5308,9 @@ void pg_log_t::copy_after(CephContext* cct, const pg_log_t &other, eversion_t v)
     log.push_front(*i);
   }
   _handle_dups(cct, *this, other, cct->_conf->osd_pg_log_dups_tracked);
+  lgeneric_subdout(cct, osd, 20) << __func__ << " END v " << v
+				 << " dups.size()=" << dups.size()
+				 << " other.dups.size()=" << other.dups.size() << dendl;
 }
 
 void pg_log_t::copy_up_to(CephContext* cct, const pg_log_t &other, int max)
@@ -5256,7 +5319,9 @@ void pg_log_t::copy_up_to(CephContext* cct, const pg_log_t &other, int max)
   int n = 0;
   head = other.head;
   tail = other.tail;
-  lgeneric_subdout(cct, osd, 20) << __func__ << " max " << max << dendl;
+  lgeneric_subdout(cct, osd, 20) << __func__ << " max " << max
+				<< " dups.size()=" << dups.size()
+				<< " other.dups.size()=" << other.dups.size() << dendl;
   for (auto i = other.log.crbegin(); i != other.log.crend(); ++i) {
     ceph_assert(i->version > other.tail);
     if (n++ >= max) {
@@ -5267,6 +5332,9 @@ void pg_log_t::copy_up_to(CephContext* cct, const pg_log_t &other, int max)
     log.push_front(*i);
   }
   _handle_dups(cct, *this, other, cct->_conf->osd_pg_log_dups_tracked);
+  lgeneric_subdout(cct, osd, 20) << __func__ << " END max " << max
+				 << " dups.size()=" << dups.size()
+				 << " other.dups.size()=" << other.dups.size() << dendl;
 }
 
 ostream& pg_log_t::print(ostream& out) const
@@ -5637,7 +5705,7 @@ void pg_hit_set_history_t::generate_test_instances(list<pg_hit_set_history_t*>& 
 
 void OSDSuperblock::encode(ceph::buffer::list &bl) const
 {
-  ENCODE_START(9, 5, bl);
+  ENCODE_START(10, 5, bl);
   encode(cluster_fsid, bl);
   encode(whoami, bl);
   encode(current_epoch, bl);
@@ -5652,12 +5720,13 @@ void OSDSuperblock::encode(ceph::buffer::list &bl) const
   encode((uint32_t)0, bl);  // map<int64_t,epoch_t> pool_last_epoch_marked_full
   encode(purged_snaps_last, bl);
   encode(last_purged_snaps_scrub, bl);
+  encode(cluster_osdmap_trim_lower_bound, bl);
   ENCODE_FINISH(bl);
 }
 
 void OSDSuperblock::decode(ceph::buffer::list::const_iterator &bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(9, 5, 5, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(10, 5, 5, bl);
   if (struct_v < 3) {
     string magic;
     decode(magic, bl);
@@ -5691,6 +5760,11 @@ void OSDSuperblock::decode(ceph::buffer::list::const_iterator &bl)
   } else {
     purged_snaps_last = 0;
   }
+  if (struct_v >= 10) {
+    decode(cluster_osdmap_trim_lower_bound, bl);
+  } else {
+    cluster_osdmap_trim_lower_bound = 0;
+  }
   DECODE_FINISH(bl);
 }
 
@@ -5710,6 +5784,8 @@ void OSDSuperblock::dump(Formatter *f) const
   f->dump_int("last_epoch_mounted", mounted);
   f->dump_unsigned("purged_snaps_last", purged_snaps_last);
   f->dump_stream("last_purged_snaps_scrub") << last_purged_snaps_scrub;
+  f->dump_int("cluster_osdmap_trim_lower_bound",
+              cluster_osdmap_trim_lower_bound);
 }
 
 void OSDSuperblock::generate_test_instances(list<OSDSuperblock*>& o)
@@ -5918,6 +5994,13 @@ void watch_info_t::dump(Formatter *f) const
   addr.dump(f);
   f->close_section();
 }
+
+std::string watch_info_t::fmt_print() const
+{
+  return fmt::format(
+      "watch(cookie {} {}s {})", cookie, timeout_seconds, addr);
+}
+
 
 void watch_info_t::generate_test_instances(list<watch_info_t*>& o)
 {
@@ -6489,7 +6572,7 @@ void ObjectRecoveryProgress::decode(ceph::buffer::list::const_iterator &bl)
 
 ostream &operator<<(ostream &out, const ObjectRecoveryProgress &prog)
 {
-  return prog.print(out);
+  return out << prog.fmt_print();
 }
 
 void ObjectRecoveryProgress::generate_test_instances(
@@ -6510,14 +6593,16 @@ void ObjectRecoveryProgress::generate_test_instances(
 
 ostream &ObjectRecoveryProgress::print(ostream &out) const
 {
-  return out << "ObjectRecoveryProgress("
-	     << ( first ? "" : "!" ) << "first, "
-	     << "data_recovered_to:" << data_recovered_to
-	     << ", data_complete:" << ( data_complete ? "true" : "false" )
-	     << ", omap_recovered_to:" << omap_recovered_to
-	     << ", omap_complete:" << ( omap_complete ? "true" : "false" )
-	     << ", error:" << ( error ? "true" : "false" )
-	     << ")";
+  return out << fmt_print();
+}
+
+std::string ObjectRecoveryProgress::fmt_print() const {
+  return fmt::format(
+      "ObjectRecoveryProgress({}first, data_recovered_to: {}, "
+      "data_complete: {}, omap_recovered_to: {}, omap_complete: "
+      "{}, error: {})",
+      (first ? "" : "!"), data_recovered_to, data_complete, omap_recovered_to,
+      omap_complete, error);
 }
 
 void ObjectRecoveryProgress::dump(Formatter *f) const
@@ -6606,19 +6691,15 @@ void ObjectRecoveryInfo::dump(Formatter *f) const
 
 ostream& operator<<(ostream& out, const ObjectRecoveryInfo &inf)
 {
-  return inf.print(out);
+  return out << inf.fmt_print();
 }
 
-ostream &ObjectRecoveryInfo::print(ostream &out) const
+std::string ObjectRecoveryInfo::fmt_print() const
 {
-  return out << "ObjectRecoveryInfo("
-	     << soid << "@" << version
-	     << ", size: " << size
-	     << ", copy_subset: " << copy_subset
-	     << ", clone_subset: " << clone_subset
-	     << ", snapset: " << ss
-	     << ", object_exist: " << object_exist
-	     << ")";
+  return fmt::format(
+      "ObjectRecoveryInfo({}@{}, size: {}, copy_subset: {}, "
+      "clone_subset: {}, snapset: {}, object_exist: {})",
+      soid, version, size, copy_subset, clone_subset, ss, object_exist);
 }
 
 // -- PushReplyOp --
@@ -6664,9 +6745,34 @@ ostream& operator<<(ostream& out, const PushReplyOp &op)
 
 uint64_t PushReplyOp::cost(CephContext *cct) const
 {
-
-  return cct->_conf->osd_push_per_object_cost +
-    cct->_conf->osd_recovery_max_chunk;
+  if (cct->_conf->osd_op_queue == "mclock_scheduler") {
+    /* In general, we really never want to throttle PushReplyOp messages.
+     * As long as the object is smaller than osd_recovery_max_chunk (8M at
+     * time of writing this comment, so this is basically always true),
+     * processing the PushReplyOp does not cost any further IO and simply
+     * permits the object once more to be written to.
+     *
+     * In the unlikely event that the object is larger than
+     * osd_recovery_max_chunk (again, 8M at the moment, so never for common
+     * configurations of rbd and virtually never for cephfs and rgw),
+     * we *still* want to push out the next portion immediately so that we can
+     * release the object for IO.
+     *
+     * The throttling for this operation on the primary occurs at the point
+     * where we queue the PGRecoveryContext which calls into recover_missing
+     * and recover_backfill to initiate pushes.
+     * See OSD::queue_recovery_context.
+     */
+    return 1;
+  } else {
+    /* We retain this legacy behavior for WeightedPriorityQueue. It seems to
+     * require very large costs for several messages in order to do any
+     * meaningful amount of throttling.  This branch should be removed after
+     * Reef.
+     */
+    return cct->_conf->osd_push_per_object_cost +
+      cct->_conf->osd_recovery_max_chunk;
+  }
 }
 
 // -- PullOp --
@@ -6730,8 +6836,20 @@ ostream& operator<<(ostream& out, const PullOp &op)
 
 uint64_t PullOp::cost(CephContext *cct) const
 {
-  return cct->_conf->osd_push_per_object_cost +
-    cct->_conf->osd_recovery_max_chunk;
+  if (cct->_conf->osd_op_queue == "mclock_scheduler") {
+    return std::clamp<uint64_t>(
+      recovery_progress.estimate_remaining_data_to_recover(recovery_info),
+      1,
+      cct->_conf->osd_recovery_max_chunk);
+  } else {
+    /* We retain this legacy behavior for WeightedPriorityQueue. It seems to
+     * require very large costs for several messages in order to do any
+     * meaningful amount of throttling.  This branch should be removed after
+     * Reef.
+     */
+    return cct->_conf->osd_push_per_object_cost +
+      cct->_conf->osd_recovery_max_chunk;
+  }
 }
 
 // -- PushOp --

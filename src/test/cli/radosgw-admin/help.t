@@ -25,7 +25,9 @@
     bucket unlink              unlink bucket from specified user
     bucket stats               returns bucket statistics
     bucket rm                  remove bucket
-    bucket check               check bucket index
+    bucket check               check bucket index by verifying size and object count stats
+    bucket check olh           check for olh index entries and objects that are pending removal
+    bucket check unlinked      check for object versions that are not visible in a bucket listing 
     bucket chown               link bucket to specified user and update its object ACLs
     bucket reshard             reshard bucket
     bucket rewrite             rewrite all objects in the specified bucket
@@ -42,6 +44,7 @@
     object stat                stat an object for its metadata
     object unlink              unlink object from bucket index
     object rewrite             rewrite the specified object
+    object reindex             reindex the object(s) indicated by --bucket and either --object or --objects-file
     objects expire             run expired objects cleanup
     objects expire-stale list  list stale expired objects (caused by reshard)
     objects expire-stale rm    remove stale expired objects
@@ -157,18 +160,19 @@
     role delete                remove a role
     role get                   get a role
     role list                  list roles with specified path prefix
-    role modify                modify the assume role policy of an existing role
+    role-trust-policy modify   modify the assume role policy of an existing role
     role-policy put            add/update permission policy to role
     role-policy list           list policies attached to a role
     role-policy get            get the specified inline policy document embedded with the given role
     role-policy delete         remove policy attached to a role
+    role update                update max_session_duration of a role
     reshard add                schedule a resharding of a bucket
     reshard list               list all bucket resharding or scheduled to be resharded
     reshard status             read bucket resharding status
     reshard process            process of scheduled reshard jobs
     reshard cancel             cancel resharding a bucket
     reshard stale-instances list list stale-instances from bucket resharding
-    reshard stale-instances rm   cleanup stale-instances from bucket resharding
+    reshard stale-instances delete   cleanup stale-instances from bucket resharding
     sync error list            list sync error
     sync error trim            trim sync error
     mfa create                 create a new MFA TOTP token
@@ -177,19 +181,20 @@
     mfa remove                 delete MFA TOTP token
     mfa check                  check MFA TOTP token
     mfa resync                 re-sync MFA TOTP token
-    topic list                 list bucket notifications/pubsub topics
-    topic get                  get a bucket notifications/pubsub topic
-    topic rm                   remove a bucket notifications/pubsub topic
-    subscription get           get a pubsub subscription definition
-    subscription rm            remove a pubsub subscription
-    subscription pull          show events in a pubsub subscription
-    subscription ack           ack (remove) an events in a pubsub subscription
-    script put                 upload a lua script to a context
-    script get                 get the lua script of a context
-    script rm                  remove the lua scripts of a context
-    script-package add         add a lua package to the scripts allowlist
-    script-package rm          remove a lua package from the scripts allowlist
-    script-package list        get the lua packages allowlist
+    topic list                 list bucket notifications topics
+    topic get                  get a bucket notifications topic
+    topic rm                   remove a bucket notifications topic
+    topic stats                get a bucket notifications persistent topic stats (i.e. reservations, entries & size)
+    script put                 upload a Lua script to a context
+    script get                 get the Lua script of a context
+    script rm                  remove the Lua scripts of a context
+    script-package add         add a Lua package to the scripts allowlist
+    script-package rm          remove a Lua package from the scripts allowlist
+    script-package list        get the Lua packages allowlist
+    script-package reload      install/remove Lua packages according to allowlist
+    notification list          list bucket notifications configuration
+    notification get           get a bucket notifications configuration
+    notification rm            remove a bucket notifications configuration
   options:
      --tenant=<tenant>         tenant name
      --user_ns=<namespace>     namespace of user (oidc in case of users authenticated with oidc provider)
@@ -214,6 +219,7 @@
      --bucket=<bucket>         Specify the bucket name. Also used by the quota command.
      --pool=<pool>             Specify the pool name. Also used to scan for leaked rados objects.
      --object=<object>         object name
+     --objects-file=<file>     file containing a list of object names to process
      --object-version=<version>         object version
      --date=<date>             date in the format yyyy-mm-dd
      --start-date=<date>       start date in the format yyyy-mm-dd
@@ -226,6 +232,10 @@
                                  data sync status
                                required for: 
                                  mdlog trim
+     --gen=<gen-id>            optional for: 
+                                 bilog list
+                                 bilog trim
+                                 bilog status
      --max-entries=<entries>   max entries for listing operations
      --metadata-key=<key>      key to retrieve metadata from with metadata get
      --remote=<remote>         zone or zonegroup id of remote gateway
@@ -261,6 +271,9 @@
      --data-extra-pool=<pool>  placement target data extra (non-ec) pool
      --placement-index-type=<type>
                                placement target index type (normal, indexless, or #id)
+     --placement-inline-data=<true>
+                               set whether the placement target is configured to store a data
+                               chunk inline in head objects
      --compression=<type>      placement target compression type (plugin name or empty/none)
      --tier-type=<type>        zone tier type
      --tier-config=<k>=<v>[,...]
@@ -292,7 +305,7 @@
      --show-log-sum=<flag>     enable/disable dump of log summation on log show
      --skip-zero-entries       log show only dumps entries that don't have zero value
                                in one of the numeric field
-     --infile=<file>           specify a file to read in when setting data
+     --infile=<file>           file to read in when setting data
      --categories=<list>       comma separated list of categories, used in usage show
      --caps=<caps>             list of caps (e.g., "usage=read, write; user=read")
      --op-mask=<op-mask>       permission of user's operations (e.g., "read, write, delete, *")
@@ -310,6 +323,8 @@
      --trim-delay-ms           time interval in msec to limit the frequency of sync error log entries trimming operations,
                                the trimming process will sleep the specified msec for every 1000 entries trimmed
      --max-concurrent-ios      maximum concurrent ios for bucket operations (default: 32)
+     --enable-feature          enable a zone/zonegroup feature
+     --disable-feature         disable a zone/zonegroup feature
   
   <date> := "YYYY-MM-DD[ hh:mm:ss]"
   
@@ -350,15 +365,19 @@
      --totp-window             the number of TOTP tokens that are checked before and after the current token when validating token
      --totp-pin                the valid value of a TOTP token at a certain time
   
-  Bucket notifications/pubsub options:
-     --topic                   bucket notifications/pubsub topic name
-     --subscription            pubsub subscription name
-     --event-id                event id in a pubsub subscription
+  Bucket notifications options:
+     --topic                   bucket notifications topic name
+     --notification-id         bucket notifications id
   
   Script options:
-     --context                 context in which the script runs. one of: preRequest, postRequest
-     --package                 name of the lua package that should be added/removed to/from the allowlist
+     --context                 context in which the script runs. one of: prerequest, postrequest, background, getdata, putdata
+     --package                 name of the Lua package that should be added/removed to/from the allowlist
      --allow-compilation       package is allowed to compile C code as part of its installation
+  
+  Bucket check olh/unlinked options:
+     --min-age-hours           minimum age of unlinked objects to consider for bucket check unlinked (default: 1)
+     --dump-keys               when specified, all keys identified as problematic are printed to stdout
+     --hide-progress           when specified, per-shard progress details are not printed to stderr
   
   radoslist options:
      --rgw-obj-fs              the field separator that will separate the rados
@@ -374,5 +393,3 @@
     --setgroup GROUP  set gid to group or gid
     --version         show version and quit
   
-
-

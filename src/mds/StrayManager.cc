@@ -20,6 +20,7 @@
 #include "mds/MDLog.h"
 #include "mds/CDir.h"
 #include "mds/CDentry.h"
+#include "mds/ScrubStack.h"
 #include "events/EUpdate.h"
 #include "messages/MClientRequest.h"
 
@@ -201,7 +202,6 @@ void StrayManager::_purge_stray_purged(
     pf->version = dir->pre_dirty();
 
     EUpdate *le = new EUpdate(mds->mdlog, "purge_stray truncate");
-    mds->mdlog->start_entry(le);
 
     le->metablob.add_dir_context(dir);
     auto& dl = le->metablob.add_dir(dn->dir, true);
@@ -229,7 +229,6 @@ void StrayManager::_purge_stray_purged(
     dn->push_projected_linkage(); // NULL
 
     EUpdate *le = new EUpdate(mds->mdlog, "purge_stray");
-    mds->mdlog->start_entry(le);
 
     // update dirfrag fragstat, rstat
     CDir *dir = dn->get_dir();
@@ -299,6 +298,11 @@ void StrayManager::enqueue(CDentry *dn, bool trunc)
   ceph_assert(dnl);
   CInode *in = dnl->get_inode();
   ceph_assert(in);
+
+  //remove inode from scrub stack if it is being purged
+  if(mds->scrubstack->remove_inode_if_stacked(in)) {
+    dout(20) << "removed " << *in << " from the scrub stack" << dendl;
+  }
 
   /* We consider a stray to be purging as soon as it is enqueued, to avoid
    * enqueing it twice */
@@ -653,7 +657,7 @@ void StrayManager::_eval_stray_remote(CDentry *stray_dn, CDentry *remote_dn)
 	dout(20) << __func__ << ": not reintegrating (can't authpin remote parent)" << dendl;
       }
 
-    } else if (!remote_dn->is_auth() && stray_dn->is_auth()) {
+    } else if (stray_dn->is_auth()) {
       migrate_stray(stray_dn, remote_dn->authority().first);
     } else {
       dout(20) << __func__ << ": not reintegrating" << dendl;

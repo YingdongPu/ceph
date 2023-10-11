@@ -34,6 +34,9 @@ public:
     dirty = true;
     return layout;
   }
+  bool is_alive() const {
+    return true;
+  }
   bool is_dirty() const { return dirty; }
   laddr_t get_hint() const final {return L_ADDR_MIN; }
   ~TestOnode() final = default;
@@ -135,6 +138,13 @@ struct object_data_handler_test_t:
       }
     }
   }
+  std::list<LBAMappingRef> get_mappings(objaddr_t offset, extent_len_t length) {
+    auto t = create_mutate_transaction();
+    auto ret = with_trans_intr(*t, [&](auto &t) {
+      return tm->get_pins(t, offset, length);
+    }).unsafe_get0();
+    return ret;
+  }
 
   seastar::future<> set_up_fut() final {
     onode = new TestOnode(
@@ -153,7 +163,7 @@ struct object_data_handler_test_t:
   }
 };
 
-TEST_F(object_data_handler_test_t, single_write)
+TEST_P(object_data_handler_test_t, single_write)
 {
   run_async([this] {
     write(1<<20, 8<<10, 'c');
@@ -163,7 +173,7 @@ TEST_F(object_data_handler_test_t, single_write)
   });
 }
 
-TEST_F(object_data_handler_test_t, multi_write)
+TEST_P(object_data_handler_test_t, multi_write)
 {
   run_async([this] {
     write((1<<20) - (4<<10), 4<<10, 'a');
@@ -178,7 +188,7 @@ TEST_F(object_data_handler_test_t, multi_write)
   });
 }
 
-TEST_F(object_data_handler_test_t, write_hole)
+TEST_P(object_data_handler_test_t, write_hole)
 {
   run_async([this] {
     write((1<<20) - (4<<10), 4<<10, 'a');
@@ -193,7 +203,7 @@ TEST_F(object_data_handler_test_t, write_hole)
   });
 }
 
-TEST_F(object_data_handler_test_t, overwrite_single)
+TEST_P(object_data_handler_test_t, overwrite_single)
 {
   run_async([this] {
     write((1<<20), 4<<10, 'a');
@@ -204,7 +214,7 @@ TEST_F(object_data_handler_test_t, overwrite_single)
   });
 }
 
-TEST_F(object_data_handler_test_t, overwrite_double)
+TEST_P(object_data_handler_test_t, overwrite_double)
 {
   run_async([this] {
     write((1<<20), 4<<10, 'a');
@@ -222,7 +232,7 @@ TEST_F(object_data_handler_test_t, overwrite_double)
   });
 }
 
-TEST_F(object_data_handler_test_t, overwrite_partial)
+TEST_P(object_data_handler_test_t, overwrite_partial)
 {
   run_async([this] {
     write((1<<20), 12<<10, 'a');
@@ -247,7 +257,7 @@ TEST_F(object_data_handler_test_t, overwrite_partial)
   });
 }
 
-TEST_F(object_data_handler_test_t, unaligned_write)
+TEST_P(object_data_handler_test_t, unaligned_write)
 {
   run_async([this] {
     objaddr_t base = 1<<20;
@@ -264,7 +274,7 @@ TEST_F(object_data_handler_test_t, unaligned_write)
   });
 }
 
-TEST_F(object_data_handler_test_t, unaligned_overwrite)
+TEST_P(object_data_handler_test_t, unaligned_overwrite)
 {
   run_async([this] {
     objaddr_t base = 1<<20;
@@ -285,7 +295,7 @@ TEST_F(object_data_handler_test_t, unaligned_overwrite)
   });
 }
 
-TEST_F(object_data_handler_test_t, truncate)
+TEST_P(object_data_handler_test_t, truncate)
 {
   run_async([this] {
     objaddr_t base = 1<<20;
@@ -306,3 +316,116 @@ TEST_F(object_data_handler_test_t, truncate)
     read(base, 64<<10);
   });
 }
+
+TEST_P(object_data_handler_test_t, no_split) {
+  run_async([this] {
+    write(0, 8<<10, 'x');
+    write(0, 8<<10, 'a');
+
+    auto pins = get_mappings(0, 8<<10);
+    EXPECT_EQ(pins.size(), 1);
+
+    read(0, 8<<10);
+  });
+}
+
+TEST_P(object_data_handler_test_t, split_left) {
+  run_async([this] {
+    write(0, 128<<10, 'x');
+
+    write(64<<10, 60<<10, 'a');
+
+    auto pins = get_mappings(0, 128<<10);
+    EXPECT_EQ(pins.size(), 2);
+
+    size_t res[2] = {0, 64<<10};
+    auto base = pins.front()->get_key();
+    int i = 0;
+    for (auto &pin : pins) {
+      EXPECT_EQ(pin->get_key() - base, res[i]);
+      i++;
+    }
+    read(0, 128<<10);
+  });
+}
+
+TEST_P(object_data_handler_test_t, split_right) {
+  run_async([this] {
+    write(0, 128<<10, 'x');
+    write(4<<10, 60<<10, 'a');
+
+    auto pins = get_mappings(0, 128<<10);
+    EXPECT_EQ(pins.size(), 2);
+
+    size_t res[2] = {0, 64<<10};
+    auto base = pins.front()->get_key();
+    int i = 0;
+    for (auto &pin : pins) {
+      EXPECT_EQ(pin->get_key() - base, res[i]);
+      i++;
+    }
+    read(0, 128<<10);
+  });
+}
+TEST_P(object_data_handler_test_t, split_left_right) {
+  run_async([this] {
+    write(0, 128<<10, 'x');
+    write(48<<10, 32<<10, 'a');
+
+    auto pins = get_mappings(0, 128<<10);
+    EXPECT_EQ(pins.size(), 3);
+
+    size_t res[3] = {0, 48<<10, 80<<10};
+    auto base = pins.front()->get_key();
+    int i = 0;
+    for (auto &pin : pins) {
+      EXPECT_EQ(pin->get_key() - base, res[i]);
+      i++;
+    }
+  });
+}
+TEST_P(object_data_handler_test_t, multiple_split) {
+  run_async([this] {
+    write(0, 128<<10, 'x');
+
+    auto t = create_mutate_transaction();
+    // normal split
+    write(*t, 120<<10, 4<<10, 'a');
+    // not aligned right
+    write(*t, 4<<10, 5<<10, 'b');
+    // split right extent of last split result
+    write(*t, 32<<10, 4<<10, 'c');
+    // non aligned overwrite
+    write(*t, 13<<10, 4<<10, 'd');
+
+    write(*t, 64<<10, 32<<10, 'e');
+    // not split right
+    write(*t, 60<<10, 8<<10, 'f');
+
+    submit_transaction(std::move(t));
+
+    auto pins = get_mappings(0, 128<<10);
+    EXPECT_EQ(pins.size(), 10);
+
+    size_t res[10] = {0, 4<<10, 12<<10, 20<<10, 32<<10,
+		      36<<10, 60<<10, 96<<10, 120<<10, 124<<10};
+    auto base = pins.front()->get_key();
+    int i = 0;
+    for (auto &pin : pins) {
+      EXPECT_EQ(pin->get_key() - base, res[i]);
+      i++;
+    }
+    read(0, 128<<10);
+  });
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  object_data_handler_test,
+  object_data_handler_test_t,
+  ::testing::Values (
+    "segmented",
+    "circularbounded"
+  )
+);
+
+

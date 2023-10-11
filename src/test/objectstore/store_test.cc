@@ -26,7 +26,6 @@
 #include <gtest/gtest.h>
 
 #include "os/ObjectStore.h"
-#include "os/filestore/FileStore.h"
 #if defined(WITH_BLUESTORE)
 #include "os/bluestore/BlueStore.h"
 #include "os/bluestore/BlueFS.h"
@@ -143,6 +142,12 @@ public:
   {}
   void doCompressionTest();
   void doSyntheticTest(
+    int initial_object_count,
+    int num_ops,
+    uint64_t max_obj, uint64_t max_wr, uint64_t align);
+  // a variant of test that keeps amount of active objects stable
+  void doSyntheticLimitedTest(
+    int initial_object_count,
     int num_ops,
     uint64_t max_obj, uint64_t max_wr, uint64_t align);
 };
@@ -164,16 +169,18 @@ public:
 class StoreTestSpecificAUSize : public StoreTestDeferredSetup {
 
 public:
-  typedef 
-    std::function<void(
-	   uint64_t num_ops,
-	   uint64_t max_obj,
-	   uint64_t max_wr,
-    	   uint64_t align)> MatrixTest;
-
+  typedef void(StoreTestSpecificAUSize::*MatrixTest)(void);
   void StartDeferred(size_t min_alloc_size) {
     SetVal(g_conf(), "bluestore_min_alloc_size", stringify(min_alloc_size).c_str());
     DeferredSetup();
+  }
+
+  void SyntheticTest() {
+    doSyntheticTest(start_object_count, num_ops, max_size, max_write, alignment);
+  }
+
+  void SyntheticLimitedTest() {
+    doSyntheticLimitedTest(start_object_count, num_ops, max_size, max_write, alignment);
   }
 
 private:
@@ -182,6 +189,7 @@ private:
   uint64_t max_size = 400 * 1024;
   uint64_t alignment = 0;
   uint64_t num_ops = 10000;
+  uint64_t start_object_count = 1000;
 
 protected:
   string matrix_get(const char *k) {
@@ -193,6 +201,8 @@ protected:
       return stringify(alignment);
     } else if (string(k) == "num_ops") {
       return stringify(num_ops);
+    } else if (string(k) == "start_object_count") {
+      return stringify(start_object_count);
     } else {
       char *buf;
       g_conf().get_val(k, &buf, -1);
@@ -211,6 +221,8 @@ protected:
       alignment = atoll(v);
     } else if (string(k) == "num_ops") {
       num_ops = atoll(v);
+    } else if (string(k) == "start_object_count") {
+      start_object_count = atoll(v);
     } else {
       SetVal(g_conf(), k, v);
     }
@@ -238,7 +250,7 @@ protected:
 	     << std::endl;
       }
       g_ceph_context->_conf.apply_changes(nullptr);
-      fn(num_ops, max_size, max_write, alignment);
+      (this->*fn)();
     }
   }
 
@@ -4179,7 +4191,8 @@ class SyntheticWorkloadState {
   };
 public:
   static const unsigned max_in_flight = 16;
-  static const unsigned max_objects = 3000;
+  static const unsigned min_objects = 20;
+  unsigned max_objects = 3000;
   static const unsigned max_attr_size = 5;
   static const unsigned max_attr_name_len = 100;
   static const unsigned max_attr_value_len = 1024 * 64;
@@ -4389,7 +4402,7 @@ public:
   }
 
   bool can_unlink() {
-    return (available_objects.size() + in_flight_objects.size()) > 0;
+    return (available_objects.size() + in_flight_objects.size()) > min_objects;
   }
 
   unsigned get_random_alloc_hints() {
@@ -4572,6 +4585,7 @@ public:
 
     if (srcoff > srcdata.length() - 1) {
       srcoff = srcdata.length() - 1;
+      dstoff = srcoff;
     }
     if (srcoff + len > srcdata.length()) {
       len = srcdata.length() - srcoff;
@@ -5087,8 +5101,9 @@ public:
 
 
 void StoreTest::doSyntheticTest(
-		     int num_ops,
-		     uint64_t max_obj, uint64_t max_wr, uint64_t align)
+  int initial_object_count,
+  int num_ops,
+  uint64_t max_obj, uint64_t max_wr, uint64_t align)
 {
   MixedGenerator gen(555);
   gen_type rng(time(NULL));
@@ -5101,7 +5116,7 @@ void StoreTest::doSyntheticTest(
   SyntheticWorkloadState test_obj(store.get(), &gen, &rng, cid,
 				  max_obj, max_wr, align);
   test_obj.init();
-  for (int i = 0; i < num_ops/10; ++i) {
+  for (int i = 0; i < initial_object_count; ++i) {
     if (!(i % 500)) cerr << "seeding object " << i << std::endl;
     test_obj.touch();
   }
@@ -5142,8 +5157,65 @@ void StoreTest::doSyntheticTest(
   test_obj.shutdown();
 }
 
+void StoreTest::doSyntheticLimitedTest(
+  int initial_object_count,
+  int num_ops,
+  uint64_t max_obj, uint64_t max_wr, uint64_t align)
+{
+  MixedGenerator gen(555);
+  gen_type rng(time(NULL));
+  coll_t cid(spg_t(pg_t(0,555), shard_id_t::NO_SHARD));
+
+  SetVal(g_conf(), "bluestore_fsck_on_mount", "false");
+  SetVal(g_conf(), "bluestore_fsck_on_umount", "false");
+  g_ceph_context->_conf.apply_changes(nullptr);
+
+  SyntheticWorkloadState test_obj(store.get(), &gen, &rng, cid,
+				  max_obj, max_wr, align);
+  test_obj.init();
+  for (int i = 0; i < initial_object_count; ++i) {
+    if (!(i % 500)) cerr << "seeding object " << i << std::endl;
+    test_obj.touch();
+  }
+  for (int i = 0; i < num_ops; ++i) {
+    if (!(i % 1000)) {
+      cerr << "Op " << i << std::endl;
+      test_obj.print_internal_state();
+    }
+    boost::uniform_int<> true_false(0, 9999 /*999*/);
+    int val = true_false(rng);
+    auto option = [&](int range) -> bool {
+      if (val == -1) {
+	return false;
+      }
+      if (val >= 0 && val < range) {
+	val = -1;
+	return true;
+      } else {
+	val -= range;
+	return false;
+      }
+    };
+    if (option(1)) test_obj.fsck(true);
+    if (option(1)) test_obj.fsck(false);
+    if (option(1)) test_obj.scan();
+    if (option(497)) test_obj.stat();
+    if (option(1000)) test_obj.zero();
+    if (option(1500)) test_obj.read();
+    if (option(1500)) test_obj.write();
+    if (option(500)) test_obj.truncate();
+    if (option(1000)) test_obj.clone_range();
+    if (option(1000)) test_obj.stash();
+    if (option(1500)) test_obj.unlink();
+    if (option(1500)) test_obj.clone();
+    ceph_assert(val == -1);
+  }
+  test_obj.wait_for_done();
+  test_obj.shutdown();
+}
+
 TEST_P(StoreTest, Synthetic) {
-  doSyntheticTest(10000, 400*1024, 40*1024, 0);
+  doSyntheticTest(1000, 10000, 400*1024, 40*1024, 0);
 }
 
 #if defined(WITH_BLUESTORE)
@@ -5165,7 +5237,50 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixSharding) {
     { "bluestore_default_buffered_write", "true", 0 },
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
+}
+
+TEST_P(StoreTestSpecificAUSize, SyntheticLimited) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  const char *m[][10] = {
+    { "bluestore_min_alloc_size", "65536", "4096", 0 }, // must be the first!
+    { "num_ops", "10000", 0 },
+    { "max_write", "65536", 0 },
+    { "max_size", "262144", 0 },
+    { "alignment", "4096", 0 },
+    { "start_object_count", "1000", "200", "50", 0 },
+    { "bluestore_max_blob_size", "65536", 0 },
+    { "bluestore_default_buffered_read", "true", 0 },
+    { "bluestore_default_buffered_write", "true", 0 },
+    { "bluestore_compression_mode", "force", "none", 0},
+    { "bluestore_prefer_deferred_size", "32768", "0", 0},
+    { 0 },
+  };
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticLimitedTest);
+}
+
+TEST_P(StoreTestSpecificAUSize, SyntheticShardingLimited) {
+  if (string(GetParam()) != "bluestore")
+    return;
+
+  const char *m[][10] = {
+    { "bluestore_min_alloc_size", "65536", "4096", 0 }, // must be the first!
+    { "num_ops", "10000", 0 },
+    { "max_write", "65536", 0 },
+    { "max_size", "262144", 0 },
+    { "alignment", "4096", 0 },
+    { "start_object_count", "1000", "200", "50", 0 },
+    { "bluestore_max_blob_size", "65536", 0 },
+    { "bluestore_extent_map_shard_min_size", "60", 0 },
+    { "bluestore_extent_map_shard_max_size", "300", 0 },
+    { "bluestore_extent_map_shard_target_size", "150", 0 },
+    { "bluestore_default_buffered_read", "true", 0 },
+    { "bluestore_default_buffered_write", "true", 0 },
+    { 0 },
+  };
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticLimitedTest);
 }
 
 TEST_P(StoreTestSpecificAUSize, ZipperPatternSharded) {
@@ -5225,7 +5340,7 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCsumAlgorithm) {
     { "bluestore_default_buffered_write", "false", 0 },
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
 }
 
 TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCsumVsCompression) {
@@ -5245,7 +5360,7 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCsumVsCompression) {
     { "bluestore_sync_submit_transaction", "false", 0 },
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
 }
 
 TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCompression) {
@@ -5262,7 +5377,7 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCompression) {
     { "bluestore_sync_submit_transaction", "true", 0 },
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
 }
 
 TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCompressionAlgorithm) {
@@ -5279,7 +5394,7 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixCompressionAlgorithm) {
     { "bluestore_default_buffered_write", "false", 0 },
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
 }
 
 TEST_P(StoreTestSpecificAUSize, SyntheticMatrixNoCsum) {
@@ -5299,7 +5414,7 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixNoCsum) {
     { "bluestore_sync_submit_transaction", "true", "false", 0 },
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
 }
 
 TEST_P(StoreTestSpecificAUSize, SyntheticMatrixPreferDeferred) {
@@ -5316,7 +5431,7 @@ TEST_P(StoreTestSpecificAUSize, SyntheticMatrixPreferDeferred) {
     { "bluestore_prefer_deferred_size", "32768", "0", 0},
     { 0 },
   };
-  do_matrix(m, std::bind(&StoreTest::doSyntheticTest, this, _1, _2, _3, _4));
+  do_matrix(m, &StoreTestSpecificAUSize::SyntheticTest);
 }
 #endif // WITH_BLUESTORE
 
@@ -6839,7 +6954,6 @@ INSTANTIATE_TEST_SUITE_P(
   StoreTest,
   ::testing::Values(
     "memstore",
-    "filestore",
 #if defined(WITH_BLUESTORE)
     "bluestore",
 #endif
@@ -6851,7 +6965,6 @@ INSTANTIATE_TEST_SUITE_P(
   StoreTestSpecificAUSize,
   ::testing::Values(
     "memstore",
-    "filestore",
 #if defined(WITH_BLUESTORE)
     "bluestore",
 #endif
@@ -6863,7 +6976,6 @@ INSTANTIATE_TEST_SUITE_P(
   StoreTestOmapUpgrade,
   ::testing::Values(
     "memstore",
-    "filestore",
 #if defined(WITH_BLUESTORE)
     "bluestore",
 #endif
@@ -6875,6 +6987,116 @@ INSTANTIATE_TEST_SUITE_P(
   StoreTestDeferredSetup,
   ::testing::Values(
     "bluestore"));
+#endif
+
+
+struct deferred_test_t {
+  uint32_t bdev_block_size;
+  uint32_t min_alloc_size;
+  uint32_t max_blob_size;
+  uint32_t prefer_deferred_size;
+};
+
+void PrintTo(const deferred_test_t& t, ::std::ostream* os)
+{
+  *os << t.bdev_block_size << "/" << t.min_alloc_size << "/"
+      << t.max_blob_size << "/" << t.prefer_deferred_size;
+}
+
+class DeferredWriteTest : public StoreTestFixture,
+		          public ::testing::WithParamInterface<deferred_test_t> {
+public:
+  DeferredWriteTest()
+    : StoreTestFixture("bluestore")
+  {}
+  void SetUp() override {
+    //do nothing
+  }
+protected:
+  void DeferredSetup() {
+    StoreTestFixture::SetUp();
+  }
+public:
+  std::vector<uint32_t> offsets = {0, 3000, 4096, 20000, 32768, 65000, 65536, 80000, 128 * 1024};
+  std::vector<uint32_t> lengths = {1, 1000, 4096, 12000, 32768, 30000, 80000, 128 * 1024};
+};
+
+TEST_P(DeferredWriteTest, NewData) {
+  const bool print = false;
+  deferred_test_t t = GetParam();
+  SetVal(g_conf(), "bdev_block_size", stringify(t.bdev_block_size).c_str());
+  SetVal(g_conf(), "bluestore_min_alloc_size", stringify(t.min_alloc_size).c_str());
+  SetVal(g_conf(), "bluestore_max_blob_size", stringify(t.max_blob_size).c_str());
+  SetVal(g_conf(), "bluestore_prefer_deferred_size", stringify(t.prefer_deferred_size).c_str());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  int r;
+  coll_t cid;
+  const PerfCounters* logger = store->get_perf_counters();
+  ObjectStore::CollectionHandle ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    for (auto offset:offsets) {
+      for (auto length:lengths) {
+	std::string hname = fmt::format("test-{}-{}", offset, length);
+	ghobject_t hoid(hobject_t(hname, "", CEPH_NOSNAP, 0, -1, ""));
+	{
+	  ObjectStore::Transaction t;
+	  t.touch(cid, hoid);
+	  r = queue_transaction(store, ch, std::move(t));
+	  ASSERT_EQ(r, 0);
+	}
+	if (print)
+	  std::cout << hname << std::endl;
+
+	auto w_new =             logger->get(l_bluestore_write_new);
+	auto w_big_deferred =    logger->get(l_bluestore_write_big_deferred);
+	auto i_deferred_w =      logger->get(l_bluestore_issued_deferred_writes);
+	{
+	  ObjectStore::Transaction t;
+	  bufferlist bl;
+	  bl.append(std::string(length, 'x'));
+	  t.write(cid, hoid, offset, bl.length(), bl,
+		  CEPH_OSD_OP_FLAG_FADVISE_NOCACHE);
+	  r = queue_transaction(store, ch, std::move(t));
+	  ASSERT_EQ(r, 0);
+	}
+	uint32_t first_db = offset / t.bdev_block_size;
+	uint32_t last_db = (offset + length - 1) / t.bdev_block_size;
+
+	uint32_t write_size = (last_db - first_db + 1) * t.bdev_block_size;
+	if (write_size < t.prefer_deferred_size) {
+	  // expect no direct writes
+	  ASSERT_EQ(w_new ,             logger->get(l_bluestore_write_new));
+	} else {
+	  // expect no deferred
+	  ASSERT_EQ(w_big_deferred ,    logger->get(l_bluestore_write_big_deferred));
+	  ASSERT_EQ(i_deferred_w ,      logger->get(l_bluestore_issued_deferred_writes));
+	}
+      }
+    }
+  }
+}
+
+#if defined(WITH_BLUESTORE)
+INSTANTIATE_TEST_SUITE_P(
+  BlueStore,
+  DeferredWriteTest,
+  ::testing::Values(
+    //              bdev      alloc      blob       deferred
+    deferred_test_t{4 * 1024, 4 * 1024,  16 * 1024, 32 * 1024},
+    deferred_test_t{4 * 1024, 16 * 1024, 64 * 1024, 64 * 1024},
+    deferred_test_t{4 * 1024, 64 * 1024, 64 * 1024, 4 * 1024},
+    deferred_test_t{4 * 1024, 4 * 1024, 64 * 1024, 0 * 1024},
+    deferred_test_t{4 * 1024, 16 * 1024, 32 * 1024, 32 * 1024},
+    deferred_test_t{4 * 1024, 16 * 1024, 64 * 1024, 128 * 1024}
+  ));
 #endif
 
 void doMany4KWritesTest(ObjectStore* store,
@@ -7002,10 +7224,14 @@ TEST_P(StoreTestSpecificAUSize, OnodeSizeTracking) {
   coll_t cid;
   ghobject_t hoid(hobject_t("test_hint", "", CEPH_NOSNAP, 0, -1, ""));
   size_t obj_size = 4 * 1024  * 1024;
+  uint64_t total_bytes_prev;
   uint64_t total_bytes, total_bytes2;
   uint64_t total_onodes;
   get_mempool_stats(&total_bytes, &total_onodes);
-  ASSERT_EQ(total_onodes, 0u);
+  total_bytes_prev = total_bytes;
+  // 5u for onode_cache_shards vector
+  ASSERT_EQ(total_onodes, 5u);
+  ASSERT_EQ(total_bytes, 40u);
 
   auto ch = store->create_new_collection(cid);
   {
@@ -7024,8 +7250,8 @@ TEST_P(StoreTestSpecificAUSize, OnodeSizeTracking) {
     ASSERT_EQ(r, 0);
   }
   get_mempool_stats(&total_bytes, &total_onodes);
-  ASSERT_NE(total_bytes, 0u);
-  ASSERT_EQ(total_onodes, 1u);
+  ASSERT_GT(total_bytes - total_bytes_prev, 0u);
+  ASSERT_EQ(total_onodes, 6u);
 
   {
     ObjectStore::Transaction t;
@@ -7045,7 +7271,7 @@ TEST_P(StoreTestSpecificAUSize, OnodeSizeTracking) {
     }
     get_mempool_stats(&total_bytes2, &total_onodes);
     ASSERT_NE(total_bytes2, 0u);
-    ASSERT_EQ(total_onodes, 1u);
+    ASSERT_EQ(total_onodes, 6u);
   }
   {
     cout <<" mempool dump:\n";
@@ -7064,7 +7290,7 @@ TEST_P(StoreTestSpecificAUSize, OnodeSizeTracking) {
   }
   get_mempool_stats(&total_bytes, &total_onodes);
   ASSERT_NE(total_bytes, 0u);
-  ASSERT_EQ(total_onodes, 1u);
+  ASSERT_EQ(total_onodes, 6u);
 
   {
     cout <<" mempool dump:\n";
@@ -7259,8 +7485,9 @@ TEST_P(StoreTestSpecificAUSize, BlobReuseOnOverwrite) {
 }
 
 TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionSmallAppend) {
-  if (string(GetParam()) != "bluestore") {
-    return;
+  CephContext *cct = (new CephContext(CEPH_ENTITY_TYPE_CLIENT))->get();
+  if (string(GetParam()) != "bluestore" || !cct->_conf->bluestore_zero_block_detection) {
+    GTEST_SKIP() << "not bluestore or bluestore_zero_block_detection=false, skipping";
   }
 
   size_t block_size = 65536;
@@ -7334,12 +7561,12 @@ TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionSmallAppend) {
 }
 
 TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionSmallOverwrite) {
-  if (string(GetParam()) != "bluestore") {
-    return;
+  CephContext *cct = (new CephContext(CEPH_ENTITY_TYPE_CLIENT))->get();
+  if (string(GetParam()) != "bluestore" || !cct->_conf->bluestore_zero_block_detection) {
+    GTEST_SKIP() << "not bluestore or bluestore_zero_block_detection=false, skipping";
   }
   if (smr) {
-    cout << "SKIP" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping";
   }
 
   size_t block_size = 65536;
@@ -7435,8 +7662,9 @@ TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionSmallOverwrite) {
 }
 
 TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionBigAppend) {
-  if (string(GetParam()) != "bluestore") {
-    return;
+  CephContext *cct = (new CephContext(CEPH_ENTITY_TYPE_CLIENT))->get();
+  if (string(GetParam()) != "bluestore" || !cct->_conf->bluestore_zero_block_detection) {
+    GTEST_SKIP() << "not bluestore or bluestore_zero_block_detection=false, skipping";
   }
 
   size_t block_size = 4096;
@@ -7513,12 +7741,12 @@ TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionBigAppend) {
 }
 
 TEST_P(StoreTestSpecificAUSize, ZeroBlockDetectionBigOverwrite) {
-  if (string(GetParam()) != "bluestore") {
-    return;
+  CephContext *cct = (new CephContext(CEPH_ENTITY_TYPE_CLIENT))->get();
+  if (string(GetParam()) != "bluestore" || !cct->_conf->bluestore_zero_block_detection) {
+    GTEST_SKIP() << "not bluestore or bluestore_zero_block_detection=false, skipping";
   }
   if (smr) {
-    cout << "SKIP" << std::endl;
-    return;
+    GTEST_SKIP() << "smr, skipping";
   }
 
   size_t block_size = 4096;
@@ -8662,6 +8890,96 @@ TEST_P(StoreTestSpecificAUSize, SmallWriteOnShardedExtents) {
   }
 }
 
+TEST_P(StoreTestSpecificAUSize, ReproBug56488Test) {
+
+  if (string(GetParam()) != "bluestore")
+    return;
+  if (smr) {
+    cout << "SKIP: no deferred" << std::endl;
+    return;
+  }
+
+  size_t alloc_size = 65536;
+  size_t write_size = 4096;
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "hdd");
+  SetVal(g_conf(), "bluestore_block_db_create", "true");
+  SetVal(g_conf(), "bluestore_block_db_size", stringify(1 << 30).c_str());
+
+  g_conf().apply_changes(nullptr);
+  StartDeferred(alloc_size);
+
+  int r;
+  coll_t cid;
+  const PerfCounters* logger = store->get_perf_counters();
+
+  ObjectStore::CollectionHandle ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ghobject_t hoid(hobject_t("test", "", CEPH_NOSNAP, 0, -1, ""));
+    {
+      ObjectStore::Transaction t;
+      t.touch(cid, hoid);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+
+    auto issued_dw = logger->get(l_bluestore_issued_deferred_writes);
+    auto issued_dw_bytes = logger->get(l_bluestore_issued_deferred_write_bytes);
+    {
+      ObjectStore::Transaction t;
+      bufferlist bl;
+      bl.append(std::string(write_size, 'x'));
+      t.write(cid, hoid, 0, bl.length(), bl,
+	      CEPH_OSD_OP_FLAG_FADVISE_NOCACHE);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+    ASSERT_EQ(logger->get(l_bluestore_issued_deferred_writes), issued_dw + 1);
+    ASSERT_EQ(logger->get(l_bluestore_issued_deferred_write_bytes),
+      issued_dw_bytes + write_size);
+  }
+  {
+    ghobject_t hoid(hobject_t("test-a", "", CEPH_NOSNAP, 0, -1, ""));
+    {
+      ObjectStore::Transaction t;
+      t.touch(cid, hoid);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+
+    auto issued_dw = logger->get(l_bluestore_issued_deferred_writes);
+    auto issued_dw_bytes = logger->get(l_bluestore_issued_deferred_write_bytes);
+    {
+      ObjectStore::Transaction t;
+      bufferlist bl;
+      bl.append(std::string(write_size * 2, 'x'));
+      t.write(cid, hoid, alloc_size - write_size, bl.length(), bl,
+	      CEPH_OSD_OP_FLAG_FADVISE_NOCACHE);
+      r = queue_transaction(store, ch, std::move(t));
+      ASSERT_EQ(r, 0);
+    }
+    ASSERT_EQ(logger->get(l_bluestore_issued_deferred_writes), issued_dw + 2);
+    ASSERT_EQ(logger->get(l_bluestore_issued_deferred_write_bytes),
+      issued_dw_bytes + write_size * 2);
+  }
+  {
+    ObjectStore::Transaction t;
+    ghobject_t hoid(hobject_t("test", "", CEPH_NOSNAP, 0, -1, ""));
+    t.remove(cid, hoid);
+    ghobject_t hoid_a(hobject_t("test-a", "", CEPH_NOSNAP, 0, -1, ""));
+    t.remove(cid, hoid_a);
+    t.remove_collection(cid);
+    cerr << "Cleaning" << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 #endif //#if defined(WITH_BLUESTORE)
 
 TEST_P(StoreTest, KVDBHistogramTest) {
@@ -8972,7 +9290,6 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
   SetVal(g_conf(), "bluestore_max_blob_size", 
     stringify(2 * offs_base).c_str());
   SetVal(g_conf(), "bluestore_extent_map_shard_max_size", "12000");
-  SetVal(g_conf(), "bluestore_fsck_error_on_no_per_pool_stats", "false");
 
   StartDeferred(0x10000);
 
@@ -9020,7 +9337,7 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
   ASSERT_EQ(bstore->fsck(false), 0);
   ASSERT_EQ(bstore->repair(false), 0);
   bstore->mount();
-  if (!bstore->has_null_fm()) {
+  if (!bstore->has_null_manager()) {
     bstore->inject_leaked(0x30000);
     err_was_injected = true;
   }
@@ -9035,7 +9352,7 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
   //////////// false free fix ////////////
   cerr << "fix false free pextents" << std::endl;
   bstore->mount();
-  if (!bstore->has_null_fm()) {
+  if (!bstore->has_null_manager()) {
     bstore->inject_false_free(cid, hoid);
     err_was_injected = true;
   }
@@ -9046,29 +9363,9 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
   }
   ASSERT_EQ(bstore->fsck(false), 0);
 
-  //////////// verify invalid statfs ///////////
-  cerr << "fix invalid statfs" << std::endl;
-  store_statfs_t statfs0, statfs;
-  bstore->mount();
-  ASSERT_EQ(bstore->statfs(&statfs0), 0);
-  statfs = statfs0;
-  statfs.allocated += 0x10000;
-  statfs.data_stored += 0x10000;
-  ASSERT_FALSE(statfs0 == statfs);
-  bstore->inject_statfs("bluestore_statfs", statfs);
-  bstore->umount();
-
-  ASSERT_EQ(bstore->fsck(false), 2);
-  ASSERT_EQ(bstore->repair(false), 0);
-  ASSERT_EQ(bstore->fsck(false), 0);
-  ASSERT_EQ(bstore->mount(), 0);
-  ASSERT_EQ(bstore->statfs(&statfs), 0);
-  // adjust free/internal meta space to success in comparison
-  statfs0.available = statfs.available;
-  statfs0.internal_metadata = statfs.internal_metadata;
-  ASSERT_EQ(statfs0, statfs);
 
   ///////// undecodable shared blob key / stray shared blob records ///////
+  bstore->mount();
   cerr << "undecodable shared blob key" << std::endl;
   bstore->inject_broken_shared_blob_key("undec1",
 			    bufferlist());
@@ -9086,44 +9383,12 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
   bstore->inject_misreference(cid, hoid, cid, hoid_dup, 0);
   bstore->inject_misreference(cid, hoid, cid, hoid_dup, (offs_base * repeats) / 2);
   bstore->inject_misreference(cid, hoid, cid, hoid_dup, offs_base * (repeats -1) );
-  int expected_errors = bstore->has_null_fm() ? 3 : 6;
+  int expected_errors = bstore->has_null_manager() ? 3 : 6;
   bstore->umount();
   ASSERT_EQ(bstore->fsck(false), expected_errors);
   ASSERT_EQ(bstore->repair(false), 0);
 
   ASSERT_EQ(bstore->fsck(true), 0);
-
-  // reproducing issues #21040 & 20983
-  SetVal(g_conf(), "bluestore_debug_inject_bug21040", "true");
-  g_ceph_context->_conf.apply_changes(nullptr);
-  bstore->mount();
-
-  cerr << "repro bug #21040" << std::endl;
-  {
-    auto ch = store->open_collection(cid);
-    {
-      ObjectStore::Transaction t;
-      bl.append("0123456789012345");
-      t.write(cid, hoid3, offs_base, bl.length(), bl);
-      bl.clear();
-      bl.append('!');
-      t.write(cid, hoid3, 0, bl.length(), bl);
-
-      r = queue_transaction(store, ch, std::move(t));
-      ASSERT_EQ(r, 0);
-    }
-    {
-      ObjectStore::Transaction t;
-      t.clone(cid, hoid3, hoid3_cloned);
-      r = queue_transaction(store, ch, std::move(t));
-      ASSERT_EQ(r, 0);
-    }
-
-    bstore->umount();
-    ASSERT_EQ(bstore->fsck(false), 4);
-    ASSERT_LE(bstore->repair(false), 0);
-    ASSERT_EQ(bstore->fsck(false), 0);
-  }
 
   cerr << "Zombie spanning blob" << std::endl;
   {
@@ -9154,9 +9419,59 @@ TEST_P(StoreTestSpecificAUSize, BluestoreRepairTest) {
     ASSERT_EQ(bstore->fsck(false), 0);
   }
 
-  cerr << "Completing" << std::endl;
+  //////////// verify invalid statfs ///////////
+  cerr << "fix invalid statfs" << std::endl;
+  SetVal(g_conf(), "bluestore_fsck_error_on_no_per_pool_stats", "false");
+  // disable allocation recovery - it will fix statfs too
+  SetVal(g_conf(),
+    "bluestore_debug_inject_allocation_from_file_failure", "0");
+  store_statfs_t statfs0;
+  store_statfs_t statfs;
   bstore->mount();
+  ASSERT_EQ(bstore->statfs(&statfs0), 0);
+  statfs = statfs0;
+  statfs.allocated += 0x10000;
+  statfs.data_stored += 0x10000;
+  ASSERT_FALSE(statfs0 == statfs);
+  // this enforces global stats usage
+  bstore->inject_global_statfs(statfs);
+  bstore->umount();
 
+  ASSERT_GE(bstore->fsck(false), 1); // global stats mismatch might omitted when
+                                     // NCB restore is applied. Hence using >= for
+                                     // error count
+  ASSERT_EQ(bstore->repair(false), 0);
+  ASSERT_EQ(bstore->fsck(false), 0);
+  ASSERT_EQ(bstore->mount(), 0);
+  ASSERT_EQ(bstore->statfs(&statfs), 0);
+  // adjust free/internal meta space to success in comparison
+  statfs0.available = statfs.available;
+  statfs0.internal_metadata = statfs.internal_metadata;
+  ASSERT_EQ(statfs0, statfs);
+
+  SetVal(g_conf(),
+    "bluestore_debug_inject_allocation_from_file_failure", "0");
+  cerr << "fix invalid statfs2" << std::endl;
+  ASSERT_EQ(bstore->statfs(&statfs0), 0);
+  statfs = statfs0;
+  statfs.allocated += 0x20000;
+  statfs.data_stored += 0x20000;
+  ASSERT_FALSE(statfs0 == statfs);
+  // this enforces global stats usage
+  bstore->inject_global_statfs(statfs);
+  bstore->umount();
+
+  ASSERT_EQ(bstore->fsck(false), 1);
+  ASSERT_EQ(bstore->repair(false), 0);
+  ASSERT_EQ(bstore->fsck(false), 0);
+  ASSERT_EQ(bstore->mount(), 0);
+  ASSERT_EQ(bstore->statfs(&statfs), 0);
+  // adjust free/internal meta space to success in comparison
+  statfs0.available = statfs.available;
+  statfs0.internal_metadata = statfs.internal_metadata;
+  ASSERT_EQ(statfs0, statfs);
+
+  cerr << "Completing" << std::endl;
 }
 
 TEST_P(StoreTestSpecificAUSize, BluestoreBrokenZombieRepairTest) {
@@ -9366,16 +9681,18 @@ TEST_P(StoreTestSpecificAUSize, BluestoreBrokenNoSharedBlobRepairTest) {
 
   {
     cerr << "fscking/fixing" << std::endl;
+    // we need to check for null-manager before umount()
+    bool has_null_manager = bstore->has_null_manager();
     bstore->umount();
     // depending on the allocation map's source we can
     // either observe or don't observe an additional 
     // extent leak detection. Hence adjusting the expected
     // value
     size_t expected_error_count =
-      g_ceph_context->_conf->bluestore_allocation_from_file ?
-      5: // 4 sb ref mismatch errors + 1 statfs mismatch
+      has_null_manager ?
+      4: // 4 sb ref mismatch errors [+ 1 optional statfs, hence ASSERT_GE]
       7; // 4 sb ref mismatch errors + 1 statfs + 1 block leak + 1 non-free
-    ASSERT_EQ(bstore->fsck(false), expected_error_count);
+    ASSERT_GE(bstore->fsck(false), expected_error_count);
     // repair might report less errors than fsck above showed
     // as some errors, e.g. statfs mismatch, are implicitly fixed
     // before the detection during the previous repair steps...
@@ -10101,8 +10418,22 @@ TEST_P(StoreTestSpecificAUSize, ReproNoBlobMultiTest) {
   }
   {
     cerr << "Finalizing" << std::endl;
+    // before ExtentMap::dup blob merge refector:
+    // allocated = 9160228864
+    // l_bluestore_gc_merged = 1094856704
+    // after ExtentMap::dup change:
+    // allocated = 9127985152
+    // l_bluestore_gc_merged = 1055684096
+    // This generally shows that we should not take seriously this test.
+    // We allocated ~9GB to create sequence of 512 objects that
+    // Ai < A(i+1) < A(i+2) < ... < A(512)
+    // and size of A(512) is less then 128M.
+    struct store_statfs_t statfs;
+    int r = store->statfs(&statfs);
+    ASSERT_EQ(r, 0);
     const PerfCounters* logger = store->get_perf_counters();
-    ASSERT_GE(logger->get(l_bluestore_gc_merged), 1024*1024*1024);
+    ASSERT_GE(logger->get(l_bluestore_gc_merged), 900*1024*1024);
+    ASSERT_LE(statfs.allocated, 9LL*1024*1024*1024);
   }
 }
 
@@ -10159,6 +10490,14 @@ TEST_P(StoreTestSpecificAUSize, SpilloverTest) {
   SetVal(g_conf(), "bluestore_block_db_create", "true");
   SetVal(g_conf(), "bluestore_block_db_size", "3221225472");
   SetVal(g_conf(), "bluestore_volume_selection_policy", "rocksdb_original");
+  // original RocksDB settings used before https://github.com/ceph/ceph/pull/47221/
+  // which enable BlueFS spillover.
+  SetVal(g_conf(), "bluestore_rocksdb_options",
+    "compression=kNoCompression,max_write_buffer_number=4,"
+    "min_write_buffer_number_to_merge=1,recycle_log_file_num=4,"
+    "write_buffer_size=268435456,writable_file_max_buffer_size=0,"
+    "compaction_readahead_size=2097152,max_background_compactions=2,"
+    "max_total_wal_size=1073741824");
 
   g_conf().apply_changes(nullptr);
 
@@ -10172,10 +10511,17 @@ TEST_P(StoreTestSpecificAUSize, SpilloverTest) {
       const PerfCounters* logger = bstore->get_bluefs_perf_counters();
       //experimentally it was discovered that this case results in 400+MB spillover
       //using lower 300MB threshold just to be safe enough
-      std::cout << "db_used:" << logger->get(l_bluefs_db_used_bytes) << std::endl;
-      std::cout << "slow_used:" << logger->get(l_bluefs_slow_used_bytes) << std::endl;
+      std::cout << "DB used:" << logger->get(l_bluefs_db_used_bytes) << std::endl;
+      std::cout << "SLOW used:" << logger->get(l_bluefs_slow_used_bytes) << std::endl;
       ASSERT_GE(logger->get(l_bluefs_slow_used_bytes), 16 * 1024 * 1024);
 
+      struct store_statfs_t statfs;
+      osd_alert_list_t alerts;
+      int r = store->statfs(&statfs, &alerts);
+      ASSERT_EQ(r, 0);
+      ASSERT_EQ(alerts.count("BLUEFS_SPILLOVER"), 1);
+      std::cout << "spillover_alert:" << alerts.find("BLUEFS_SPILLOVER")->second
+                << std::endl;
     }
   );
 }
@@ -10647,10 +10993,11 @@ int main(int argc, char **argv) {
   g_ceph_context->_conf.set_val_or_die("bluestore_debug_freelist", "true");
   g_ceph_context->_conf.set_val_or_die("bluestore_clone_cow", "true");
   g_ceph_context->_conf.set_val_or_die("bluestore_max_alloc_size", "196608");
-
   // set small cache sizes so we see trimming during Synthetic tests
   g_ceph_context->_conf.set_val_or_die("bluestore_cache_size_hdd", "4000000");
   g_ceph_context->_conf.set_val_or_die("bluestore_cache_size_ssd", "4000000");
+  g_ceph_context->_conf.set_val_or_die(
+  "bluestore_debug_inject_allocation_from_file_failure", "0.66");
 
   // very short *_max prealloc so that we fall back to async submits
   g_ceph_context->_conf.set_val_or_die("bluestore_blobid_prealloc", "10");

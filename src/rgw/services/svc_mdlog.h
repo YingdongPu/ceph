@@ -16,9 +16,9 @@
 
 #pragma once
 
-#include "rgw/rgw_service.h"
-#include "rgw/rgw_period_history.h"
-#include "rgw/rgw_period_puller.h"
+#include "rgw_service.h"
+#include "rgw_period_history.h"
+#include "rgw_period_puller.h"
 
 #include "svc_meta_be.h"
 
@@ -102,7 +102,7 @@ public:
                     RGWObjVersionTracker *objv_tracker,
 		    optional_yield y, bool exclusive = false);
 
-  int add_entry(const DoutPrefixProvider *dpp, const std::string& hash_key, const std::string& section, const std::string& key, bufferlist& bl);
+  int add_entry(const DoutPrefixProvider *dpp, const std::string& hash_key, const std::string& section, const std::string& key, bufferlist& bl, optional_yield y);
 
   int get_shard_id(const std::string& hash_key, int *shard_id);
 

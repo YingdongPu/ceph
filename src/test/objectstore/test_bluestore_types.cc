@@ -56,15 +56,30 @@ TEST(bluestore, sizeof) {
 void dump_mempools()
 {
   ostringstream ostr;
-  Formatter* f = Formatter::create("json-pretty", "json-pretty", "json-pretty");
+  auto f = Formatter::create_unique("json-pretty", "json-pretty", "json-pretty");
   ostr << "Mempools: ";
   f->open_object_section("mempools");
-  mempool::dump(f);
+  mempool::dump(f.get());
   f->close_section();
   f->flush(ostr);
-  delete f;
   cout << ostr.str() << std::endl;
 }
+/*void get_mempool_stats(uint64_t* total_bytes, uint64_t* total_items)
+{
+  uint64_t meta_allocated = mempool::bluestore_cache_meta::allocated_bytes();
+  uint64_t onode_allocated = mempool::bluestore_cache_onode::allocated_bytes();
+  uint64_t other_allocated = mempool::bluestore_cache_other::allocated_bytes();
+
+  uint64_t meta_items = mempool::bluestore_cache_meta::allocated_items();
+  uint64_t onode_items = mempool::bluestore_cache_onode::allocated_items();
+  uint64_t other_items = mempool::bluestore_cache_other::allocated_items();
+  cout << "meta(" << meta_allocated << "/" << meta_items
+       << ") onode(" << onode_allocated << "/" << onode_items
+       << ") other(" << other_allocated << "/" << other_items
+       << ")" << std::endl;
+  *total_bytes = meta_allocated + onode_allocated + other_allocated;
+  *total_items = onode_items;
+}*/
 
 TEST(sb_info_space_efficient_map_t, basic) {
   sb_info_space_efficient_map_t sb_info;
@@ -1081,17 +1096,17 @@ TEST(Blob, legacy_decode)
 
     uint64_t sbid, sbid2;
     Bres.decode(
-      coll.get(),
       p,
       1, /*struct_v*/
       &sbid,
-      true);
+      true,
+      coll.get());
     Bres2.decode(
-      coll.get(),
       p2,
       2, /*struct_v*/
       &sbid2,
-      true);
+      true,
+      coll.get());
 
     ASSERT_EQ(0xff0u + 1u, Bres.get_blob_use_tracker().get_referenced_bytes());
     ASSERT_EQ(0xff0u + 1u, Bres2.get_blob_use_tracker().get_referenced_bytes());
@@ -1109,7 +1124,8 @@ TEST(ExtentMap, seek_lextent)
 
   auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
   BlueStore::Onode onode(coll.get(), ghobject_t(), "");
-  BlueStore::ExtentMap em(&onode);
+  BlueStore::ExtentMap em(&onode,
+    g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
   BlueStore::BlobRef br(new BlueStore::Blob);
   br->shared_blob = new BlueStore::SharedBlob(coll.get());
 
@@ -1161,7 +1177,8 @@ TEST(ExtentMap, has_any_lextents)
     g_ceph_context, "lru", NULL);
   auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
   BlueStore::Onode onode(coll.get(), ghobject_t(), "");
-  BlueStore::ExtentMap em(&onode);
+  BlueStore::ExtentMap em(&onode,
+    g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
   BlueStore::BlobRef b(new BlueStore::Blob);
   b->shared_blob = new BlueStore::SharedBlob(coll.get());
 
@@ -1220,7 +1237,8 @@ TEST(ExtentMap, compress_extent_map)
   
   auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
   BlueStore::Onode onode(coll.get(), ghobject_t(), "");
-  BlueStore::ExtentMap em(&onode);
+  BlueStore::ExtentMap em(&onode,
+    g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
   BlueStore::BlobRef b1(new BlueStore::Blob);
   BlueStore::BlobRef b2(new BlueStore::Blob);
   BlueStore::BlobRef b3(new BlueStore::Blob);
@@ -1266,6 +1284,546 @@ TEST(ExtentMap, compress_extent_map)
   ASSERT_EQ(6u, em.extent_map.size());
 }
 
+class ExtentMapFixture : virtual public ::testing::Test {
+
+public:
+  BlueStore store;
+  BlueStore::OnodeCacheShard *oc;
+  BlueStore::BufferCacheShard *bc;
+  BlueStore::CollectionRef coll;
+
+  static constexpr uint32_t au_size = 4096;
+  uint32_t blob_size = 65536;
+  size_t csum_order = 12; //1^12 = 4096 bytes
+
+  struct au {
+    uint32_t chksum;
+    uint32_t refs;
+  };
+  std::vector<au> disk;
+
+  // test onode that glues some simplifications in representation
+  // with actual BlueStore's onode
+  struct t_onode {
+    BlueStore::OnodeRef onode; //actual BS onode
+    std::vector<uint32_t> data; //map to AUs
+    static constexpr uint32_t empty = std::numeric_limits<uint32_t>::max();
+  };
+  void print(std::ostream& out, t_onode& onode)
+  {
+    for (size_t i = 0; i < onode.data.size(); ++i) {
+      if (i != 0) out << " ";
+      if (onode.data[i] == t_onode::empty) {
+	out << "-";
+      } else {
+	out << std::hex << onode.data[i]
+	    << "/" << disk[onode.data[i]].chksum
+	    << ":" << std::dec << disk[onode.data[i]].refs;
+      }
+    }
+  }
+  explicit ExtentMapFixture()
+    : store(g_ceph_context, "", au_size)
+  {
+    oc = BlueStore::OnodeCacheShard::create(g_ceph_context, "lru", NULL);
+    bc = BlueStore::BufferCacheShard::create(g_ceph_context, "lru", NULL);
+    coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
+  }
+
+  void SetUp() override {
+  }
+  void TearDown() override {
+  }
+
+  // takes new space from disk, initializes csums
+  // returns index of first au
+  uint32_t allocate(uint32_t num_au) {
+    uint32_t pos = disk.size();
+    disk.resize(pos + num_au);
+    for (uint32_t i = 0; i < num_au; i++) {
+      uint32_t p = pos + i;
+      disk[p].chksum = 2 * p + 1;
+      disk[p].refs = 0;
+    }
+    return pos;
+  }
+  void release(uint32_t& au_idx) {
+    if (au_idx != t_onode::empty) {
+      disk_unref(au_idx);
+    }
+    au_idx = t_onode::empty;
+  }
+  void disk_ref(uint32_t au_idx) {
+    ++disk[au_idx].refs;
+  }
+  void disk_unref(uint32_t au_idx) {
+    ceph_assert(disk[au_idx].refs > 0);
+    --disk[au_idx].refs;
+  }
+
+  t_onode create() {
+    t_onode res;
+    res.onode = new BlueStore::Onode(coll.get(), ghobject_t(), "");
+    return res;
+  }
+
+  void fillup(t_onode& onode, uint32_t end) {
+    if (end > onode.data.size()) {
+      size_t e = onode.data.size();
+      onode.data.resize(end);
+      for (; e < end; ++e) {
+	onode.data[e] = t_onode::empty;
+      }
+    }
+  }
+  void punch_hole(t_onode& onode, uint32_t off, uint32_t len) {
+    ceph_assert((off % au_size) == 0);
+    ceph_assert((len % au_size) == 0);
+    uint32_t i = off / au_size;
+    uint32_t end = (off + len) / au_size;
+    fillup(onode, end);
+    while (i < end && i < onode.data.size()) {
+      if (onode.data[i] != t_onode::empty)
+	release(onode.data[i]);
+      onode.data[i] = t_onode::empty;
+      i++;
+    }
+    store.debug_punch_hole(coll, onode.onode, off, len);
+  }
+
+  void write(t_onode& onode, uint32_t off, uint32_t len) {
+    ceph_assert((off % au_size) == 0);
+    ceph_assert((len % au_size) == 0);
+    punch_hole(onode, off, len);
+
+    uint32_t i = off / au_size;
+    uint32_t end = (off + len) / au_size;
+    fillup(onode, end);
+
+    uint32_t au_idx = allocate(end - i);
+    uint32_t idx = au_idx;
+    while (i < end) {
+      onode.data[i] = idx;
+      disk_ref(idx);
+      ++idx;
+      ++i;
+    }
+
+    // below simulation of write performed by BlueStore::do_write()
+    auto helper_blob_write = [&](
+      uint32_t log_off,   // logical offset of blob to put to onode
+      uint32_t empty_aus, // amount of unreferenced aus in the beginning
+      uint32_t first_au,  // first au that will be referenced
+      uint32_t num_aus     // number of aus, first, first+1.. first+num_au-1
+    ) {
+      uint32_t blob_length = (empty_aus + num_aus) * au_size;
+      BlueStore::BlobRef b(new BlueStore::Blob);
+      b->shared_blob = new BlueStore::SharedBlob(coll.get());
+      bluestore_blob_t& bb = b->dirty_blob();
+      bb.init_csum(Checksummer::CSUM_CRC32C, csum_order, blob_length);
+      for(size_t i = 0; i < num_aus; ++i) {
+	bb.set_csum_item(empty_aus + i, disk[first_au + i].chksum);
+      }
+
+      PExtentVector pextents;
+      pextents.emplace_back(first_au * au_size, num_aus * au_size);
+      bb.allocated(empty_aus * au_size, num_aus * au_size, pextents);
+
+      auto *ext = new BlueStore::Extent(log_off, empty_aus * au_size,
+					 num_aus * au_size, b);
+      onode.onode->extent_map.extent_map.insert(*ext);
+      b->get_ref(coll.get(), empty_aus * au_size, num_aus * au_size);
+      bb.mark_used(empty_aus * au_size, num_aus * au_size);
+    };
+
+    size_t off_blob_aligned = p2align(off, blob_size);
+    size_t off_blob_roundup = p2align(off + blob_size, blob_size);
+    uint32_t skip_aus = (off - off_blob_aligned) / au_size;
+    size_t l = std::min<size_t>(off_blob_roundup - off, len);
+    uint32_t num_aus = l / au_size;
+
+    while (len > 0) {
+      helper_blob_write(off, skip_aus, au_idx, num_aus);
+      skip_aus = 0;
+      au_idx += num_aus;
+      len -= num_aus * au_size;
+      off += (skip_aus + num_aus) * au_size;
+      l = std::min<size_t>(blob_size, len);
+      num_aus = l / au_size;
+    };
+  }
+
+  void dup(t_onode& ofrom, t_onode& oto, uint64_t off, uint64_t len) {
+    ceph_assert((off % au_size) == 0);
+    ceph_assert((len % au_size) == 0);
+    punch_hole(oto, off, len);
+
+    uint32_t i = off / au_size;
+    uint32_t end = (off + len) / au_size;
+    fillup(ofrom, end);
+    ceph_assert(end <= ofrom.data.size());
+    while (i < end) {
+      oto.data[i] = ofrom.data[i];
+      if (oto.data[i] != t_onode::empty) {
+	disk_ref(oto.data[i]);
+      }
+      ++i;
+    }
+    BlueStore::TransContext txc(store.cct, coll.get(), nullptr, nullptr);
+    ofrom.onode->extent_map.dup_esb(&store, &txc, coll, ofrom.onode, oto.onode, off, len, off);
+  }
+
+  int32_t compare(t_onode& onode) {
+    BlueStore::ExtentMap::debug_au_vector_t debug =
+      onode.onode->extent_map.debug_list_disk_layout();
+    size_t pos = 0;
+    for (size_t i = 0; i < debug.size(); ++i) {
+      if (debug[i].disk_offset == -1ULL) {
+	size_t len = debug[i].disk_length;
+	size_t l = len / au_size;
+	if (pos + l > onode.data.size()) {
+	  return pos + l;
+	}
+	while (l > 0) {
+	  if (onode.data[pos] != t_onode::empty) {
+	    return pos;
+	  }
+	  --l;
+	  ++pos;
+	};
+      } else {
+	ceph_assert(pos < onode.data.size());
+	uint32_t au = onode.data[pos];
+	if (debug[i].disk_offset != au * au_size ||
+	    debug[i].disk_length != au_size      ||
+	    debug[i].chksum != disk[au].chksum) {
+	  return pos;
+	}
+	if ((int32_t)debug[i].ref_cnts == -1) {
+	  if (disk[au].refs != 1) {
+	    return pos;
+	  }
+	} else {
+	  if (disk[au].refs != debug[i].ref_cnts) {
+	    return pos;
+	  }
+	}
+	++pos;
+      }
+    }
+    // remaining aus must be empty
+    while (pos < onode.data.size()) {
+      if (onode.data[pos] != t_onode::empty) {
+	return pos;
+      }
+      ++pos;
+    }
+    return -1;
+  }
+
+  bool check(t_onode& onode) {
+    int32_t res = compare(onode);
+    if (res != -1) {
+      cout << "Discrepancy at 0x" << std::hex << res * au_size << std::dec << std::endl;
+      cout << "Simulated: ";
+      print(cout, onode);
+      cout << std::endl;
+      cout << "Onode: " << onode.onode->extent_map.debug_list_disk_layout() << std::endl;
+      return false;
+    }
+    return true;
+  }
+  void print(t_onode& onode) {
+    cout << "Simulated: ";
+    print(cout, onode);
+    cout << std::endl;
+    cout << "Onode: " << onode.onode->extent_map.debug_list_disk_layout() << std::endl;
+  }
+};
+
+TEST_F(ExtentMapFixture, walk)
+{
+  std::vector<t_onode> X;
+  for (size_t i = 0; i < 100; i++) {
+    X.push_back(create());
+  }
+
+  for (size_t i = 0; i < 100 - 1; i++) {
+    write(X[i], (i + 2) * au_size, 4 * au_size);
+    dup(X[i], X[i+1], (i + 1) * au_size, 8 * au_size);
+  }
+  for (size_t i = 0; i < 100; i++) {
+    ASSERT_EQ(check(X[i]), true);
+  }
+}
+
+TEST_F(ExtentMapFixture, pyramid)
+{
+  constexpr size_t H = 100;
+  std::vector<t_onode> X;
+  for (size_t i = 0; i < H; i++) {
+    X.push_back(create());
+  }
+  write(X[0], 0, (H * 2 + 1) * au_size);
+
+  for (size_t i = 0; i < H - 1; i++) {
+    dup(X[i], X[i + 1], i * au_size, (H * 2 + 1 - i * 2) * au_size);
+  }
+  for (size_t i = 0; i < H; i++) {
+    ASSERT_EQ(check(X[i]), true);
+  }
+}
+
+TEST_F(ExtentMapFixture, rain)
+{
+  constexpr size_t H = 100;
+  constexpr size_t W = 100;
+  std::vector<t_onode> X;
+  for (size_t i = 0; i < H; i++) {
+    X.push_back(create());
+  }
+  for (size_t i = 0; i < H - 1; i++) {
+    write(X[i], (rand() % W - 1) * au_size, au_size);
+    dup(X[i], X[i + 1], 0, W * au_size);
+  }
+  for (size_t i = 0; i < H; i++) {
+    ASSERT_EQ(check(X[i]), true);
+  }
+}
+
+TEST_F(ExtentMapFixture, pollock)
+{
+  constexpr size_t H = 100;
+  constexpr size_t W = 100;
+  std::vector<t_onode> X;
+  for (size_t i = 0; i < H; i++) {
+    X.push_back(create());
+  }
+  for (size_t i = 0; i < H - 1; i++) {
+    size_t w = rand() % (W / 3) + 1;
+    size_t l = rand() % (W - w);
+    write(X[i], l * au_size, w * au_size);
+    w = rand() % (W / 3) + 1;
+    l = rand() % (W - w);
+    dup(X[i], X[i + 1], l * au_size, w * au_size);
+  }
+  for (size_t i = 0; i < H; i++) {
+    ASSERT_EQ(check(X[i]), true);
+  }
+}
+
+TEST_F(ExtentMapFixture, carousel)
+{
+  constexpr size_t R = 10;
+  constexpr size_t CNT = 300;
+  constexpr size_t W = 100;
+  std::vector<t_onode> X;
+  for (size_t i = 0; i < R; i++) {
+    X.push_back(create());
+  }
+  for (size_t i = 0; i < CNT; i++) {
+    size_t w = rand() % (W / 3) + 1;
+    size_t l = rand() % (W - w);
+    write(X[i % R], l * au_size, w * au_size);
+    w = rand() % (W / 3) + 1;
+    l = rand() % (W - w);
+    dup(X[i % R], X[(i + 1) % R], l * au_size, w * au_size);
+  }
+  for (size_t i = 0; i < R; i++) {
+    ASSERT_EQ(check(X[i]), true);
+  }
+}
+
+TEST_F(ExtentMapFixture, petri)
+{
+  constexpr size_t R = 10;
+  constexpr size_t CNT = 300;
+  constexpr size_t W = 100;
+  std::vector<t_onode> X;
+  for (size_t i = 0; i < R; i++) {
+    X.push_back(create());
+    write(X[i], 0 * au_size, W * au_size);
+  }
+  for (size_t i = 0; i < CNT; i++) {
+    size_t from = rand() % R;
+    size_t to = from;
+    while (to == from) {
+      to = rand() % R;
+    }
+    size_t w = rand() % (W / 5) + 1;
+    size_t l = rand() % (W - w);
+    dup(X[from], X[to], l * au_size, w * au_size);
+  }
+  for (size_t i = 0; i < R; i++) {
+    ASSERT_EQ(check(X[i]), true);
+  }
+}
+
+TEST(ExtentMap, dup_extent_map)
+{
+  BlueStore store(g_ceph_context, "", 4096);
+  BlueStore::OnodeCacheShard *oc = BlueStore::OnodeCacheShard::create(
+    g_ceph_context, "lru", NULL);
+  BlueStore::BufferCacheShard *bc = BlueStore::BufferCacheShard::create(
+    g_ceph_context, "lru", NULL);
+
+  size_t csum_order = 12; //1^12 = 4096 bytes
+  auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
+  std::unique_ptr<ceph::Formatter> formatter(Formatter::create("json"));
+
+  ///////////////////////////
+  //constructing onode1
+  BlueStore::OnodeRef onode1(new BlueStore::Onode(coll.get(), ghobject_t(), ""));
+  
+  //BlueStore::ExtentMap em1(&onode1,
+  //  g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
+  BlueStore::ExtentMap& em1 = onode1->extent_map;
+  ///////////////////////////
+  // constructing extent/Blob: 0x0~2000 at <0x100000~2000>
+  size_t ext1_offs = 0x0;
+  size_t ext1_len = 0x2000;
+  size_t ext1_boffs = 0x0;
+  BlueStore::BlobRef b1(new BlueStore::Blob);
+  b1->shared_blob = new BlueStore::SharedBlob(coll.get());
+  auto &_b1 = b1->dirty_blob();
+  _b1.init_csum(Checksummer::CSUM_CRC32C, csum_order, ext1_len);
+  for(size_t i = 0; i < _b1.get_csum_count(); i++) {
+    *(_b1.get_csum_item_ptr(i)) = i + 1;
+  }
+  PExtentVector pextents;
+  pextents.emplace_back(0x100000, ext1_len);
+  _b1.allocated(0, ext1_len, pextents);
+
+  auto *ext1 = new BlueStore::Extent(ext1_offs, ext1_boffs, ext1_len, b1);
+  em1.extent_map.insert(*ext1);
+  b1->get_ref(coll.get(), ext1->blob_offset, ext1->length);
+  _b1.mark_used(ext1->blob_offset, ext1->length);
+
+  ///////////////////////////
+  //constructing onode2 which is a full clone from onode1
+  BlueStore::OnodeRef onode2(new BlueStore::Onode(coll.get(), ghobject_t(), ""));
+  //BlueStore::ExtentMap em2(&onode2,
+  //  g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
+  BlueStore::ExtentMap& em2 = onode2->extent_map;
+  {
+    BlueStore::TransContext txc(store.cct, coll.get(), nullptr, nullptr);
+
+    //em1.dup(&store, &txc, coll, em2, ext1_offs, ext1_len, ext1_offs);
+    onode1->extent_map.dup_esb(&store, &txc, coll, onode1, onode2, ext1_offs, ext1_len, ext1_offs);
+
+    em1.dump(formatter.get()); // see the log if any
+    formatter->flush(std::cout);
+    std::cout << std::endl;
+    em2.dump(formatter.get());
+    formatter->flush(std::cout);
+    std::cout << std::endl;
+
+    ASSERT_TRUE(b1->get_blob().is_shared());
+    ASSERT_EQ(b1->get_referenced_bytes(), ext1_len);
+
+    BlueStore::BlobRef b2 = em2.seek_lextent(ext1_offs)->blob;
+    ASSERT_TRUE(b2->get_blob().is_shared());
+    ASSERT_EQ(b2->get_referenced_bytes(), ext1_len);
+    ASSERT_EQ(b1->shared_blob, b2->shared_blob);
+    auto &_b2 = b2->get_blob();
+    ASSERT_EQ(_b1.get_csum_count(), _b2.get_csum_count());
+    for(size_t i = 0; i < _b2.get_csum_count(); i++) {
+      ASSERT_EQ(*(_b1.get_csum_item_ptr(i)), *(_b2.get_csum_item_ptr(i)));
+    }
+  }
+
+  ///////////////////////////
+  //constructing onode3 which is partial clone (tail part) from onode2
+  BlueStore::OnodeRef onode3(new BlueStore::Onode(coll.get(), ghobject_t(), ""));
+  //BlueStore::ExtentMap em3(&onode3,
+  //  g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
+  BlueStore::ExtentMap& em3 = onode3->extent_map;
+  {
+    size_t clone_shift = 0x1000;
+    ceph_assert(ext1_len > clone_shift);
+    size_t clone_offs = ext1_offs + clone_shift;
+    size_t clone_len = ext1_len - clone_shift;
+    BlueStore::TransContext txc(store.cct, coll.get(), nullptr, nullptr);
+
+    onode1->extent_map.dup_esb(&store, &txc, coll, onode1, onode3, clone_offs, clone_len, clone_offs);
+    em1.dump(formatter.get()); // see the log if any
+    formatter->flush(std::cout);
+    std::cout << std::endl;
+    em3.dump(formatter.get());
+    formatter->flush(std::cout);
+    std::cout << std::endl;
+
+    // make sure (basically) onode1&2 are unmodified
+    BlueStore::BlobRef b1 = em1.seek_lextent(ext1_offs)->blob;
+    BlueStore::BlobRef b2 = em2.seek_lextent(ext1_offs)->blob;
+    ASSERT_EQ(b1->shared_blob, b2->shared_blob);
+
+    BlueStore::Extent &ext3 = *em3.seek_lextent(clone_offs);
+    ASSERT_EQ(ext3.blob_offset, clone_shift);
+    ASSERT_EQ(ext3.length, clone_len);
+    BlueStore::BlobRef b3 = ext3.blob;
+    ASSERT_TRUE(b3->get_blob().is_shared());
+    ASSERT_EQ(b3->shared_blob, b1->shared_blob);
+    ASSERT_EQ(b3->get_referenced_bytes(), clone_len);
+    auto ll = b3->get_blob().get_logical_length();
+    ASSERT_EQ(ll, ext1_len);
+    auto &_b3 = b3->get_blob();
+    ASSERT_EQ(_b1.get_csum_count(), _b3.get_csum_count());
+    for(size_t i = 0; i < _b3.get_csum_count(); i++) {
+      ASSERT_EQ(*(_b1.get_csum_item_ptr(i)), *(_b3.get_csum_item_ptr(i)));
+    }
+  }
+
+  ///////////////////////////
+  //constructing onode4 which is partial clone (head part) from onode2
+  BlueStore::OnodeRef onode4(new BlueStore::Onode(coll.get(), ghobject_t(), ""));
+  //BlueStore::ExtentMap em4(&onode4,
+  //  g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
+  BlueStore::ExtentMap& em4 = onode4->extent_map;
+
+  {
+    size_t clone_shift = 0;
+    size_t clone_len = 0x1000;
+    ceph_assert(ext1_len >= clone_shift + clone_len);
+    size_t clone_offs = ext1_offs + clone_shift;
+    BlueStore::TransContext txc(store.cct, coll.get(), nullptr, nullptr);
+
+    onode2->extent_map.dup_esb(&store, &txc, coll, onode2, onode4, clone_offs, clone_len, clone_offs);
+    em2.dump(formatter.get()); // see the log if any
+    formatter->flush(std::cout);
+    std::cout << std::endl;
+    em4.dump(formatter.get());
+    formatter->flush(std::cout);
+    std::cout << std::endl;
+
+    // make sure (basically) onode1&2 are unmodified
+    BlueStore::BlobRef b1 = em1.seek_lextent(ext1_offs)->blob;
+    BlueStore::BlobRef b2 = em2.seek_lextent(ext1_offs)->blob;
+    BlueStore::BlobRef b3 = em3.seek_lextent(ext1_offs)->blob;
+    ASSERT_EQ(b1->shared_blob, b2->shared_blob);
+    ASSERT_EQ(b1->shared_blob, b3->shared_blob);
+    auto &_b2 = b2->get_blob();
+
+    BlueStore::Extent &ext4 = *em4.seek_lextent(clone_offs);
+    ASSERT_EQ(ext4.blob_offset, clone_shift);
+    ASSERT_EQ(ext4.length, clone_len);
+    BlueStore::BlobRef b4 = ext4.blob;
+    ASSERT_TRUE(b4->get_blob().is_shared());
+    ASSERT_EQ(b4->shared_blob, b2->shared_blob);
+    ASSERT_EQ(b4->get_referenced_bytes(), clone_len);
+    auto &_b4 = b4->get_blob();
+    auto ll = _b4.get_logical_length();
+    auto csum_entries = ll / (1 << csum_order);
+    ASSERT_EQ(ll, clone_len);
+    ASSERT_EQ(csum_entries, _b4.get_csum_count());
+
+    ASSERT_GT(_b2.get_csum_count(), csum_entries);
+    for(size_t i = 0; i < csum_entries; i++) {
+      ASSERT_EQ(*(_b2.get_csum_item_ptr(i)), *(_b4.get_csum_item_ptr(i)));
+    }
+  }
+}
+
 
 void clear_and_dispose(BlueStore::old_extent_map_t& old_em)
 {
@@ -1287,7 +1845,8 @@ TEST(GarbageCollector, BasicTest)
   BlueStore store(g_ceph_context, "", 4096);
   auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
   BlueStore::Onode onode(coll.get(), ghobject_t(), "");
-  BlueStore::ExtentMap em(&onode);
+  BlueStore::ExtentMap em(&onode,
+    g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
 
   BlueStore::old_extent_map_t old_extents;
 
@@ -1376,7 +1935,8 @@ TEST(GarbageCollector, BasicTest)
     BlueStore store(g_ceph_context, "", 0x10000);
     auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
     BlueStore::Onode onode(coll.get(), ghobject_t(), "");
-    BlueStore::ExtentMap em(&onode);
+    BlueStore::ExtentMap em(&onode,
+      g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
 
     BlueStore::old_extent_map_t old_extents;
     BlueStore::GarbageCollector gc(g_ceph_context);
@@ -1503,7 +2063,8 @@ TEST(GarbageCollector, BasicTest)
     BlueStore store(g_ceph_context, "", 0x10000);
     auto coll = ceph::make_ref<BlueStore::Collection>(&store, oc, bc, coll_t());
     BlueStore::Onode onode(coll.get(), ghobject_t(), "");
-    BlueStore::ExtentMap em(&onode);
+    BlueStore::ExtentMap em(&onode,
+      g_ceph_context->_conf->bluestore_extent_map_inline_shard_prealloc_size);
 
     BlueStore::old_extent_map_t old_extents;
     BlueStore::GarbageCollector gc(g_ceph_context);
@@ -2149,6 +2710,39 @@ TEST(SimpleBitmap, boundaries)
   }
 }
 
+//---------------------------------------------------------------------------------
+TEST(SimpleBitmap, boundaries2)
+{
+  const uint64_t bit_count_base = 64 << 10; // 64Kb = 8MB
+  const extent_t null_extent    = {0, 0};
+
+  for (unsigned i = 0; i < 64; i++) {
+    uint64_t     bit_count   = bit_count_base + i;
+    extent_t     full_extent = {0, bit_count};
+    SimpleBitmap sbmap(g_ceph_context, bit_count);
+
+    sbmap.set(0, bit_count);
+    ASSERT_TRUE(sbmap.get_next_set_extent(0) == full_extent);
+    ASSERT_TRUE(sbmap.get_next_clr_extent(0) == null_extent);
+
+    for (uint64_t bit = 0; bit < bit_count; bit++) {
+      sbmap.clr(bit, 1);
+    }
+    ASSERT_TRUE(sbmap.get_next_set_extent(0) == null_extent);
+    ASSERT_TRUE(sbmap.get_next_clr_extent(0) == full_extent);
+
+    for (uint64_t bit = 0; bit < bit_count; bit++) {
+      sbmap.set(bit, 1);
+    }
+    ASSERT_TRUE(sbmap.get_next_set_extent(0) == full_extent);
+    ASSERT_TRUE(sbmap.get_next_clr_extent(0) == null_extent);
+
+    sbmap.clr(0, bit_count);
+    ASSERT_TRUE(sbmap.get_next_set_extent(0) == null_extent);
+    ASSERT_TRUE(sbmap.get_next_clr_extent(0) == full_extent);
+  }
+}
+
 TEST(shared_blob_2hash_tracker_t, basic_test)
 {
   shared_blob_2hash_tracker_t t1(1024 * 1024, 4096);
@@ -2214,6 +2808,73 @@ TEST(shared_blob_2hash_tracker_t, basic_test)
   ASSERT_TRUE(t1.test_all_zero_range(5, 0x4500, 0x3b00));
   ASSERT_TRUE(!t1.test_all_zero_range(5, 0, 0x9000));
 }
+
+TEST(bluestore_blob_use_tracker_t, mempool_stats_test)
+{
+  using mempool::bluestore_cache_other::allocated_items;
+  using mempool::bluestore_cache_other::allocated_bytes;
+  uint64_t other_items0 = allocated_items();
+  uint64_t other_bytes0 = allocated_bytes();
+  {
+    bluestore_blob_use_tracker_t* t1 = new bluestore_blob_use_tracker_t;
+
+    t1->init(1024 * 1024, 4096);
+    ASSERT_EQ(256, allocated_items() - other_items0);  // = 1M / 4K
+    ASSERT_EQ(1024, allocated_bytes() - other_bytes0); // = 1M / 4K * 4
+
+    delete t1;
+    ASSERT_EQ(allocated_items(), other_items0);
+    ASSERT_EQ(allocated_bytes(), other_bytes0);
+  }
+  {
+    bluestore_blob_use_tracker_t* t1 = new bluestore_blob_use_tracker_t;
+
+    t1->init(1024 * 1024, 4096);
+    t1->add_tail(2048 * 1024, 4096);
+    // proper stats update after tail add
+    ASSERT_EQ(512, allocated_items() - other_items0);  // = 2M / 4K
+    ASSERT_EQ(2048, allocated_bytes() - other_bytes0); // = 2M / 4K * 4
+
+    delete t1;
+    ASSERT_EQ(allocated_items(), other_items0);
+    ASSERT_EQ(allocated_bytes(), other_bytes0);
+  }
+  {
+    bluestore_blob_use_tracker_t* t1 = new bluestore_blob_use_tracker_t;
+
+    t1->init(1024 * 1024, 4096);
+    t1->prune_tail(512 * 1024);
+    // no changes in stats after pruning
+    ASSERT_EQ(256, allocated_items() - other_items0);  // = 1M / 4K
+    ASSERT_EQ(1024, allocated_bytes() - other_bytes0); // = 1M / 4K * 4
+
+    delete t1;
+    ASSERT_EQ(allocated_items(), other_items0);
+    ASSERT_EQ(allocated_bytes(), other_bytes0);
+  }
+  {
+    bluestore_blob_use_tracker_t* t1 = new bluestore_blob_use_tracker_t;
+    bluestore_blob_use_tracker_t* t2 = new bluestore_blob_use_tracker_t;
+
+    t1->init(1024 * 1024, 4096);
+
+    // t1 keeps the same amount of entries + t2 has got half of them
+    t1->split(512 * 1024, t2);
+    ASSERT_EQ(256 + 128, allocated_items() - other_items0);  //= 1M / 4K*1.5
+    ASSERT_EQ(1024 + 512, allocated_bytes() - other_bytes0); //= 1M / 4K*4*1.5
+
+    // t1 & t2 release everything, then t2 get one less entry than t2 had had
+    // before
+    t1->split(4096, t2);
+    ASSERT_EQ(127, allocated_items() - other_items0);     // = 512K / 4K - 1
+    ASSERT_EQ(127 * 4, allocated_bytes() - other_bytes0); // = 512L / 4K * 4 - 4
+    delete t1;
+    delete t2;
+    ASSERT_EQ(allocated_items(), other_items0);
+    ASSERT_EQ(allocated_bytes(), other_bytes0);
+  }
+}
+
 int main(int argc, char **argv) {
   auto args = argv_to_vec(argc, argv);
   auto cct = global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT,

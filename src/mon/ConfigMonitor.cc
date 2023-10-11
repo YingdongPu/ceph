@@ -191,6 +191,7 @@ bool ConfigMonitor::preprocess_command(MonOpRequestRef op)
     stringstream ss;
     string name;
     cmd_getval(cmdmap, "key", name);
+    name = ConfFile::normalize_key_name(name);
     const Option *opt = g_conf().find_option(name);
     if (!opt) {
       opt = mon.mgrmon()->find_module_option(name);
@@ -263,20 +264,20 @@ bool ConfigMonitor::preprocess_command(MonOpRequestRef op)
     } else {
       f->open_array_section("config");
     }
-    for (auto s : sections) {
-      for (auto& i : s.second->options) {
+    for (auto& [sec_name, section] : sections) {
+      for (auto& [opt_name, masked_opt] : section->options) {
 	if (!f) {
-	  tbl << s.first;
-	  tbl << i.second.mask.to_str();
-	  tbl << Option::level_to_str(i.second.opt->level);
-          tbl << i.first;
-	  tbl << i.second.raw_value;
-	  tbl << (i.second.opt->can_update_at_runtime() ? "" : "*");
+	  tbl << sec_name;
+	  tbl << masked_opt.mask.to_str();
+	  tbl << Option::level_to_str(masked_opt.opt->level);
+          tbl << opt_name;
+	  tbl << masked_opt.raw_value;
+	  tbl << (masked_opt.opt->can_update_at_runtime() ? "" : "*");
 	  tbl << TextTable::endrow;
 	} else {
 	  f->open_object_section("option");
-	  f->dump_string("section", s.first);
-	  i.second.dump(f.get());
+	  f->dump_string("section", sec_name);
+	  masked_opt.dump(f.get());
 	  f->close_section();
 	}
       }
@@ -321,11 +322,13 @@ bool ConfigMonitor::preprocess_command(MonOpRequestRef op)
       &src);
 
     if (cmd_getval(cmdmap, "key", name)) {
+      name = ConfFile::normalize_key_name(name);
       const Option *opt = g_conf().find_option(name);
       if (!opt) {
 	opt = mon.mgrmon()->find_module_option(name);
       }
       if (!opt) {
+        ss << "unrecognized key '" << name << "'";
 	err = -ENOENT;
 	goto reply;
       }
@@ -535,7 +538,8 @@ bool ConfigMonitor::prepare_command(MonOpRequestRef op)
     cmd_getval(cmdmap, "name", name);
     cmd_getval(cmdmap, "value", value);
     cmd_getval(cmdmap, "force", force);
-
+    name = ConfFile::normalize_key_name(name);
+    
     if (prefix == "config set" && !force) {
       const Option *opt = g_conf().find_option(name);
       if (!opt) {
@@ -732,7 +736,7 @@ update:
   mon.kvmon()->propose_pending();
   paxos.unplug();
   force_immediate_propose();
-  wait_for_finished_proposal(
+  wait_for_commit(
     op,
     new Monitor::C_Command(
       mon, op, 0, ss.str(), odata,
@@ -827,6 +831,7 @@ void ConfigMonitor::load_config()
     
     MaskedOption mopt(opt);
     mopt.raw_value = value;
+    mopt.localized_name = name;
     string section_name;
     if (who.size() &&
 	!ConfigMap::parse_mask(who, &section_name, &mopt.mask)) {
@@ -916,6 +921,7 @@ bool ConfigMonitor::refresh_config(MonSession *s)
 
   string device_class;
   if (s->name.is_osd()) {
+    osdmap.crush->get_full_location(s->entity_name.to_str(), &crush_location);
     const char *c = osdmap.crush->get_item_class(s->name.num());
     if (c) {
       device_class = c;

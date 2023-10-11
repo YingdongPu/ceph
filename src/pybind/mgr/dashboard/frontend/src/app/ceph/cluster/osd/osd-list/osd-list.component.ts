@@ -1,5 +1,5 @@
 import { Component, OnInit, TemplateRef, ViewChild } from '@angular/core';
-import { FormControl } from '@angular/forms';
+import { UntypedFormControl } from '@angular/forms';
 import { Router } from '@angular/router';
 
 import { NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
@@ -523,7 +523,7 @@ export class OsdListComponent extends ListWithDetails implements OnInit {
 
   delete() {
     const deleteFormGroup = new CdFormGroup({
-      preserve: new FormControl(false)
+      preserve: new UntypedFormControl(false)
     });
 
     this.showCriticalConfirmationModal(
@@ -580,6 +580,9 @@ export class OsdListComponent extends ListWithDetails implements OnInit {
         bodyContext: {
           safeToPerform: result[checkKey],
           message: result.message,
+          active: result.active,
+          missingStats: result.missing_stats,
+          storedPgs: result.stored_pgs,
           actionDescription: templateItemDescription,
           osdIds: this.getSelectedOsdIds()
         },

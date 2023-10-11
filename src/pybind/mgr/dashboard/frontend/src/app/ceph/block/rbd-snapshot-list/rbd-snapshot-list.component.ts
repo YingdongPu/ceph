@@ -56,6 +56,10 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
   @Input()
   namespace: string;
   @Input()
+  mirroring: string;
+  @Input()
+  primary: boolean;
+  @Input()
   rbdName: string;
   @ViewChild('nameTpl')
   nameTpl: TemplateRef<any>;
@@ -114,7 +118,7 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
         pipe: this.dimlessBinaryPipe
       },
       {
-        name: $localize`Provisioned`,
+        name: $localize`Used`,
         prop: 'disk_usage',
         flexGrow: 1,
         cellClass: 'text-right',
@@ -210,7 +214,10 @@ export class RbdSnapshotListComponent implements OnInit, OnChanges {
   }
 
   private openSnapshotModal(taskName: string, snapName: string = null) {
-    this.modalRef = this.modalService.show(RbdSnapshotFormModalComponent);
+    const modalVariables = {
+      mirroring: this.mirroring
+    };
+    this.modalRef = this.modalService.show(RbdSnapshotFormModalComponent, modalVariables);
     this.modalRef.componentInstance.poolName = this.poolName;
     this.modalRef.componentInstance.imageName = this.rbdName;
     this.modalRef.componentInstance.namespace = this.namespace;

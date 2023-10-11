@@ -70,40 +70,38 @@ struct fltree_onode_manager_test_t
     return tm_teardown();
   }
 
-
-  virtual void _init() final {
-    TMTestState::_init();
-    manager.reset(new FLTreeOnodeManager(*tm));
+  virtual seastar::future<> _init() final {
+    return TMTestState::_init().then([this] {
+      manager.reset(new FLTreeOnodeManager(*tm));
+    });
   }
 
-  virtual void _destroy() final {
+  virtual seastar::future<> _destroy() final {
     manager.reset();
-    TMTestState::_destroy();
+    return TMTestState::_destroy();
   }
 
   virtual FuturizedStore::mkfs_ertr::future<> _mkfs() final {
     return TMTestState::_mkfs(
     ).safe_then([this] {
-      return tm->mount(
-      ).safe_then([this] {
-	return repeat_eagain([this] {
-	  return seastar::do_with(
-	    create_mutate_transaction(),
-	    [this](auto &ref_t) {
-	      return with_trans_intr(*ref_t, [&](auto &t) {
-		return manager->mkfs(t
-		).si_then([this, &t] {
-		  return submit_transaction_fut2(t);
-		});
-	      });
-	  });
-	});
-      }).safe_then([this] {
-	return tm->close();
-      }).handle_error(
-	crimson::ct_error::assert_all{"Invalid error in _mkfs"}
-      );
-    });
+      return restart_fut();
+    }).safe_then([this] {
+      return repeat_eagain([this] {
+        return seastar::do_with(
+          create_mutate_transaction(),
+          [this](auto &ref_t)
+        {
+          return with_trans_intr(*ref_t, [&](auto &t) {
+            return manager->mkfs(t
+            ).si_then([this, &t] {
+              return submit_transaction_fut2(t);
+            });
+          });
+        });
+      });
+    }).handle_error(
+      crimson::ct_error::assert_all{"Invalid error in _mkfs"}
+    );
   }
 
   template <typename F>
@@ -111,7 +109,6 @@ struct fltree_onode_manager_test_t
     auto t = create_mutate_transaction();
     std::invoke(f, *t);
     submit_transaction(std::move(t));
-    segment_cleaner->run_until_halt().get0();
   }
 
   template <typename F>
@@ -123,7 +120,11 @@ struct fltree_onode_manager_test_t
       }).unsafe_get0();
       std::invoke(f, t, *onode, p_kv->value);
       with_trans_intr(t, [&](auto &t) {
-        return manager->write_dirty(t, {onode});
+	if (onode->is_alive()) {
+	  return manager->write_dirty(t, {onode});
+	} else {
+	  return OnodeManager::write_dirty_iertr::now();
+	}
       }).unsafe_get0();
     });
   }
@@ -238,7 +239,7 @@ struct fltree_onode_manager_test_t
   fltree_onode_manager_test_t() {}
 };
 
-TEST_F(fltree_onode_manager_test_t, 1_single)
+TEST_P(fltree_onode_manager_test_t, 1_single)
 {
   run_async([this] {
     uint64_t block_size = tm->get_block_size();
@@ -266,7 +267,7 @@ TEST_F(fltree_onode_manager_test_t, 1_single)
   });
 }
 
-TEST_F(fltree_onode_manager_test_t, 2_synthetic)
+TEST_P(fltree_onode_manager_test_t, 2_synthetic)
 {
   run_async([this] {
     uint64_t block_size = tm->get_block_size();
@@ -318,3 +319,12 @@ TEST_F(fltree_onode_manager_test_t, 2_synthetic)
     validate_list_onodes(pool);
   });
 }
+
+INSTANTIATE_TEST_SUITE_P(
+  fltree_onode__manager_test,
+  fltree_onode_manager_test_t,
+  ::testing::Values (
+    "segmented",
+    "circularbounded"
+  )
+);

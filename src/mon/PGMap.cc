@@ -33,9 +33,9 @@ using std::vector;
 
 using ceph::bufferlist;
 using ceph::fixed_u_to_string;
-
-using TOPNSPC::common::cmd_getval;
-using TOPNSPC::common::cmd_getval_or;
+using ceph::common::cmd_getval;
+using ceph::common::cmd_getval_or;
+using ceph::common::cmd_putval;
 
 MEMPOOL_DEFINE_OBJECT_FACTORY(PGMapDigest, pgmap_digest, pgmap);
 MEMPOOL_DEFINE_OBJECT_FACTORY(PGMap, pgmap, pgmap);
@@ -1212,10 +1212,12 @@ void PGMap::apply_incremental(CephContext *cct, const Incremental& inc)
       stat_osd_sub(t->first, t->second);
       osd_stat.erase(t);
     }
-    for (auto i = pool_statfs.begin();  i != pool_statfs.end(); ++i) {
+    for (auto i = pool_statfs.begin();  i != pool_statfs.end();) {
       if (i->first.second == *p) {
 	pg_pool_sum[i->first.first].sub(i->second);
-	pool_statfs.erase(i);
+	i = pool_statfs.erase(i);
+      } else {
+        ++i;
       }
     }
   }
@@ -1659,6 +1661,7 @@ void PGMap::dump_pg_stats_plain(
     tab.define_column("OMAP_BYTES*", TextTable::LEFT, TextTable::RIGHT);
     tab.define_column("OMAP_KEYS*", TextTable::LEFT, TextTable::RIGHT);
     tab.define_column("LOG", TextTable::LEFT, TextTable::RIGHT);
+    tab.define_column("LOG_DUPS", TextTable::LEFT, TextTable::RIGHT);
     tab.define_column("DISK_LOG", TextTable::LEFT, TextTable::RIGHT);
     tab.define_column("STATE", TextTable::LEFT, TextTable::RIGHT);
     tab.define_column("STATE_STAMP", TextTable::LEFT, TextTable::RIGHT);
@@ -1676,6 +1679,7 @@ void PGMap::dump_pg_stats_plain(
     tab.define_column("LAST_SCRUB_DURATION", TextTable::LEFT, TextTable::RIGHT);
     tab.define_column("SCRUB_SCHEDULING", TextTable::LEFT, TextTable::LEFT);
     tab.define_column("OBJECTS_SCRUBBED", TextTable::LEFT, TextTable::RIGHT);
+    tab.define_column("OBJECTS_TRIMMED", TextTable::LEFT, TextTable::RIGHT);
   }
 
   for (const auto& [pg, st] : pg_stats) {
@@ -1701,6 +1705,7 @@ void PGMap::dump_pg_stats_plain(
           << st.stats.sum.num_omap_bytes
           << st.stats.sum.num_omap_keys
           << st.log_size
+          << st.log_dups_size
           << st.ondisk_log_size
           << pg_state_string(st.state)
           << st.last_change
@@ -1718,6 +1723,7 @@ void PGMap::dump_pg_stats_plain(
           << st.last_scrub_duration
           << st.dump_scrub_schedule()
           << st.objects_scrubbed
+          << st.objects_trimmed
           << TextTable::endrow;
     }
   }
@@ -1935,6 +1941,10 @@ void PGMap::get_stuck_stats(
 	val = i->second.last_unstale;
     }
 
+    if ((types & STUCK_PEERING) && (i->second.state & PG_STATE_PEERING)) {
+      if (i->second.last_peered < val)
+	val = i->second.last_peered;
+    }
     // val is now the earliest any of the requested stuck states began
     if (val < cutoff) {
       stuck_pgs[i->first] = i->second;
@@ -1985,6 +1995,8 @@ int PGMap::dump_stuck_pg_stats(
       stuck_types |= PGMap::STUCK_DEGRADED;
     else if (*i == "stale")
       stuck_types |= PGMap::STUCK_STALE;
+    else if (*i == "peering")
+      stuck_types |= PGMap::STUCK_PEERING;
     else {
       ds << "Unknown type: " << *i << std::endl;
       return -EINVAL;
@@ -2240,6 +2252,7 @@ void PGMap::dump_filtered_pg_stats(ostream& ss, set<pg_t>& pgs) const
   tab.define_column("OMAP_BYTES*", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("OMAP_KEYS*", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("LOG", TextTable::LEFT, TextTable::RIGHT);
+  tab.define_column("LOG_DUPS", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("STATE", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("SINCE", TextTable::LEFT, TextTable::RIGHT);
   tab.define_column("VERSION", TextTable::LEFT, TextTable::RIGHT);
@@ -2269,6 +2282,7 @@ void PGMap::dump_filtered_pg_stats(ostream& ss, set<pg_t>& pgs) const
         << st.stats.sum.num_omap_bytes
         << st.stats.sum.num_omap_keys
         << st.log_size
+        << st.log_dups_size
         << pg_state_string(st.state)
         << utimespan_str(now - st.last_change)
         << st.version
@@ -3331,19 +3345,9 @@ void PGMap::get_health_checks(
     for (auto &it : pools) {
       const pg_pool_t &pool = it.second;
       const string& pool_name = osdmap.get_pool_name(it.first);
-      auto it2 = pg_pool_sum.find(it.first);
-      if (it2 == pg_pool_sum.end()) {
-        continue;
-      }
-      const pool_stat_t *pstat = &it2->second;
-      if (pstat == nullptr) {
-        continue;
-      }
-      const object_stat_sum_t& sum = pstat->stats.sum;
       // application metadata is not encoded until luminous is minimum
       // required release
-      if (sum.num_objects > 0 && pool.application_metadata.empty() &&
-          !pool.is_tier()) {
+      if (pool.application_metadata.empty() && !pool.is_tier()) {
         stringstream ss;
         ss << "application not enabled on pool '" << pool_name << "'";
         detail.push_back(ss.str());
@@ -3844,6 +3848,7 @@ static void _try_mark_pg_stale(
     newstat->state |= PG_STATE_STALE;
     newstat->last_unstale = ceph_clock_now();
   }
+
 }
 
 void PGMapUpdater::check_down_pgs(

@@ -220,8 +220,9 @@ bool rgw_create_s3_canonical_header(const DoutPrefixProvider *dpp,
 
     if (header_time) {
       struct tm t;
-      if (!parse_rfc2616(req_date, &t)) {
-        ldpp_dout(dpp, 0) << "NOTICE: failed to parse date for auth header" << dendl;
+      uint32_t ns = 0;
+      if (!parse_rfc2616(req_date, &t) && !parse_iso8601(req_date, &t, &ns, false)) {
+        ldpp_dout(dpp, 0) << "NOTICE: failed to parse date <" << req_date << "> for auth header" << dendl;
         return false;
       }
       if (t.tm_year < 70) {
@@ -433,9 +434,13 @@ static inline int parse_v4_auth_header(const req_info& info,               /* in
   /* grab date */
 
   const char *d = info.env->get("HTTP_X_AMZ_DATE");
+
   struct tm t;
-  if (!parse_iso8601(d, &t, NULL, false)) {
-    ldpp_dout(dpp, 10) << "error reading date via http_x_amz_date" << dendl;
+  if (unlikely(d == NULL)) {
+    d = info.env->get("HTTP_DATE");
+  }
+  if (!d || !parse_iso8601(d, &t, NULL, false)) {
+    ldpp_dout(dpp, 10) << "error reading date via http_x_amz_date and http_date" << dendl;
     return -EACCES;
   }
   date = d;
@@ -444,8 +449,9 @@ static inline int parse_v4_auth_header(const req_info& info,               /* in
     return -ERR_REQUEST_TIME_SKEWED;
   }
 
-  if (info.env->exists("HTTP_X_AMZ_SECURITY_TOKEN")) {
-    sessiontoken = info.env->get("HTTP_X_AMZ_SECURITY_TOKEN");
+  auto token = info.env->get_optional("HTTP_X_AMZ_SECURITY_TOKEN");
+  if (token) {
+    sessiontoken = *token;
   }
 
   return 0;
@@ -459,7 +465,7 @@ bool is_non_s3_op(RGWOpType op_type)
       op_type == RGW_OP_CREATE_ROLE ||
       op_type == RGW_OP_DELETE_ROLE ||
       op_type == RGW_OP_GET_ROLE ||
-      op_type == RGW_OP_MODIFY_ROLE ||
+      op_type == RGW_OP_MODIFY_ROLE_TRUST_POLICY ||
       op_type == RGW_OP_LIST_ROLES ||
       op_type == RGW_OP_PUT_ROLE_POLICY ||
       op_type == RGW_OP_GET_ROLE_POLICY ||
@@ -479,7 +485,8 @@ bool is_non_s3_op(RGWOpType op_type)
       op_type == RGW_OP_PUBSUB_TOPIC_DELETE ||
       op_type == RGW_OP_TAG_ROLE ||
       op_type == RGW_OP_LIST_ROLE_TAGS ||
-      op_type == RGW_OP_UNTAG_ROLE) {
+      op_type == RGW_OP_UNTAG_ROLE ||
+      op_type == RGW_OP_UPDATE_ROLE) {
     return true;
   }
   return false;
@@ -610,11 +617,12 @@ std::string get_v4_canonical_qs(const req_info& info, const bool using_qs)
 }
 
 static void add_v4_canonical_params_from_map(const map<string, string>& m,
-                                        std::map<string, string> *result)
+                                        std::map<string, string> *result,
+                                        bool is_non_s3_op)
 {
   for (auto& entry : m) {
     const auto& key = entry.first;
-    if (key.empty()) {
+    if (key.empty() || (is_non_s3_op && key == "PayloadHash")) {
       continue;
     }
 
@@ -622,12 +630,12 @@ static void add_v4_canonical_params_from_map(const map<string, string>& m,
   }
 }
 
-std::string gen_v4_canonical_qs(const req_info& info)
+std::string gen_v4_canonical_qs(const req_info& info, bool is_non_s3_op)
 {
   std::map<std::string, std::string> canonical_qs_map;
 
-  add_v4_canonical_params_from_map(info.args.get_params(), &canonical_qs_map);
-  add_v4_canonical_params_from_map(info.args.get_sys_params(), &canonical_qs_map);
+  add_v4_canonical_params_from_map(info.args.get_params(), &canonical_qs_map, is_non_s3_op);
+  add_v4_canonical_params_from_map(info.args.get_sys_params(), &canonical_qs_map, false);
 
   if (canonical_qs_map.empty()) {
     return string();
@@ -649,6 +657,35 @@ std::string gen_v4_canonical_qs(const req_info& info)
   }
 
   return canonical_qs;
+}
+
+std::string get_v4_canonical_method(const req_state* s)
+{
+  /* If this is a OPTIONS request we need to compute the v4 signature for the
+   * intended HTTP method and not the OPTIONS request itself. */
+  if (s->op_type == RGW_OP_OPTIONS_CORS) {
+    const char *cors_method = s->info.env->get("HTTP_ACCESS_CONTROL_REQUEST_METHOD");
+
+    if (cors_method) {
+      /* Validate request method passed in access-control-request-method is valid. */
+      auto cors_flags = get_cors_method_flags(cors_method);
+      if (!cors_flags) {
+          ldpp_dout(s, 1) << "invalid access-control-request-method header = "
+                          << cors_method << dendl;
+          throw -EINVAL;
+      }
+
+      ldpp_dout(s, 10) << "canonical req method = " << cors_method
+                       << ", due to access-control-request-method header" << dendl;
+      return cors_method;
+    } else {
+      ldpp_dout(s, 1) << "invalid http options req missing "
+                      << "access-control-request-method header" << dendl;
+      throw -EINVAL;
+    }
+  }
+
+  return s->info.method;
 }
 
 boost::optional<std::string>
@@ -1104,7 +1141,7 @@ bool AWSv4ComplMulti::is_signature_mismatched()
   }
 }
 
-size_t AWSv4ComplMulti::recv_body(char* const buf, const size_t buf_max)
+size_t AWSv4ComplMulti::recv_chunk(char* const buf, const size_t buf_max, bool& eof)
 {
   /* Buffer stores only parsed stream. Raw values reflect the stream
    * we're getting from a client. */
@@ -1129,6 +1166,7 @@ size_t AWSv4ComplMulti::recv_body(char* const buf, const size_t buf_max)
                                                    to_extract);
       parsing_buf.resize(parsing_buf.size() - (to_extract - received));
       if (received == 0) {
+        eof = true;
         break;
       }
 
@@ -1178,6 +1216,7 @@ size_t AWSv4ComplMulti::recv_body(char* const buf, const size_t buf_max)
     dout(30) << "AWSv4ComplMulti: to_extract=" << to_extract << ", received=" << received << dendl;
 
     if (received == 0) {
+      eof = true;
       break;
     }
 
@@ -1190,6 +1229,19 @@ size_t AWSv4ComplMulti::recv_body(char* const buf, const size_t buf_max)
 
   dout(20) << "AWSv4ComplMulti: filled=" << buf_pos << dendl;
   return buf_pos;
+}
+
+size_t AWSv4ComplMulti::recv_body(char* const buf, const size_t buf_max)
+{
+  bool eof = false;
+  size_t total = 0;
+
+  while (total < buf_max && !eof) {
+    const size_t received = recv_chunk(buf + total, buf_max - total, eof);
+    total += received;
+  }
+  dout(20) << "AWSv4ComplMulti: received=" << total << dendl;
+  return total;
 }
 
 void AWSv4ComplMulti::modify_request_state(const DoutPrefixProvider* dpp, req_state* const s_rw)

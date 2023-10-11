@@ -6,6 +6,7 @@ set of utilities for interacting with LVM.
 import logging
 import os
 import uuid
+import re
 from itertools import repeat
 from math import floor
 from ceph_volume import process, util, conf
@@ -785,6 +786,17 @@ def get_device_vgs(device, name_prefix=''):
     return [VolumeGroup(**vg) for vg in vgs if vg['vg_name'] and vg['vg_name'].startswith(name_prefix)]
 
 
+def get_all_devices_vgs(name_prefix=''):
+    vg_fields = f'pv_name,{VG_FIELDS}'
+    cmd = ['pvs'] + VG_CMD_OPTIONS + ['-o', vg_fields]
+    stdout, stderr, returncode = process.call(
+        cmd,
+        run_on_host=True,
+        verbose_on_failure=False
+    )
+    vgs = _output_parser(stdout, vg_fields)
+    return [VolumeGroup(**vg) for vg in vgs if vg['vg_name']]
+
 #################################
 #
 # Code for LVM Logical Volumes
@@ -1007,7 +1019,6 @@ def create_lv(name_prefix,
     # be so this function will set it after creation using the mapping
     # XXX add CEPH_VOLUME_LVM_DEBUG to enable -vvvv on lv operations
     type_path_tag = {
-        'journal': 'ceph.journal_device',
         'data': 'ceph.data_device',
         'block': 'ceph.block_device',
         'wal': 'ceph.wal_device',
@@ -1199,3 +1210,39 @@ def get_lv_by_fullname(full_name):
     except ValueError:
         res_lv = None
     return res_lv
+
+def get_lv_path_from_mapper(mapper):
+    """
+    This functions translates a given mapper device under the format:
+    /dev/mapper/LV to the format /dev/VG/LV.
+    eg:
+    from:
+    /dev/mapper/ceph--c1a97e46--234c--46aa--a549--3ca1d1f356a9-osd--block--32e8e896--172e--4a38--a06a--3702598510ec
+    to:
+    /dev/ceph-c1a97e46-234c-46aa-a549-3ca1d1f356a9/osd-block-32e8e896-172e-4a38-a06a-3702598510ec
+    """
+    results = re.split(r'^\/dev\/mapper\/(.+\w)-(\w.+)', mapper)
+    results = list(filter(None, results))
+
+    if len(results) != 2:
+        return None
+
+    return f"/dev/{results[0].replace('--', '-')}/{results[1].replace('--', '-')}"
+
+def get_mapper_from_lv_path(lv_path):
+    """
+    This functions translates a given lv path under the format:
+    /dev/VG/LV to the format /dev/mapper/LV.
+    eg:
+    from:
+    /dev/ceph-c1a97e46-234c-46aa-a549-3ca1d1f356a9/osd-block-32e8e896-172e-4a38-a06a-3702598510ec
+    to:
+    /dev/mapper/ceph--c1a97e46--234c--46aa--a549--3ca1d1f356a9-osd--block--32e8e896--172e--4a38--a06a--3702598510ec
+    """
+    results = re.split(r'^\/dev\/(.+\w)-(\w.+)', lv_path)
+    results = list(filter(None, results))
+
+    if len(results) != 2:
+        return None
+
+    return f"/dev/mapper/{results[0].replace('-', '--')}/{results[1].replace('-', '--')}"

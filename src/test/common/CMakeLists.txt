@@ -294,13 +294,18 @@ add_executable(unittest_perf_histogram
 add_ceph_unittest(unittest_perf_histogram)
 target_link_libraries(unittest_perf_histogram ceph-common)
 
+# unittest_perf_cache_key
+add_executable(unittest_perf_counters_key test_perf_counters_key.cc)
+add_ceph_unittest(unittest_perf_counters_key)
+target_link_libraries(unittest_perf_counters_key ceph-common)
+
 # unittest_global_doublefree
 if(WITH_CEPHFS)
   add_executable(unittest_global_doublefree
     test_global_doublefree.cc
     )
   add_ceph_unittest(unittest_global_doublefree)
-  target_link_libraries(unittest_global_doublefree cephfs librados)
+  target_link_libraries(unittest_global_doublefree cephfs librados ceph-common)
 endif(WITH_CEPHFS)
 
 if(NOT WIN32)
@@ -311,12 +316,16 @@ target_link_libraries(unittest_dns_resolve global)
 add_ceph_unittest(unittest_dns_resolve)
 endif()
 
+# We're getting an ICE when trying to compile this test using mingw-gcc and
+# recent Boost versions. Note that mingw-llvm works fine.
+if (NOT WIN32 OR (NOT(CMAKE_CXX_COMPILER_ID STREQUAL GNU)))
 add_executable(unittest_back_trace
   test_back_trace.cc)
 set_source_files_properties(test_back_trace.cc PROPERTIES
   COMPILE_FLAGS -fno-inline)
 add_ceph_unittest(unittest_back_trace)
 target_link_libraries(unittest_back_trace ceph-common)
+endif()
 
 add_executable(unittest_hostname
     test_hostname.cc)
@@ -363,10 +372,16 @@ add_ceph_unittest(unittest_cdc)
 
 add_executable(unittest_ceph_timer test_ceph_timer.cc)
 add_ceph_unittest(unittest_ceph_timer)
+target_link_libraries(unittest_ceph_timer global ceph-common)
 
 add_executable(unittest_option test_option.cc)
 target_link_libraries(unittest_option ceph-common GTest::Main)
 add_ceph_unittest(unittest_option)
+
+add_executable(unittest_fault_injector test_fault_injector.cc
+  $<TARGET_OBJECTS:unit-main>)
+target_link_libraries(unittest_fault_injector global)
+add_ceph_unittest(unittest_fault_injector)
 
 add_executable(unittest_blocked_completion test_blocked_completion.cc)
 add_ceph_unittest(unittest_blocked_completion)

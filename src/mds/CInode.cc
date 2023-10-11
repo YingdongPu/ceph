@@ -131,7 +131,7 @@ std::string_view CInode::pin_name(int p) const
 }
 
 //int cinode_pins[CINODE_NUM_PINS];  // counts
-ostream& CInode::print_db_line_prefix(ostream& out)
+ostream& CInode::print_db_line_prefix(ostream& out) const
 {
   return out << ceph_clock_now() << " mds." << mdcache->mds->get_nodeid() << ".cache.ino(" << ino() << ") ";
 }
@@ -338,7 +338,7 @@ CInode::CInode(MDCache *c, bool auth, snapid_t f, snapid_t l) :
     state_set(STATE_AUTH);
 }
 
-void CInode::print(ostream& out)
+void CInode::print(ostream& out) const
 {
   out << *this;
 }
@@ -523,6 +523,10 @@ sr_t *CInode::prepare_new_srnode(snapid_t snapid)
     new_srnode->seq = snapid;
     new_srnode->created = snapid;
     new_srnode->current_parent_since = get_oldest_snap();
+    SnapRealm *sr = find_snaprealm();
+    dout(20) << __func__ << ": inheriting change_attr from " << *sr
+             << dendl;
+    new_srnode->change_attr = sr->srnode.change_attr;
   }
   return new_srnode;
 }
@@ -1667,12 +1671,13 @@ void CInode::set_object_info(MDSCacheObjectInfo &info)
 
 void CInode::encode_lock_iauth(bufferlist& bl)
 {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   encode(get_inode()->version, bl);
   encode(get_inode()->ctime, bl);
   encode(get_inode()->mode, bl);
   encode(get_inode()->uid, bl);
-  encode(get_inode()->gid, bl);  
+  encode(get_inode()->gid, bl);
+  encode(get_inode()->fscrypt_auth, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -1680,7 +1685,7 @@ void CInode::decode_lock_iauth(bufferlist::const_iterator& p)
 {
   ceph_assert(!is_auth());
   auto _inode = allocate_inode(*get_inode());
-  DECODE_START(1, p);
+  DECODE_START(2, p);
   decode(_inode->version, p);
   utime_t tm;
   decode(tm, p);
@@ -1688,6 +1693,8 @@ void CInode::decode_lock_iauth(bufferlist::const_iterator& p)
   decode(_inode->mode, p);
   decode(_inode->uid, p);
   decode(_inode->gid, p);
+  if (struct_v >= 2)
+    decode(_inode->fscrypt_auth, p);
   DECODE_FINISH(p);
   reset_inode(std::move(_inode));
 }
@@ -1799,26 +1806,26 @@ void CInode::decode_lock_idft(bufferlist::const_iterator& p)
 
 void CInode::encode_lock_ifile(bufferlist& bl)
 {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   if (is_auth()) {
-    encode(get_inode()->version, bl); 
-    encode(get_inode()->ctime, bl); 
-    encode(get_inode()->mtime, bl); 
-    encode(get_inode()->atime, bl); 
-    encode(get_inode()->time_warp_seq, bl); 
+    encode(get_inode()->version, bl);
+    encode(get_inode()->ctime, bl);
+    encode(get_inode()->mtime, bl);
+    encode(get_inode()->atime, bl);
+    encode(get_inode()->time_warp_seq, bl);
     if (!is_dir()) {
       encode(get_inode()->layout, bl, mdcache->mds->mdsmap->get_up_features());
-      encode(get_inode()->size, bl); 
-      encode(get_inode()->truncate_seq, bl); 
-      encode(get_inode()->truncate_size, bl); 
-      encode(get_inode()->client_ranges, bl); 
-      encode(get_inode()->inline_data, bl); 
-    }    
+      encode(get_inode()->size, bl);
+      encode(get_inode()->truncate_seq, bl);
+      encode(get_inode()->truncate_size, bl);
+      encode(get_inode()->client_ranges, bl);
+      encode(get_inode()->inline_data, bl);
+    }
   } else {
     // treat flushing as dirty when rejoining cache
     bool dirty = filelock.is_dirty_or_flushing();
-    encode(dirty, bl); 
-  }    
+    encode(dirty, bl);
+  }
   dout(15) << __func__ << " inode.dirstat is " << get_inode()->dirstat << dendl;
   encode(get_inode()->dirstat, bl);  // only meaningful if i am auth.
   bufferlist tmp;
@@ -1840,6 +1847,8 @@ void CInode::encode_lock_ifile(bufferlist& bl)
   }
   encode(n, bl);
   bl.claim_append(tmp);
+  if (is_auth())
+    encode(get_inode()->fscrypt_file, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -1847,7 +1856,7 @@ void CInode::decode_lock_ifile(bufferlist::const_iterator& p)
 {
   inode_ptr _inode;
 
-  DECODE_START(1, p);
+  DECODE_START(2, p);
   if (!is_auth()) {
     _inode = allocate_inode(*get_inode());
 
@@ -1922,6 +1931,8 @@ void CInode::decode_lock_ifile(bufferlist::const_iterator& p)
       }
     }
   }
+  if (!is_auth() && struct_v >= 2)
+    decode(_inode->fscrypt_file, p);
   DECODE_FINISH(p);
 
   if (_inode)
@@ -2037,10 +2048,11 @@ void CInode::decode_lock_inest(bufferlist::const_iterator& p)
 
 void CInode::encode_lock_ixattr(bufferlist& bl)
 {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   encode(get_inode()->version, bl);
   encode(get_inode()->ctime, bl);
   encode_xattrs(bl);
+  encode(get_inode()->xattr_version, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -2048,13 +2060,16 @@ void CInode::decode_lock_ixattr(bufferlist::const_iterator& p)
 {
   ceph_assert(!is_auth());
   auto _inode = allocate_inode(*get_inode());
-  DECODE_START(1, p);
+  DECODE_START(2, p);
   decode(_inode->version, p);
   utime_t tm;
   decode(tm, p);
   if (_inode->ctime < tm)
     _inode->ctime = tm;
   decode_xattrs(p);
+  if (struct_v >= 2) {
+    decode(_inode->xattr_version, p);
+  }
   DECODE_FINISH(p);
   reset_inode(std::move(_inode));
 }
@@ -2201,7 +2216,6 @@ void CInode::decode_lock_state(int type, const bufferlist& bl)
   auto p = bl.cbegin();
 
   DECODE_START(1, p);
-  utime_t tm;
 
   snapid_t newfirst;
   using ceph::decode;
@@ -2395,7 +2409,6 @@ void CInode::finish_scatter_update(ScatterLock *lock, CDir *dir,
       }
 	
       EUpdate *le = new EUpdate(mdlog, ename);
-      mdlog->start_entry(le);
       le->metablob.add_dir_context(dir);
       le->metablob.add_dir(dir, true);
       
@@ -2532,7 +2545,8 @@ void CInode::finish_scatter_gather_update(int type, MutationRef& mut)
       if (touched_mtime)
 	pi->mtime = pi->ctime = pi->dirstat.mtime;
       if (touched_chattr)
-	pi->change_attr = pi->dirstat.change_attr;
+	pi->change_attr++;
+
       dout(20) << " final dirstat " << pi->dirstat << dendl;
 
       if (dirstat_valid && !dirstat.same_sums(pi->dirstat)) {
@@ -3042,6 +3056,7 @@ const CInode::mempool_old_inode& CInode::cow_old_inode(snapid_t follows, bool co
 void CInode::pre_cow_old_inode()
 {
   snapid_t follows = mdcache->get_global_snaprealm()->get_newest_seq();
+  dout(20) << __func__ << " follows " << follows << " on " << *this << dendl;
   if (first <= follows)
     cow_old_inode(follows, true);
 }
@@ -3788,7 +3803,9 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
   dout(20) << " pfile " << pfile << " pauth " << pauth
 	   << " plink " << plink << " pxattr " << pxattr
 	   << " plocal " << plocal
+	   << " mtime " << any_i->mtime
 	   << " ctime " << any_i->ctime
+	   << " change_attr " << any_i->change_attr
 	   << " valid=" << valid << dendl;
 
   // file
@@ -4010,7 +4027,7 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
    * note: encoding matches MClientReply::InodeStat
    */
   if (session->info.has_feature(CEPHFS_FEATURE_REPLY_ENCODING)) {
-    ENCODE_START(6, 1, bl);
+    ENCODE_START(7, 1, bl);
     encode(oi->ino, bl);
     encode(snapid, bl);
     encode(oi->rdev, bl);
@@ -4055,7 +4072,9 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
     encode(snap_btime, bl);
     encode(file_i->rstat.rsnaps, bl);
     encode(snap_metadata, bl);
-    encode(file_i->fscrypt, bl);
+    encode(!file_i->fscrypt_auth.empty(), bl);
+    encode(file_i->fscrypt_auth, bl);
+    encode(file_i->fscrypt_file, bl);
     ENCODE_FINISH(bl);
   }
   else {
@@ -4134,13 +4153,15 @@ void CInode::encode_cap_message(const ref_t<MClientCaps> &m, Capability *cap)
 
   dout(20) << __func__ << " pfile " << pfile
 	   << " pauth " << pauth << " plink " << plink << " pxattr " << pxattr
-	   << " ctime " << i->ctime << dendl;
+	   << " mtime " << i->mtime << " ctime " << i->ctime << " change_attr " << i->change_attr << dendl;
 
   i = pfile ? pi:oi;
   m->set_layout(i->layout);
   m->size = i->size;
   m->truncate_seq = i->truncate_seq;
   m->truncate_size = i->truncate_size;
+  m->fscrypt_file = i->fscrypt_file;
+  m->fscrypt_auth = i->fscrypt_auth;
   m->mtime = i->mtime;
   m->atime = i->atime;
   m->ctime = i->ctime;
@@ -4699,6 +4720,10 @@ void CInode::validate_disk_state(CInode::validated_data *results,
         results->backtrace.error_str << "failed to read off disk; see retval";
         // we probably have a new unwritten file!
         // so skip the backtrace scrub for this entry and say that all's well
+        if (in->is_mdsdir()){
+          dout(20) << "forcing backtrace as passed since mdsdir actually doesn't have backtrace" << dendl;
+          results->backtrace.passed = true;
+        }
         if (in->is_dirty_parent()) {
           dout(20) << "forcing backtrace as passed since inode is dirty parent" << dendl;
           results->backtrace.passed = true;
@@ -5139,6 +5164,11 @@ void CInode::dump(Formatter *f, int flags) const
     }
     f->close_section();
   }
+
+  auto realm = find_snaprealm();
+  inodeno_t subvol_ino = realm->get_subvolume_ino();
+  bool is_subvol = (subvol_ino && subvol_ino == ino());
+  f->dump_bool("is_subvolume", is_subvol);
 }
 
 /****** Scrub Stuff *****/

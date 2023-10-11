@@ -25,6 +25,7 @@ struct MetaSession {
   uint64_t cap_renew_seq = 0;
   entity_addrvec_t addrs;
   feature_bitset_t mds_features;
+  feature_bitset_t mds_metric_flags;
 
   enum {
     STATE_NEW, // Unused
@@ -60,6 +61,13 @@ struct MetaSession {
 
   MetaSession(mds_rank_t mds_num, ConnectionRef con, const entity_addrvec_t& addrs)
     : mds_num(mds_num), con(con), addrs(addrs) {
+  }
+  ~MetaSession() {
+    ceph_assert(caps.empty());
+    ceph_assert(dirty_list.empty());
+    ceph_assert(flushing_caps.empty());
+    ceph_assert(requests.empty());
+    ceph_assert(unsafe_requests.empty());
   }
 
   xlist<Inode*> &get_dirty_list() { return dirty_list; }

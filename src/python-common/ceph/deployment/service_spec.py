@@ -1,12 +1,26 @@
 import fnmatch
+import os
 import re
 import enum
 from collections import OrderedDict
 from contextlib import contextmanager
 from functools import wraps
 from ipaddress import ip_network, ip_address
-from typing import Optional, Dict, Any, List, Union, Callable, Iterable, Type, TypeVar, cast, \
-    NamedTuple, Mapping, Iterator
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import yaml
 
@@ -314,28 +328,34 @@ class PlacementSpec(object):
         # type: (Optional[str]) -> PlacementSpec
         """
         A single integer is parsed as a count:
+
         >>> PlacementSpec.from_string('3')
         PlacementSpec(count=3)
 
         A list of names is parsed as host specifications:
+
         >>> PlacementSpec.from_string('host1 host2')
         PlacementSpec(hosts=[HostPlacementSpec(hostname='host1', network='', name=''), HostPlacemen\
 tSpec(hostname='host2', network='', name='')])
 
         You can also prefix the hosts with a count as follows:
+
         >>> PlacementSpec.from_string('2 host1 host2')
         PlacementSpec(count=2, hosts=[HostPlacementSpec(hostname='host1', network='', name=''), Hos\
 tPlacementSpec(hostname='host2', network='', name='')])
 
-        You can spefify labels using `label:<label>`
+        You can specify labels using `label:<label>`
+
         >>> PlacementSpec.from_string('label:mon')
         PlacementSpec(label='mon')
 
-        Labels als support a count:
+        Labels also support a count:
+
         >>> PlacementSpec.from_string('3 label:mon')
         PlacementSpec(count=3, label='mon')
 
         fnmatch is also supported:
+
         >>> PlacementSpec.from_string('data[1-3]')
         PlacementSpec(host_pattern='data[1-3]')
 
@@ -414,6 +434,58 @@ tPlacementSpec(hostname='host2', network='', name='')])
 _service_spec_from_json_validate = True
 
 
+class CustomConfig:
+    """
+    Class to specify custom config files to be mounted in daemon's container
+    """
+
+    _fields = ['content', 'mount_path']
+
+    def __init__(self, content: str, mount_path: str) -> None:
+        self.content: str = content
+        self.mount_path: str = mount_path
+        self.validate()
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            'content': self.content,
+            'mount_path': self.mount_path,
+        }
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any]) -> "CustomConfig":
+        for k in cls._fields:
+            if k not in data:
+                raise SpecValidationError(f'CustomConfig must have "{k}" field')
+        for k in data.keys():
+            if k not in cls._fields:
+                raise SpecValidationError(f'CustomConfig got unknown field "{k}"')
+        return cls(**data)
+
+    @property
+    def filename(self) -> str:
+        return os.path.basename(self.mount_path)
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, CustomConfig):
+            return (
+                self.content == other.content
+                and self.mount_path == other.mount_path
+            )
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f'CustomConfig({self.mount_path})'
+
+    def validate(self) -> None:
+        if not isinstance(self.content, str):
+            raise SpecValidationError(
+                    f'CustomConfig content must be a string. Got {type(self.content)}')
+        if not isinstance(self.mount_path, str):
+            raise SpecValidationError(
+                    f'CustomConfig content must be a string. Got {type(self.mount_path)}')
+
+
 @contextmanager
 def service_spec_allow_invalid_from_json() -> Iterator[None]:
     """
@@ -427,20 +499,147 @@ def service_spec_allow_invalid_from_json() -> Iterator[None]:
     _service_spec_from_json_validate = True
 
 
+class ArgumentSpec:
+    """The ArgumentSpec type represents an argument that can be
+    passed to an underyling subsystem, like a container engine or
+    another command line tool.
+
+    The ArgumentSpec aims to be backwards compatible with the previous
+    form of argument, a single string. The string was always assumed
+    to be indentended to be split on spaces. For example:
+    `--cpus 8` becomes `["--cpus", "8"]`. This type is converted from
+    either a string or an json/yaml object. In the object form you
+    can choose if the string part should be split so an argument like
+    `--migrate-from=//192.168.5.22/My Documents` can be expressed.
+    """
+    _fields = ['argument', 'split']
+
+    class OriginalType(enum.Enum):
+        OBJECT = 0
+        STRING = 1
+
+    def __init__(
+        self,
+        argument: str,
+        split: bool = False,
+        *,
+        origin: OriginalType = OriginalType.OBJECT,
+    ) -> None:
+        self.argument = argument
+        self.split = bool(split)
+        # origin helps with round-tripping between inputs that
+        # are simple strings or objects (dicts)
+        self._origin = origin
+        self.validate()
+
+    def to_json(self) -> Union[str, Dict[str, Any]]:
+        """Return a json-safe represenation of the ArgumentSpec."""
+        if self._origin == self.OriginalType.STRING:
+            return self.argument
+        return {
+            'argument': self.argument,
+            'split': self.split,
+        }
+
+    def to_args(self) -> List[str]:
+        """Convert this ArgumentSpec into a list of arguments suitable for
+        adding to an argv-style command line.
+        """
+        if not self.split:
+            return [self.argument]
+        return [part for part in self.argument.split(" ") if part]
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, ArgumentSpec):
+            return (
+                self.argument == other.argument
+                and self.split == other.split
+            )
+        if isinstance(other, object):
+            # This is a workaround for silly ceph mgr object/type identity
+            # mismatches due to multiple python interpreters in use.
+            try:
+                argument = getattr(other, 'argument')
+                split = getattr(other, 'split')
+                return (self.argument == argument and self.split == split)
+            except AttributeError:
+                pass
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f'ArgumentSpec({self.argument!r}, {self.split!r})'
+
+    def validate(self) -> None:
+        if not isinstance(self.argument, str):
+            raise SpecValidationError(
+                    f'ArgumentSpec argument must be a string. Got {type(self.argument)}')
+        if not isinstance(self.split, bool):
+            raise SpecValidationError(
+                    f'ArgumentSpec split must be a boolean. Got {type(self.split)}')
+
+    @classmethod
+    def from_json(cls, data: Union[str, Dict[str, Any]]) -> "ArgumentSpec":
+        """Convert a json-object (dict) to an ArgumentSpec."""
+        if isinstance(data, str):
+            return cls(data, split=True, origin=cls.OriginalType.STRING)
+        if 'argument' not in data:
+            raise SpecValidationError(f'ArgumentSpec must have an "argument" field')
+        for k in data.keys():
+            if k not in cls._fields:
+                raise SpecValidationError(f'ArgumentSpec got an unknown field {k!r}')
+        return cls(**data)
+
+    @staticmethod
+    def map_json(
+        values: Optional["ArgumentList"]
+    ) -> Optional[List[Union[str, Dict[str, Any]]]]:
+        """Given a list of ArgumentSpec objects return a json-safe
+        representation.of them."""
+        if values is None:
+            return None
+        return [v.to_json() for v in values]
+
+    @classmethod
+    def from_general_args(cls, data: "GeneralArgList") -> "ArgumentList":
+        """Convert a list of strs, dicts, or existing ArgumentSpec objects
+        to a list of only ArgumentSpec objects.
+        """
+        out: ArgumentList = []
+        for item in data:
+            if isinstance(item, (str, dict)):
+                out.append(cls.from_json(item))
+            elif isinstance(item, cls):
+                out.append(item)
+            elif hasattr(item, 'to_json'):
+                # This is a workaround for silly ceph mgr object/type identity
+                # mismatches due to multiple python interpreters in use.
+                # It should be safe because we already have to be able to
+                # round-trip between json/yaml.
+                out.append(cls.from_json(item.to_json()))
+            else:
+                raise SpecValidationError(f"Unknown type for argument: {type(item)}")
+        return out
+
+
+ArgumentList = List[ArgumentSpec]
+GeneralArgList = List[Union[str, Dict[str, Any], "ArgumentSpec"]]
+
+
 class ServiceSpec(object):
     """
     Details of service creation.
 
     Request to the orchestrator for a cluster of daemons
-    such as MDS, RGW, iscsi gateway, MONs, MGRs, Prometheus
+    such as MDS, RGW, iscsi gateway, nvmeof gateway, MONs, MGRs, Prometheus
 
     This structure is supposed to be enough information to
     start the services.
     """
-    KNOWN_SERVICE_TYPES = 'alertmanager crash grafana iscsi mds mgr mon nfs ' \
-                          'node-exporter osd prometheus rbd-mirror rgw agent ' \
-                          'container ingress cephfs-mirror snmp-gateway'.split()
-    REQUIRES_SERVICE_ID = 'iscsi mds nfs rgw container ingress '.split()
+    KNOWN_SERVICE_TYPES = 'alertmanager crash grafana iscsi nvmeof loki promtail mds mgr mon nfs ' \
+                          'node-exporter osd prometheus rbd-mirror rgw agent ceph-exporter ' \
+                          'container ingress cephfs-mirror snmp-gateway jaeger-tracing ' \
+                          'elasticsearch jaeger-agent jaeger-collector jaeger-query'.split()
+    REQUIRES_SERVICE_ID = 'iscsi nvmeof mds nfs rgw container ingress '.split()
     MANAGED_CONFIG_OPTIONS = [
         'mds_join_fs',
     ]
@@ -450,17 +649,28 @@ class ServiceSpec(object):
         from ceph.deployment.drive_group import DriveGroupSpec
 
         ret = {
+            'mon': MONSpec,
             'rgw': RGWSpec,
             'nfs': NFSServiceSpec,
             'osd': DriveGroupSpec,
+            'mds': MDSSpec,
             'iscsi': IscsiServiceSpec,
+            'nvmeof': NvmeofServiceSpec,
             'alertmanager': AlertManagerSpec,
             'ingress': IngressSpec,
             'container': CustomContainerSpec,
             'grafana': GrafanaSpec,
             'node-exporter': MonitoringSpec,
-            'prometheus': MonitoringSpec,
+            'ceph-exporter': CephExporterSpec,
+            'prometheus': PrometheusSpec,
+            'loki': MonitoringSpec,
+            'promtail': MonitoringSpec,
             'snmp-gateway': SNMPGatewaySpec,
+            'elasticsearch': TracingSpec,
+            'jaeger-agent': TracingSpec,
+            'jaeger-collector': TracingSpec,
+            'jaeger-query': TracingSpec,
+            'jaeger-tracing': TracingSpec,
         }.get(service_type, cls)
         if ret == ServiceSpec and not service_type:
             raise SpecValidationError('Spec needs a "service_type" key.')
@@ -490,7 +700,9 @@ class ServiceSpec(object):
                  unmanaged: bool = False,
                  preview_only: bool = False,
                  networks: Optional[List[str]] = None,
-                 extra_container_args: Optional[List[str]] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
 
         #: See :ref:`orchestrator-cli-placement-spec`.
@@ -504,8 +716,8 @@ class ServiceSpec(object):
         #: ``prometheus``) or (``container``) for custom containers.
         self.service_type = service_type
 
-        #: The name of the service. Required for ``iscsi``, ``mds``, ``nfs``, ``osd``, ``rgw``,
-        #: ``container``, ``ingress``
+        #: The name of the service. Required for ``iscsi``, ``nvmeof``, ``mds``, ``nfs``, ``osd``,
+        #: ``rgw``, ``container``, ``ingress``
         self.service_id = None
 
         if self.service_type in self.REQUIRES_SERVICE_ID or self.service_type == 'osd':
@@ -529,7 +741,26 @@ class ServiceSpec(object):
         if config:
             self.config = {k.replace(' ', '_'): v for k, v in config.items()}
 
-        self.extra_container_args: Optional[List[str]] = extra_container_args
+        self.extra_container_args: Optional[ArgumentList] = None
+        self.extra_entrypoint_args: Optional[ArgumentList] = None
+        if extra_container_args:
+            self.extra_container_args = ArgumentSpec.from_general_args(
+                extra_container_args)
+        if extra_entrypoint_args:
+            self.extra_entrypoint_args = ArgumentSpec.from_general_args(
+                extra_entrypoint_args)
+        self.custom_configs: Optional[List[CustomConfig]] = custom_configs
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if value is not None and name in ('extra_container_args', 'extra_entrypoint_args'):
+            for v in value:
+                tname = str(type(v))
+                if 'ArgumentSpec' not in tname:
+                    raise TypeError(
+                        f"{name} is not all ArgumentSpec values:"
+                        f" {v!r}(is {type(v)} in {value!r}")
+
+        super().__setattr__(name, value)
 
     @classmethod
     @handle_type_error
@@ -566,7 +797,7 @@ class ServiceSpec(object):
         understanding of what fields are special for a give service type.
 
         Note, we'll need to stay compatible with both versions for the
-        the next two major releases (octoups, pacific).
+        the next two major releases (octopus, pacific).
 
         :param json_spec: A valid dict with ServiceSpec
 
@@ -617,6 +848,8 @@ class ServiceSpec(object):
         for k, v in json_spec.items():
             if k == 'placement':
                 v = PlacementSpec.from_json(v)
+            if k == 'custom_configs':
+                v = [CustomConfig.from_json(c) for c in v]
             if k == 'spec':
                 args.update(v)
                 continue
@@ -654,7 +887,15 @@ class ServiceSpec(object):
         if self.networks:
             ret['networks'] = self.networks
         if self.extra_container_args:
-            ret['extra_container_args'] = self.extra_container_args
+            ret['extra_container_args'] = ArgumentSpec.map_json(
+                self.extra_container_args
+            )
+        if self.extra_entrypoint_args:
+            ret['extra_entrypoint_args'] = ArgumentSpec.map_json(
+                self.extra_entrypoint_args
+            )
+        if self.custom_configs:
+            ret['custom_configs'] = [c.to_json() for c in self.custom_configs]
 
         c = {}
         for key, val in sorted(self.__dict__.items(), key=lambda tpl: tpl[0]):
@@ -680,7 +921,7 @@ class ServiceSpec(object):
                         f'Service of type \'{self.service_type}\' should not contain a service id')
 
         if self.service_id:
-            if not re.match('^[a-zA-Z0-9_.-]+$', self.service_id):
+            if not re.match('^[a-zA-Z0-9_.-]+$', str(self.service_id)):
                 raise SpecValidationError('Service id contains invalid characters, '
                                           'only [a-zA-Z0-9_.-] allowed')
 
@@ -730,14 +971,22 @@ class NFSServiceSpec(ServiceSpec):
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
                  port: Optional[int] = None,
+                 virtual_ip: Optional[str] = None,
+                 enable_haproxy_protocol: bool = False,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'nfs'
         super(NFSServiceSpec, self).__init__(
             'nfs', service_id=service_id,
             placement=placement, unmanaged=unmanaged, preview_only=preview_only,
-            config=config, networks=networks)
+            config=config, networks=networks, extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args, custom_configs=custom_configs)
 
         self.port = port
+        self.virtual_ip = virtual_ip
+        self.enable_haproxy_protocol = enable_haproxy_protocol
 
     def get_port_start(self) -> List[int]:
         if self.port:
@@ -762,6 +1011,7 @@ class RGWSpec(ServiceSpec):
         service_id: myrealm.myzone
         spec:
             rgw_realm: myrealm
+            rgw_zonegroup: myzonegroup
             rgw_zone: myzone
             ssl: true
             rgw_frontend_port: 1234
@@ -774,6 +1024,7 @@ class RGWSpec(ServiceSpec):
     MANAGED_CONFIG_OPTIONS = ServiceSpec.MANAGED_CONFIG_OPTIONS + [
         'rgw_zone',
         'rgw_realm',
+        'rgw_zonegroup',
         'rgw_frontends',
     ]
 
@@ -782,16 +1033,24 @@ class RGWSpec(ServiceSpec):
                  service_id: Optional[str] = None,
                  placement: Optional[PlacementSpec] = None,
                  rgw_realm: Optional[str] = None,
+                 rgw_zonegroup: Optional[str] = None,
                  rgw_zone: Optional[str] = None,
                  rgw_frontend_port: Optional[int] = None,
                  rgw_frontend_ssl_certificate: Optional[List[str]] = None,
                  rgw_frontend_type: Optional[str] = None,
+                 rgw_frontend_extra_args: Optional[List[str]] = None,
                  unmanaged: bool = False,
                  ssl: bool = False,
                  preview_only: bool = False,
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
                  subcluster: Optional[str] = None,  # legacy, only for from_json on upgrade
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
+                 rgw_realm_token: Optional[str] = None,
+                 update_endpoints: Optional[bool] = False,
+                 zone_endpoints: Optional[str] = None  # commad separated endpoints list
                  ):
         assert service_type == 'rgw', service_type
 
@@ -802,11 +1061,21 @@ class RGWSpec(ServiceSpec):
         super(RGWSpec, self).__init__(
             'rgw', service_id=service_id,
             placement=placement, unmanaged=unmanaged,
-            preview_only=preview_only, config=config, networks=networks)
+            preview_only=preview_only, config=config, networks=networks,
+            extra_container_args=extra_container_args, extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
 
         #: The RGW realm associated with this service. Needs to be manually created
+        #: if the spec is being applied directly to cephdam. In case of rgw module
+        #: the realm is created automatically.
         self.rgw_realm: Optional[str] = rgw_realm
+        #: The RGW zonegroup associated with this service. Needs to be manually created
+        #: if the spec is being applied directly to cephdam. In case of rgw module
+        #: the zonegroup is created automatically.
+        self.rgw_zonegroup: Optional[str] = rgw_zonegroup
         #: The RGW zone associated with this service. Needs to be manually created
+        #: if the spec is being applied directly to cephdam. In case of rgw module
+        #: the zone is created automatically.
         self.rgw_zone: Optional[str] = rgw_zone
         #: Port of the RGW daemons
         self.rgw_frontend_port: Optional[int] = rgw_frontend_port
@@ -814,8 +1083,13 @@ class RGWSpec(ServiceSpec):
         self.rgw_frontend_ssl_certificate: Optional[List[str]] = rgw_frontend_ssl_certificate
         #: civetweb or beast (default: beast). See :ref:`rgw_frontends`
         self.rgw_frontend_type: Optional[str] = rgw_frontend_type
+        #: List of extra arguments for rgw_frontend in the form opt=value. See :ref:`rgw_frontends`
+        self.rgw_frontend_extra_args: Optional[List[str]] = rgw_frontend_extra_args
         #: enable SSL
         self.ssl = ssl
+        self.rgw_realm_token = rgw_realm_token
+        self.update_endpoints = update_endpoints
+        self.zone_endpoints = zone_endpoints
 
     def get_port_start(self) -> List[int]:
         return [self.get_port()]
@@ -835,11 +1109,111 @@ class RGWSpec(ServiceSpec):
             raise SpecValidationError(
                     'Cannot add RGW: Realm specified but no zone specified')
         if self.rgw_zone and not self.rgw_realm:
-            raise SpecValidationError(
-                    'Cannot add RGW: Zone specified but no realm specified')
+            raise SpecValidationError('Cannot add RGW: Zone specified but no realm specified')
+
+        if self.rgw_frontend_type is not None:
+            if self.rgw_frontend_type not in ['beast', 'civetweb']:
+                raise SpecValidationError(
+                    'Invalid rgw_frontend_type value. Valid values are: beast, civetweb.\n'
+                    'Additional rgw type parameters can be passed using rgw_frontend_extra_args.'
+                )
 
 
 yaml.add_representer(RGWSpec, ServiceSpec.yaml_representer)
+
+
+class NvmeofServiceSpec(ServiceSpec):
+    def __init__(self,
+                 service_type: str = 'nvmeof',
+                 service_id: Optional[str] = None,
+                 name: Optional[str] = None,
+                 group: Optional[str] = None,
+                 port: Optional[int] = None,
+                 pool: Optional[str] = None,
+                 enable_auth: bool = False,
+                 server_key: Optional[str] = None,
+                 server_cert: Optional[str] = None,
+                 client_key: Optional[str] = None,
+                 client_cert: Optional[str] = None,
+                 spdk_path: Optional[str] = None,
+                 tgt_path: Optional[str] = None,
+                 timeout: Optional[int] = 60,
+                 conn_retries: Optional[int] = 10,
+                 transports: Optional[str] = 'tcp',
+                 transport_tcp_options: Optional[Dict[str, int]] =
+                 {"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr": 7},
+                 tgt_cmd_extra_args: Optional[str] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False,
+                 config: Optional[Dict[str, str]] = None,
+                 networks: Optional[List[str]] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
+                 ):
+        assert service_type == 'nvmeof'
+        super(NvmeofServiceSpec, self).__init__('nvmeof', service_id=service_id,
+                                                placement=placement, unmanaged=unmanaged,
+                                                preview_only=preview_only,
+                                                config=config, networks=networks,
+                                                extra_container_args=extra_container_args,
+                                                extra_entrypoint_args=extra_entrypoint_args,
+                                                custom_configs=custom_configs)
+
+        #: RADOS pool where ceph-nvmeof config data is stored.
+        self.pool = pool
+        #: ``port`` port of the nvmeof gateway
+        self.port = port or 5500
+        #: ``name`` name of the nvmeof gateway
+        self.name = name
+        #: ``group`` name of the nvmeof gateway
+        self.group = group
+        #: ``enable_auth`` enables user authentication on nvmeof gateway
+        self.enable_auth = enable_auth
+        #: ``server_key`` gateway server key
+        self.server_key = server_key or './server.key'
+        #: ``server_cert`` gateway server certificate
+        self.server_cert = server_cert or './server.crt'
+        #: ``client_key`` client key
+        self.client_key = client_key or './client.key'
+        #: ``client_cert`` client certificate
+        self.client_cert = client_cert or './client.crt'
+        #: ``spdk_path`` path to SPDK
+        self.spdk_path = spdk_path or '/usr/local/bin/nvmf_tgt'
+        #: ``tgt_path`` nvmeof target path
+        self.tgt_path = tgt_path or '/usr/local/bin/nvmf_tgt'
+        #: ``timeout`` ceph connectivity timeout
+        self.timeout = timeout
+        #: ``conn_retries`` ceph connection retries number
+        self.conn_retries = conn_retries
+        #: ``transports`` tcp
+        self.transports = transports
+        #: List of extra arguments for transports in the form opt=value
+        self.transport_tcp_options: Optional[Dict[str, int]] = transport_tcp_options
+        #: ``tgt_cmd_extra_args`` extra arguments for the nvmf_tgt process
+        self.tgt_cmd_extra_args = tgt_cmd_extra_args
+
+    def get_port_start(self) -> List[int]:
+        return [5500, 4420, 8009]
+
+    def validate(self) -> None:
+        #  TODO: what other parameters should be validated as part of this function?
+        super(NvmeofServiceSpec, self).validate()
+
+        if not self.pool:
+            raise SpecValidationError('Cannot add NVMEOF: No Pool specified')
+
+        if self.enable_auth:
+            if not any([self.server_key, self.server_cert, self.client_key, self.client_cert]):
+                raise SpecValidationError(
+                    'enable_auth is true but client/server certificates are missing')
+
+        if self.transports not in ['tcp']:
+            raise SpecValidationError('Invalid transport. Valid values are tcp')
+
+
+yaml.add_representer(NvmeofServiceSpec, ServiceSpec.yaml_representer)
 
 
 class IscsiServiceSpec(ServiceSpec):
@@ -848,9 +1222,9 @@ class IscsiServiceSpec(ServiceSpec):
                  service_id: Optional[str] = None,
                  pool: Optional[str] = None,
                  trusted_ip_list: Optional[str] = None,
-                 api_port: Optional[int] = None,
-                 api_user: Optional[str] = None,
-                 api_password: Optional[str] = None,
+                 api_port: Optional[int] = 5000,
+                 api_user: Optional[str] = 'admin',
+                 api_password: Optional[str] = 'admin',
                  api_secure: Optional[bool] = None,
                  ssl_cert: Optional[str] = None,
                  ssl_key: Optional[str] = None,
@@ -859,12 +1233,18 @@ class IscsiServiceSpec(ServiceSpec):
                  preview_only: bool = False,
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'iscsi'
         super(IscsiServiceSpec, self).__init__('iscsi', service_id=service_id,
                                                placement=placement, unmanaged=unmanaged,
                                                preview_only=preview_only,
-                                               config=config, networks=networks)
+                                               config=config, networks=networks,
+                                               extra_container_args=extra_container_args,
+                                               extra_entrypoint_args=extra_entrypoint_args,
+                                               custom_configs=custom_configs)
 
         #: RADOS pool where ceph-iscsi config data is stored.
         self.pool = pool
@@ -885,6 +1265,9 @@ class IscsiServiceSpec(ServiceSpec):
 
         if not self.api_secure and self.ssl_cert and self.ssl_key:
             self.api_secure = True
+
+    def get_port_start(self) -> List[int]:
+        return [self.api_port or 5000]
 
     def validate(self) -> None:
         super(IscsiServiceSpec, self).validate()
@@ -923,15 +1306,28 @@ class IngressSpec(ServiceSpec):
                  enable_stats: Optional[bool] = None,
                  keepalived_password: Optional[str] = None,
                  virtual_ip: Optional[str] = None,
+                 virtual_ips_list: Optional[List[str]] = None,
                  virtual_interface_networks: Optional[List[str]] = [],
+                 use_keepalived_multicast: Optional[bool] = False,
+                 vrrp_interface_network: Optional[str] = None,
+                 first_virtual_router_id: Optional[int] = 50,
                  unmanaged: bool = False,
-                 ssl: bool = False
+                 ssl: bool = False,
+                 keepalive_only: bool = False,
+                 enable_haproxy_protocol: bool = False,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'ingress'
+
         super(IngressSpec, self).__init__(
             'ingress', service_id=service_id,
             placement=placement, config=config,
-            networks=networks
+            networks=networks,
+            extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs
         )
         self.backend_service = backend_service
         self.frontend_port = frontend_port
@@ -945,13 +1341,23 @@ class IngressSpec(ServiceSpec):
         self.monitor_password = monitor_password
         self.keepalived_password = keepalived_password
         self.virtual_ip = virtual_ip
+        self.virtual_ips_list = virtual_ips_list
         self.virtual_interface_networks = virtual_interface_networks or []
+        self.use_keepalived_multicast = use_keepalived_multicast
+        self.vrrp_interface_network = vrrp_interface_network
+        self.first_virtual_router_id = first_virtual_router_id
         self.unmanaged = unmanaged
         self.ssl = ssl
+        self.keepalive_only = keepalive_only
+        self.enable_haproxy_protocol = enable_haproxy_protocol
 
     def get_port_start(self) -> List[int]:
-        return [cast(int, self.frontend_port),
-                cast(int, self.monitor_port)]
+        ports = []
+        if self.frontend_port is not None:
+            ports.append(cast(int, self.frontend_port))
+        if self.monitor_port is not None:
+            ports.append(cast(int, self.monitor_port))
+        return ports
 
     def get_virtual_ip(self) -> Optional[str]:
         return self.virtual_ip
@@ -962,18 +1368,118 @@ class IngressSpec(ServiceSpec):
         if not self.backend_service:
             raise SpecValidationError(
                 'Cannot add ingress: No backend_service specified')
-        if not self.frontend_port:
+        if not self.keepalive_only and not self.frontend_port:
             raise SpecValidationError(
                 'Cannot add ingress: No frontend_port specified')
         if not self.monitor_port:
             raise SpecValidationError(
                 'Cannot add ingress: No monitor_port specified')
-        if not self.virtual_ip:
+        if not self.virtual_ip and not self.virtual_ips_list:
             raise SpecValidationError(
                 'Cannot add ingress: No virtual_ip provided')
+        if self.virtual_ip is not None and self.virtual_ips_list is not None:
+            raise SpecValidationError(
+                'Cannot add ingress: Single and multiple virtual IPs specified')
 
 
 yaml.add_representer(IngressSpec, ServiceSpec.yaml_representer)
+
+
+class InitContainerSpec(object):
+    """An init container is not a service that lives on its own, but rather
+    is used to run and exit prior to a service container starting in order
+    to help initialize some aspect of the container environment.
+    For example: a command to pre-populate a DB file with expected values
+    before the server starts.
+    """
+
+    _basic_fields = [
+        'image',
+        'entrypoint',
+        'volume_mounts',
+        'envs',
+        'privileged',
+    ]
+    _fields = _basic_fields + ['entrypoint_args']
+
+    def __init__(
+        self,
+        image: Optional[str] = None,
+        entrypoint: Optional[str] = None,
+        entrypoint_args: Optional[GeneralArgList] = None,
+        volume_mounts: Optional[Dict[str, str]] = None,
+        envs: Optional[List[str]] = None,
+        privileged: Optional[bool] = None,
+    ):
+        self.image = image
+        self.entrypoint = entrypoint
+        self.entrypoint_args: Optional[ArgumentList] = None
+        if entrypoint_args:
+            self.entrypoint_args = ArgumentSpec.from_general_args(
+                entrypoint_args
+            )
+        self.volume_mounts = volume_mounts
+        self.envs = envs
+        self.privileged = privileged
+        self.validate()
+
+    def validate(self) -> None:
+        if all(getattr(self, key) is None for key in self._fields):
+            raise SpecValidationError(
+                'At least one parameter must be set (no values were specified)'
+            )
+
+    def to_json(self, flatten_args: bool = False) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        for key in self._basic_fields:
+            value = getattr(self, key, None)
+            if value is not None:
+                data[key] = value
+        if self.entrypoint_args and flatten_args:
+            data['entrypoint_args'] = sum(
+                (ea.to_args() for ea in self.entrypoint_args), []
+            )
+        elif self.entrypoint_args:
+            data['entrypoint_args'] = ArgumentSpec.map_json(
+                self.entrypoint_args
+            )
+        return data
+
+    def __repr__(self) -> str:
+        vals = ((key, getattr(self, key)) for key in self._fields)
+        contents = ", ".join(f'{key}={val!r}' for key, val in vals if val)
+        return f'InitContainerSpec({contents})'
+
+    @classmethod
+    def from_json(cls, data: Dict[str, Any]) -> 'InitContainerSpec':
+        return cls(
+            image=data.get('image'),
+            entrypoint=data.get('entrypoint'),
+            entrypoint_args=data.get('entrypoint_args'),
+            volume_mounts=data.get('volume_mounts'),
+            envs=data.get('envs'),
+            privileged=data.get('privileged'),
+        )
+
+    @classmethod
+    def import_values(
+        cls, values: List[Union['InitContainerSpec', Dict[str, Any]]]
+    ) -> List['InitContainerSpec']:
+        out: List[InitContainerSpec] = []
+        for value in values:
+            if isinstance(value, dict):
+                out.append(cls.from_json(value))
+            elif isinstance(value, cls):
+                out.append(value)
+            elif hasattr(value, 'to_json'):
+                # This is a workaround for silly ceph mgr object/type identity
+                # mismatches due to multiple python interpreters in use.
+                out.append(cls.from_json(value.to_json()))
+            else:
+                raise SpecValidationError(
+                    f"Unknown type for InitContainerSpec: {type(value)}"
+                )
+        return out
 
 
 class CustomContainerSpec(ServiceSpec):
@@ -990,13 +1496,18 @@ class CustomContainerSpec(ServiceSpec):
                  uid: Optional[int] = None,
                  gid: Optional[int] = None,
                  volume_mounts: Optional[Dict[str, str]] = {},
-                 args: Optional[List[str]] = [],
+                 # args are for the container runtime, not entrypoint
+                 args: Optional[GeneralArgList] = [],
                  envs: Optional[List[str]] = [],
                  privileged: Optional[bool] = False,
                  bind_mounts: Optional[List[List[str]]] = None,
                  ports: Optional[List[int]] = [],
                  dirs: Optional[List[str]] = [],
                  files: Optional[Dict[str, Any]] = {},
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
+                 init_containers: Optional[List[Union['InitContainerSpec', Dict[str, Any]]]] = None,
                  ):
         assert service_type == 'container'
         assert service_id is not None
@@ -1006,7 +1517,9 @@ class CustomContainerSpec(ServiceSpec):
             service_type, service_id,
             placement=placement, unmanaged=unmanaged,
             preview_only=preview_only, config=config,
-            networks=networks)
+            networks=networks, extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
 
         self.image = image
         self.entrypoint = entrypoint
@@ -1020,6 +1533,11 @@ class CustomContainerSpec(ServiceSpec):
         self.ports = ports
         self.dirs = dirs
         self.files = files
+        self.init_containers: Optional[List['InitContainerSpec']] = None
+        if init_containers:
+            self.init_containers = InitContainerSpec.import_values(
+                init_containers
+            )
 
     def config_json(self) -> Dict[str, Any]:
         """
@@ -1039,6 +1557,28 @@ class CustomContainerSpec(ServiceSpec):
                 config_json[prop] = value
         return config_json
 
+    def validate(self) -> None:
+        super(CustomContainerSpec, self).validate()
+
+        if self.args and self.extra_container_args:
+            raise SpecValidationError(
+                '"args" and "extra_container_args" are mutually exclusive '
+                '(and both serve the same purpose)')
+
+        if self.files and self.custom_configs:
+            raise SpecValidationError(
+                '"files" and "custom_configs" are mutually exclusive '
+                '(and both serve the same purpose)')
+
+    # use quotes for OrderedDict, getting this to work across py 3.6, 3.7
+    # and 3.7+ is suprisingly difficult
+    def to_json(self) -> "OrderedDict[str, Any]":
+        data = super().to_json()
+        ics = data.get('spec', {}).get('init_containers')
+        if ics:
+            data['spec']['init_containers'] = [ic.to_json() for ic in ics]
+        return data
+
 
 yaml.add_representer(CustomContainerSpec, ServiceSpec.yaml_representer)
 
@@ -1053,14 +1593,20 @@ class MonitoringSpec(ServiceSpec):
                  unmanaged: bool = False,
                  preview_only: bool = False,
                  port: Optional[int] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
-        assert service_type in ['grafana', 'node-exporter', 'prometheus', 'alertmanager']
+        assert service_type in ['grafana', 'node-exporter', 'prometheus', 'alertmanager',
+                                'loki', 'promtail']
 
         super(MonitoringSpec, self).__init__(
             service_type, service_id,
             placement=placement, unmanaged=unmanaged,
             preview_only=preview_only, config=config,
-            networks=networks)
+            networks=networks, extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
 
         self.service_type = service_type
         self.port = port
@@ -1075,7 +1621,9 @@ class MonitoringSpec(ServiceSpec):
             return {'prometheus': 9095,
                     'node-exporter': 9100,
                     'alertmanager': 9093,
-                    'grafana': 3000}[self.service_type]
+                    'grafana': 3000,
+                    'loki': 3100,
+                    'promtail': 9080}[self.service_type]
 
 
 yaml.add_representer(MonitoringSpec, ServiceSpec.yaml_representer)
@@ -1092,12 +1640,18 @@ class AlertManagerSpec(MonitoringSpec):
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
                  port: Optional[int] = None,
+                 secure: bool = False,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'alertmanager'
         super(AlertManagerSpec, self).__init__(
             'alertmanager', service_id=service_id,
             placement=placement, unmanaged=unmanaged,
-            preview_only=preview_only, config=config, networks=networks, port=port)
+            preview_only=preview_only, config=config, networks=networks, port=port,
+            extra_container_args=extra_container_args, extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
 
         # Custom configuration.
         #
@@ -1114,6 +1668,7 @@ class AlertManagerSpec(MonitoringSpec):
         #                        added to the default receivers'
         #                        <webhook_configs> configuration.
         self.user_data = user_data or {}
+        self.secure = secure
 
     def get_port_start(self) -> List[int]:
         return [self.get_port(), 9094]
@@ -1139,18 +1694,86 @@ class GrafanaSpec(MonitoringSpec):
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
                  port: Optional[int] = None,
-                 initial_admin_password: Optional[str] = None
+                 protocol: Optional[str] = 'https',
+                 initial_admin_password: Optional[str] = None,
+                 anonymous_access: Optional[bool] = True,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'grafana'
         super(GrafanaSpec, self).__init__(
             'grafana', service_id=service_id,
             placement=placement, unmanaged=unmanaged,
-            preview_only=preview_only, config=config, networks=networks, port=port)
+            preview_only=preview_only, config=config, networks=networks, port=port,
+            extra_container_args=extra_container_args, extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
 
         self.initial_admin_password = initial_admin_password
+        self.anonymous_access = anonymous_access
+        self.protocol = protocol
+
+    def validate(self) -> None:
+        super(GrafanaSpec, self).validate()
+        if self.protocol not in ['http', 'https']:
+            err_msg = f"Invalid protocol '{self.protocol}'. Valid values are: 'http', 'https'."
+            raise SpecValidationError(err_msg)
+
+        if not self.anonymous_access and not self.initial_admin_password:
+            err_msg = ('Either initial_admin_password must be set or anonymous_access '
+                       'must be set to true. Otherwise the grafana dashboard will '
+                       'be inaccessible.')
+            raise SpecValidationError(err_msg)
 
 
 yaml.add_representer(GrafanaSpec, ServiceSpec.yaml_representer)
+
+
+class PrometheusSpec(MonitoringSpec):
+    def __init__(self,
+                 service_type: str = 'prometheus',
+                 service_id: Optional[str] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False,
+                 config: Optional[Dict[str, str]] = None,
+                 networks: Optional[List[str]] = None,
+                 port: Optional[int] = None,
+                 retention_time: Optional[str] = None,
+                 retention_size: Optional[str] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
+                 ):
+        assert service_type == 'prometheus'
+        super(PrometheusSpec, self).__init__(
+            'prometheus', service_id=service_id,
+            placement=placement, unmanaged=unmanaged,
+            preview_only=preview_only, config=config, networks=networks, port=port,
+            extra_container_args=extra_container_args, extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
+
+        self.retention_time = retention_time.strip() if retention_time else None
+        self.retention_size = retention_size.strip() if retention_size else None
+
+    def validate(self) -> None:
+        super(PrometheusSpec, self).validate()
+
+        if self.retention_time:
+            valid_units = ['y', 'w', 'd', 'h', 'm', 's']
+            m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", self.retention_time)
+            if not m:
+                units = ', '.join(valid_units)
+                raise SpecValidationError(f"Invalid retention time. Valid units are: {units}")
+        if self.retention_size:
+            valid_units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']
+            m = re.search(rf"^(\d+)({'|'.join(valid_units)})$", self.retention_size)
+            if not m:
+                units = ', '.join(valid_units)
+                raise SpecValidationError(f"Invalid retention size. Valid units are: {units}")
+
+
+yaml.add_representer(PrometheusSpec, ServiceSpec.yaml_representer)
 
 
 class SNMPGatewaySpec(ServiceSpec):
@@ -1192,6 +1815,9 @@ class SNMPGatewaySpec(ServiceSpec):
                  unmanaged: bool = False,
                  preview_only: bool = False,
                  port: Optional[int] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
                  ):
         assert service_type == 'snmp-gateway'
 
@@ -1199,7 +1825,10 @@ class SNMPGatewaySpec(ServiceSpec):
             service_type,
             placement=placement,
             unmanaged=unmanaged,
-            preview_only=preview_only)
+            preview_only=preview_only,
+            extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args,
+            custom_configs=custom_configs)
 
         self.service_type = service_type
         self.snmp_version = snmp_version
@@ -1299,3 +1928,241 @@ class SNMPGatewaySpec(ServiceSpec):
 
 
 yaml.add_representer(SNMPGatewaySpec, ServiceSpec.yaml_representer)
+
+
+class MDSSpec(ServiceSpec):
+    def __init__(self,
+                 service_type: str = 'mds',
+                 service_id: Optional[str] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 config: Optional[Dict[str, str]] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
+                 ):
+        assert service_type == 'mds'
+        super(MDSSpec, self).__init__('mds', service_id=service_id,
+                                      placement=placement,
+                                      config=config,
+                                      unmanaged=unmanaged,
+                                      preview_only=preview_only,
+                                      extra_container_args=extra_container_args,
+                                      extra_entrypoint_args=extra_entrypoint_args,
+                                      custom_configs=custom_configs)
+
+    def validate(self) -> None:
+        super(MDSSpec, self).validate()
+
+        if str(self.service_id)[0].isdigit():
+            raise SpecValidationError('MDS service id cannot start with a numeric digit')
+
+
+yaml.add_representer(MDSSpec, ServiceSpec.yaml_representer)
+
+
+class MONSpec(ServiceSpec):
+    def __init__(self,
+                 service_type: str,
+                 service_id: Optional[str] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 count: Optional[int] = None,
+                 config: Optional[Dict[str, str]] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False,
+                 networks: Optional[List[str]] = None,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 custom_configs: Optional[List[CustomConfig]] = None,
+                 crush_locations: Optional[Dict[str, List[str]]] = None,
+                 ):
+        assert service_type == 'mon'
+        super(MONSpec, self).__init__('mon', service_id=service_id,
+                                      placement=placement,
+                                      count=count,
+                                      config=config,
+                                      unmanaged=unmanaged,
+                                      preview_only=preview_only,
+                                      networks=networks,
+                                      extra_container_args=extra_container_args,
+                                      extra_entrypoint_args=extra_entrypoint_args,
+                                      custom_configs=custom_configs)
+
+        self.crush_locations = crush_locations
+        self.validate()
+
+    def validate(self) -> None:
+        if self.crush_locations:
+            for host, crush_locs in self.crush_locations.items():
+                try:
+                    assert_valid_host(host)
+                except SpecValidationError as e:
+                    err_str = f'Invalid hostname found in spec crush locations: {e}'
+                    raise SpecValidationError(err_str)
+                for cloc in crush_locs:
+                    if '=' not in cloc or len(cloc.split('=')) != 2:
+                        err_str = ('Crush locations must be of form <bucket>=<location>. '
+                                   f'Found crush location: {cloc}')
+                        raise SpecValidationError(err_str)
+
+
+yaml.add_representer(MONSpec, ServiceSpec.yaml_representer)
+
+
+class TracingSpec(ServiceSpec):
+    SERVICE_TYPES = ['elasticsearch', 'jaeger-collector', 'jaeger-query', 'jaeger-agent']
+
+    def __init__(self,
+                 service_type: str,
+                 es_nodes: Optional[str] = None,
+                 without_query: bool = False,
+                 service_id: Optional[str] = None,
+                 config: Optional[Dict[str, str]] = None,
+                 networks: Optional[List[str]] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False
+                 ):
+        assert service_type in TracingSpec.SERVICE_TYPES + ['jaeger-tracing']
+
+        super(TracingSpec, self).__init__(
+            service_type, service_id,
+            placement=placement, unmanaged=unmanaged,
+            preview_only=preview_only, config=config,
+            networks=networks)
+        self.without_query = without_query
+        self.es_nodes = es_nodes
+
+    def get_port_start(self) -> List[int]:
+        return [self.get_port()]
+
+    def get_port(self) -> int:
+        return {'elasticsearch': 9200,
+                'jaeger-agent': 6799,
+                'jaeger-collector': 14250,
+                'jaeger-query': 16686}[self.service_type]
+
+    def get_tracing_specs(self) -> List[ServiceSpec]:
+        assert self.service_type == 'jaeger-tracing'
+        specs: List[ServiceSpec] = []
+        daemons: Dict[str, Optional[PlacementSpec]] = {
+            daemon: None for daemon in TracingSpec.SERVICE_TYPES}
+
+        if self.es_nodes:
+            del daemons['elasticsearch']
+        if self.without_query:
+            del daemons['jaeger-query']
+        if self.placement:
+            daemons.update({'jaeger-collector': self.placement})
+
+        for daemon, daemon_placement in daemons.items():
+            specs.append(TracingSpec(service_type=daemon,
+                                     es_nodes=self.es_nodes,
+                                     placement=daemon_placement,
+                                     unmanaged=self.unmanaged,
+                                     config=self.config,
+                                     networks=self.networks,
+                                     preview_only=self.preview_only
+                                     ))
+        return specs
+
+
+yaml.add_representer(TracingSpec, ServiceSpec.yaml_representer)
+
+
+class TunedProfileSpec():
+    def __init__(self,
+                 profile_name: str,
+                 placement: Optional[PlacementSpec] = None,
+                 settings: Optional[Dict[str, str]] = None,
+                 ):
+        self.profile_name = profile_name
+        self.placement = placement or PlacementSpec(host_pattern='*')
+        self.settings = settings or {}
+        self._last_updated: str = ''
+
+    @classmethod
+    def from_json(cls, spec: Dict[str, Any]) -> 'TunedProfileSpec':
+        data = {}
+        if 'profile_name' not in spec:
+            raise SpecValidationError('Tuned profile spec must include "profile_name" field')
+        data['profile_name'] = spec['profile_name']
+        if not isinstance(data['profile_name'], str):
+            raise SpecValidationError('"profile_name" field must be a string')
+        if 'placement' in spec:
+            data['placement'] = PlacementSpec.from_json(spec['placement'])
+        if 'settings' in spec:
+            data['settings'] = spec['settings']
+        return cls(**data)
+
+    def to_json(self) -> Dict[str, Any]:
+        res: Dict[str, Any] = {}
+        res['profile_name'] = self.profile_name
+        res['placement'] = self.placement.to_json()
+        res['settings'] = self.settings
+        return res
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, TunedProfileSpec):
+            if (
+                self.placement == other.placement
+                and self.profile_name == other.profile_name
+                and self.settings == other.settings
+            ):
+                return True
+            return False
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f'TunedProfile({self.profile_name})'
+
+    def copy(self) -> 'TunedProfileSpec':
+        # for making deep copies so you can edit the settings in one without affecting the other
+        # mostly for testing purposes
+        return TunedProfileSpec(self.profile_name, self.placement, self.settings.copy())
+
+
+class CephExporterSpec(ServiceSpec):
+    def __init__(self,
+                 service_type: str = 'ceph-exporter',
+                 sock_dir: Optional[str] = None,
+                 addrs: str = '',
+                 port: Optional[int] = None,
+                 prio_limit: Optional[int] = 5,
+                 stats_period: Optional[int] = 5,
+                 placement: Optional[PlacementSpec] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False,
+                 extra_container_args: Optional[GeneralArgList] = None,
+                 extra_entrypoint_args: Optional[GeneralArgList] = None,
+                 ):
+        assert service_type == 'ceph-exporter'
+
+        super(CephExporterSpec, self).__init__(
+            service_type,
+            placement=placement,
+            unmanaged=unmanaged,
+            preview_only=preview_only,
+            extra_container_args=extra_container_args,
+            extra_entrypoint_args=extra_entrypoint_args)
+
+        self.service_type = service_type
+        self.sock_dir = sock_dir
+        self.addrs = addrs
+        self.port = port
+        self.prio_limit = prio_limit
+        self.stats_period = stats_period
+
+    def validate(self) -> None:
+        super(CephExporterSpec, self).validate()
+
+        if not isinstance(self.prio_limit, int):
+            raise SpecValidationError(
+                    f'prio_limit must be an integer. Got {type(self.prio_limit)}')
+        if not isinstance(self.stats_period, int):
+            raise SpecValidationError(
+                    f'stats_period must be an integer. Got {type(self.stats_period)}')
+
+
+yaml.add_representer(CephExporterSpec, ServiceSpec.yaml_representer)

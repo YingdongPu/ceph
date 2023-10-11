@@ -14,6 +14,7 @@
 
 
 #include "common/dout.h"
+#include "common/likely.h"
 #include "common/HeartbeatMap.h"
 
 #include "include/stringify.h"
@@ -73,20 +74,30 @@ void Beacon::init(const MDSMap &mdsmap)
 
   sender = std::thread([this]() {
     std::unique_lock<std::mutex> lock(mutex);
-    std::condition_variable c; // no one wakes us
+    bool sent;
     while (!finished) {
       auto now = clock::now();
       auto since = std::chrono::duration<double>(now-last_send).count();
       auto interval = beacon_interval;
+      sent = false;
       if (since >= interval*.90) {
         if (!_send()) {
           interval = 0.5; /* 500ms */
+        }
+        else {
+          sent = true;
         }
       } else {
         interval -= since;
       }
       dout(20) << "sender thread waiting interval " << interval << "s" << dendl;
-      c.wait_for(lock, interval*1s);
+      if (cvar.wait_for(lock, interval*1s) == std::cv_status::timeout) {
+        if (sent) {
+          //missed beacon ack because we timedout after a beacon send
+          dout(0) << "missed beacon ack from the monitors" << dendl;
+          missed_beacon_ack_dump = true;
+        }
+      }
     }
   });
 }
@@ -117,8 +128,6 @@ bool Beacon::ms_dispatch2(const ref_t<Message>& m)
 
 /**
  * Update lagginess state based on response from remote MDSMonitor
- *
- * This function puts the passed message before returning
  */
 void Beacon::handle_mds_beacon(const cref_t<MMDSBeacon> &m)
 {
@@ -173,7 +182,11 @@ void Beacon::send_and_wait(const double duration)
   while (!seq_stamp.empty() && seq_stamp.begin()->first <= awaiting_seq) {
     auto now = clock::now();
     auto s = duration*.95-std::chrono::duration<double>(now-start).count();
-    if (s < 0) break;
+    if (s < 0) {
+      //missed beacon ACKs
+      missed_beacon_ack_dump = true;
+      break;
+    }
     cvar.wait_for(lock, s*1s);
   }
 }
@@ -191,6 +204,8 @@ bool Beacon::_send()
     /* If anything isn't progressing, let avoid sending a beacon so that
      * the MDS will consider us laggy */
     dout(0) << "Skipping beacon heartbeat to monitors (last acked " << since << "s ago); MDS internal heartbeat is not healthy!" << dendl;
+    //missed internal heartbeat
+    missed_internal_heartbeat_dump = true;
     return false;
   }
 
@@ -298,6 +313,11 @@ void Beacon::notify_health(MDSRank const *mds)
 
   health.metrics.clear();
 
+  if (unlikely(g_conf().get_val<bool>("mds_inject_health_dummy"))) {
+    MDSHealthMetric m(MDS_HEALTH_DUMMY, HEALTH_ERR, std::string("dummy"));
+    health.metrics.push_back(m);
+  }
+
   // Detect presence of entries in DamageTable
   if (!mds->damage_table.empty()) {
     MDSHealthMetric m(MDS_HEALTH_DAMAGE, HEALTH_ERR, std::string(
@@ -308,14 +328,16 @@ void Beacon::notify_health(MDSRank const *mds)
   // Detect MDS_HEALTH_TRIM condition
   // Indicates MDS is not trimming promptly
   {
-    if (mds->mdlog->get_num_segments() > (size_t)(g_conf()->mds_log_max_segments * g_conf().get_val<double>("mds_log_warn_factor"))) {
+    const auto log_max_segments = mds->mdlog->get_max_segments();
+    const auto log_warn_factor = g_conf().get_val<double>("mds_log_warn_factor");
+    if (mds->mdlog->get_num_segments() > (size_t)(log_max_segments * log_warn_factor)) {
       CachedStackStringStream css;
       *css << "Behind on trimming (" << mds->mdlog->get_num_segments()
-        << "/" << g_conf()->mds_log_max_segments << ")";
+        << "/" << log_max_segments << ")";
 
       MDSHealthMetric m(MDS_HEALTH_TRIM, HEALTH_WARN, css->strv());
       m.metadata["num_segments"] = stringify(mds->mdlog->get_num_segments());
-      m.metadata["max_segments"] = stringify(g_conf()->mds_log_max_segments);
+      m.metadata["max_segments"] = stringify(log_max_segments);
       health.metrics.push_back(m);
     }
   }
@@ -474,6 +496,24 @@ void Beacon::notify_health(MDSRank const *mds)
 
     MDSHealthMetric m(MDS_HEALTH_CACHE_OVERSIZED, HEALTH_WARN, css->strv());
     health.metrics.push_back(m);
+  }
+
+  // Report laggy client(s) due to laggy OSDs
+  {
+    auto&& laggy_clients = mds->server->get_laggy_clients();
+    if (!laggy_clients.empty()) {
+      std::vector<MDSHealthMetric> laggy_clients_metrics;
+      for (const auto& laggy_client: laggy_clients) {
+        CachedStackStringStream css;
+        *css << "Client " << laggy_client << " is laggy; not evicted"
+            << " because some OSD(s) is/are laggy";
+        MDSHealthMetric m(MDS_HEALTH_CLIENTS_LAGGY, HEALTH_WARN, css->strv());
+        laggy_clients_metrics.emplace_back(std::move(m));
+      }
+      auto&& m = laggy_clients_metrics;
+      health.metrics.insert(std::end(health.metrics), std::cbegin(m),
+                            std::cend(m));
+    }
   }
 }
 

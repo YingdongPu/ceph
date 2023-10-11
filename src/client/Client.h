@@ -32,6 +32,8 @@
 #include "include/unordered_set.h"
 #include "include/cephfs/metrics/Types.h"
 #include "mds/mdstypes.h"
+#include "mds/MDSAuthCaps.h"
+#include "include/cephfs/types.h"
 #include "msg/Dispatcher.h"
 #include "msg/MessageRef.h"
 #include "msg/Messenger.h"
@@ -77,6 +79,15 @@ enum {
   l_c_wrlat,
   l_c_read,
   l_c_fsync,
+  l_c_md_avg,
+  l_c_md_sqsum,
+  l_c_md_ops,
+  l_c_rd_avg,
+  l_c_rd_sqsum,
+  l_c_rd_ops,
+  l_c_wr_avg,
+  l_c_wr_sqsum,
+  l_c_wr_ops,
   l_c_last,
 };
 
@@ -87,6 +98,7 @@ class MDSCommandOp : public CommandOp
   mds_gid_t     mds_gid;
 
   explicit MDSCommandOp(ceph_tid_t t) : CommandOp(t) {}
+  explicit MDSCommandOp(ceph_tid_t t, ceph_tid_t multi_id) : CommandOp(t, multi_id) {}
 };
 
 /* error code for ceph_fuse */
@@ -259,6 +271,7 @@ public:
   public:
     explicit CommandHook(Client *client);
     int call(std::string_view command, const cmdmap_t& cmdmap,
+	     const bufferlist&,
 	     Formatter *f,
 	     std::ostream& errss,
 	     bufferlist& out) override;
@@ -344,12 +357,19 @@ public:
    * If @a cb returns a negative error code, stop and return that.
    */
   int readdir_r_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
-		   unsigned want=0, unsigned flags=AT_NO_ATTR_SYNC,
+		   unsigned want=0, unsigned flags=AT_STATX_DONT_SYNC,
 		   bool getref=false);
 
   struct dirent * readdir(dir_result_t *d);
   int readdir_r(dir_result_t *dirp, struct dirent *de);
   int readdirplus_r(dir_result_t *dirp, struct dirent *de, struct ceph_statx *stx, unsigned want, unsigned flags, Inode **out);
+
+  /*
+   * Get the next snapshot delta entry.
+   *
+   */
+  int readdir_snapdiff(dir_result_t* dir1, snapid_t snap2,
+    struct dirent* out_de, snapid_t* out_snap);
 
   int getdir(const char *relpath, std::list<std::string>& names,
 	     const UserPerm& perms);  // get the whole dir at once.
@@ -532,6 +552,9 @@ public:
              mode_t mode=0, const std::map<std::string, std::string> &metadata={});
   int rmsnap(const char *path, const char *name, const UserPerm& perm, bool check_perms=false);
 
+  // cephx mds auth caps checking
+  int mds_check_access(std::string& path, const UserPerm& perms, int mask);
+
   // Inode permission checking
   int inode_permission(Inode *in, const UserPerm& perms, unsigned want);
 
@@ -628,6 +651,11 @@ public:
   int ll_write(Fh *fh, loff_t off, loff_t len, const char *data);
   int64_t ll_readv(struct Fh *fh, const struct iovec *iov, int iovcnt, int64_t off);
   int64_t ll_writev(struct Fh *fh, const struct iovec *iov, int iovcnt, int64_t off);
+  int64_t ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov, int iovcnt,
+                            int64_t offset, bool write,
+                            Context *onfinish = nullptr,
+                            bufferlist *blp = nullptr,
+                            bool do_fsync = false, bool syncdataonly = false);
   loff_t ll_lseek(Fh *fh, loff_t offset, int whence);
   int ll_flush(Fh *fh);
   int ll_fsync(Fh *fh, bool syncdataonly);
@@ -655,7 +683,7 @@ public:
   void _ll_register_callbacks(struct ceph_client_callback_args *args);
   void ll_register_callbacks(struct ceph_client_callback_args *args); // deprecated
   int ll_register_callbacks2(struct ceph_client_callback_args *args);
-  int test_dentry_handling(bool can_invalidate);
+  std::pair<int, bool> test_dentry_handling(bool can_invalidate);
 
   const char** get_tracked_conf_keys() const override;
   void handle_conf_change(const ConfigProxy& conf,
@@ -677,6 +705,7 @@ public:
 
   client_t get_nodeid() { return whoami; }
 
+  inodeno_t _get_root_ino(bool fake=true);
   inodeno_t get_root_ino();
   Inode *get_root();
 
@@ -735,6 +764,7 @@ public:
   void flush_snaps(Inode *in);
   void get_cap_ref(Inode *in, int cap);
   void put_cap_ref(Inode *in, int cap);
+  void submit_sync_caps(Inode *in, ceph_tid_t want, Context *onfinish);
   void wait_sync_caps(Inode *in, ceph_tid_t want);
   void wait_sync_caps(ceph_tid_t want);
   void queue_cap_snap(Inode *in, SnapContext &old_snapc);
@@ -780,7 +810,8 @@ public:
   void update_dir_dist(Inode *in, DirStat *st, mds_rank_t from);
 
   void clear_dir_complete_and_ordered(Inode *diri, bool complete);
-  void insert_readdir_results(MetaRequest *request, MetaSession *session, Inode *diri);
+  void insert_readdir_results(MetaRequest *request, MetaSession *session,
+                              Inode *diri, Inode *diri_other);
   Inode* insert_trace(MetaRequest *request, MetaSession *session);
   void update_inode_file_size(Inode *in, int issued, uint64_t size,
 			      uint64_t truncate_seq, uint64_t truncate_size);
@@ -888,8 +919,10 @@ public:
   std::unique_ptr<MDSMap> mdsmap;
 
   bool fuse_default_permissions;
+  bool _collect_and_send_global_metrics;
 
 protected:
+  std::list<ceph::condition_variable*> waiting_for_reclaim;
   /* Flags for check_caps() */
   static const unsigned CHECK_CAPS_NODELAY = 0x1;
   static const unsigned CHECK_CAPS_SYNCHRONOUS = 0x2;
@@ -923,8 +956,9 @@ protected:
   void dump_mds_sessions(Formatter *f, bool cap_dump=false);
 
   int make_request(MetaRequest *req, const UserPerm& perms,
-		   InodeRef *ptarget = 0, bool *pcreated = 0,
-		   mds_rank_t use_mds=-1, bufferlist *pdirbl=0);
+                   InodeRef *ptarget = 0, bool *pcreated = 0,
+                   mds_rank_t use_mds=-1, bufferlist *pdirbl=0,
+                   size_t feature_needed=ULONG_MAX);
   void put_request(MetaRequest *request);
   void unregister_request(MetaRequest *request);
 
@@ -942,7 +976,7 @@ protected:
   void connect_mds_targets(mds_rank_t mds);
   void send_request(MetaRequest *request, MetaSession *session,
 		    bool drop_cap_releases=false);
-  MRef<MClientRequest> build_client_request(MetaRequest *request);
+  MRef<MClientRequest> build_client_request(MetaRequest *request, mds_rank_t mds);
   void kick_requests(MetaSession *session);
   void kick_requests_closed(MetaSession *session);
   void handle_client_request_forward(const MConstRef<MClientRequestForward>& reply);
@@ -968,9 +1002,10 @@ protected:
   SnapRealm *get_snap_realm_maybe(inodeno_t r);
   void put_snap_realm(SnapRealm *realm);
   bool adjust_realm_parent(SnapRealm *realm, inodeno_t parent);
-  void update_snap_trace(const bufferlist& bl, SnapRealm **realm_ret, bool must_flush=true);
+  void update_snap_trace(MetaSession *session, const bufferlist& bl, SnapRealm **realm_ret, bool must_flush=true);
   void invalidate_snaprealm_and_children(SnapRealm *realm);
 
+  void refresh_snapdir_attrs(Inode *in, Inode *diri);
   Inode *open_snapdir(Inode *diri);
 
   int get_fd() {
@@ -996,8 +1031,12 @@ protected:
   // helpers
   void wake_up_session_caps(MetaSession *s, bool reconnect);
 
+  void add_nonblocking_onfinish_to_context_list(std::list<Context*>& ls, Context *onfinish) {
+    ls.push_back(onfinish);
+  }
   void wait_on_context_list(std::list<Context*>& ls);
   void signal_context_list(std::list<Context*>& ls);
+  void signal_caps_inode(Inode *in);
 
   // -- metadata cache stuff
 
@@ -1061,7 +1100,7 @@ protected:
 
   int authenticate();
 
-  Inode* get_quota_root(Inode *in, const UserPerm& perms);
+  Inode* get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type=QUOTA_ANY);
   bool check_quota_condition(Inode *in, const UserPerm& perms,
 			     std::function<bool (const Inode &)> test);
   bool is_quota_files_exceeded(Inode *in, const UserPerm& perms);
@@ -1222,6 +1261,258 @@ protected:
   struct initialize_state_t initialize_state;
 
 private:
+  class C_Read_Finisher : public Context {
+  public:
+    bool iofinished;
+    void finish_io(int r);
+
+    C_Read_Finisher(Client *clnt, Context *onfinish, Context *iofinish,
+                    bool is_read_async, int have_caps, bool movepos,
+                    utime_t start, Fh *f, Inode *in, uint64_t fpos,
+                    int64_t offset, uint64_t size)
+      : clnt(clnt), onfinish(onfinish), iofinish(iofinish),
+        is_read_async(is_read_async), have_caps(have_caps), f(f), in(in),
+        start(start), fpos(fpos), offset(offset), size(size), movepos(movepos) {
+      iofinished = false;
+    }
+
+    void finish(int r) override {
+      // We need to override finish, but have nothing to do.
+    }
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Context *iofinish;
+    bool is_read_async;
+    int have_caps;
+    Fh *f;
+    Inode *in;
+    utime_t start;
+    uint64_t fpos;
+    int64_t offset;
+    uint64_t size;
+    bool movepos;
+  };
+
+  struct CRF_iofinish : public Context {
+    Client::C_Read_Finisher *CRF;
+
+    CRF_iofinish()
+      : CRF(nullptr) {}
+
+    void finish(int r) override {
+      CRF->finish_io(r);
+    }
+
+    // For _read_async, we may not finish in one go, so be prepared for multiple
+    // calls to complete. All the handling though is in C_Read_Finisher.
+    void complete(int r) override {
+      finish(r);
+      if (CRF->iofinished)
+        delete this;
+    }
+  };
+
+  class C_Read_Sync_NonBlocking : public Context {
+  // When operating in non-blocking mode, what used to be done by _read_sync
+  // still needs to be handled, but it needs to be handled without blocking
+  // while still following the semantics. Note that _read_sync is actually
+  // asynchronous. it just uses condition variables to wait. Now instead, we use
+  // this Context class to synchronize the steps.
+  //
+  // The steps will be accomplished by complete/finish being called to complete
+  // each step, with complete only releasing this object once all is finally
+  // complete.
+  public:
+    C_Read_Sync_NonBlocking(Client *clnt, Context *onfinish, Fh *f, Inode *in,
+                            uint64_t fpos, uint64_t off, uint64_t len,
+                            bufferlist *bl, Filer *filer, int have_caps)
+      : clnt(clnt), onfinish(onfinish), f(f), in(in), off(off), len(len), bl(bl),
+        filer(filer), have_caps(have_caps)
+    {
+      left = len;
+      wanted = len;
+      read = 0;
+      pos = off;
+      fini = false;
+    }
+
+    void retry();
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Fh *f;
+    Inode *in;
+    uint64_t off;
+    uint64_t len;
+    int left;
+    int wanted;
+    bufferlist *bl;
+    bufferlist tbl;
+    Filer *filer;
+    int have_caps;
+    int read;
+    uint64_t pos;
+    bool fini;
+
+    void finish(int r) override;
+
+    void complete(int r) override
+    {
+      finish(r);
+      if (fini)
+        delete this;
+    }
+  };
+
+  class C_Read_Async_Finisher : public Context {
+  public:
+    C_Read_Async_Finisher(Client *clnt, Context *onfinish, Fh *f, Inode *in,
+                          uint64_t fpos, uint64_t off, uint64_t len)
+      : clnt(clnt), onfinish(onfinish), f(f), in(in), off(off), len(len) {}
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    Fh *f;
+    Inode *in;
+    uint64_t off;
+    uint64_t len;
+
+    void finish(int r) override;
+  };
+
+  class C_Write_Finisher : public Context {
+  public:
+    void finish_io(int r);
+    void finish_onuninline(int r);
+    void finish_fsync(int r);
+
+    C_Write_Finisher(Client *clnt, Context *onfinish, bool dont_need_uninline,
+                     bool is_file_write, utime_t start, Fh *f, Inode *in,
+                     uint64_t fpos, int64_t offset, uint64_t size,
+                     bool do_fsync, bool syncdataonly)
+      : clnt(clnt), onfinish(onfinish),
+        is_file_write(is_file_write), start(start), f(f), in(in), fpos(fpos),
+        offset(offset), size(size), syncdataonly(syncdataonly) {
+      iofinished_r = 0;
+      onuninlinefinished_r = 0;
+      fsync_r = 0;
+      iofinished = false;
+      onuninlinefinished = dont_need_uninline;
+      fsync_finished = !do_fsync;
+    }
+
+    void finish(int r) override {
+      // We need to override finish, but have nothing to do.
+    }
+
+  private:
+    Client *clnt;
+    Context *onfinish;
+    bool is_file_write;
+    utime_t start;
+    Fh *f;
+    Inode *in;
+    uint64_t fpos;
+    int64_t offset;
+    uint64_t size;
+    bool syncdataonly;
+    int64_t iofinished_r;
+    int64_t onuninlinefinished_r;
+    int64_t fsync_r;
+    bool iofinished;
+    bool onuninlinefinished;
+    bool fsync_finished;
+    bool try_complete();
+  };
+
+  struct CWF_iofinish : public Context {
+    C_Write_Finisher *CWF;
+
+    CWF_iofinish()
+      : CWF(nullptr) {}
+
+    void finish(int r) override {
+      CWF->finish_io(r);
+    }
+  };
+
+  struct CWF_fsync_finish : public Context {
+    C_Write_Finisher *CWF;
+
+    CWF_fsync_finish(C_Write_Finisher *CWF)
+      : CWF(CWF) {}
+
+    void finish(int r) override {
+      CWF->finish_fsync(r);
+    }
+  };
+
+  struct C_nonblocking_fsync_state {
+    Client *clnt;
+
+    // nonblocking_fsync parms
+    Inode *in;
+    bool syncdataonly;
+    Context *onfinish;
+
+    // were local variables
+    ceph_tid_t flush_tid;
+    InodeRef tmp_ref;
+    utime_t start;
+    MetaRequest *req;
+
+    // we need to keep track of where we are
+    int progress;
+    bool flush_wait;
+    bool flush_completed;
+    int result;
+    bool waitfor_safe;
+
+    C_nonblocking_fsync_state(Client *clnt, Inode *in, bool syncdataonly, Context *onfinish)
+      : clnt(clnt), in(in), syncdataonly(syncdataonly), onfinish(onfinish) {
+      flush_tid = 0;
+      start = ceph_clock_now();
+      progress = 0;
+      flush_wait = false;
+      flush_completed = false;
+      result = 0;
+      waitfor_safe = false;
+    }
+
+    void advance();
+
+    void complete_flush(int r);
+  };
+
+  struct C_nonblocking_fsync_state_advancer : Context {
+    Client *clnt;
+    Client::C_nonblocking_fsync_state *state;
+
+    C_nonblocking_fsync_state_advancer(Client *clnt, Client::C_nonblocking_fsync_state *state)
+      : clnt(clnt), state(state) {
+    }
+
+    void finish(int r) override;
+  };
+
+  struct C_nonblocking_fsync_flush_finisher : Context {
+    Client *clnt;
+    Client::C_nonblocking_fsync_state *state;
+
+    C_nonblocking_fsync_flush_finisher(Client *clnt, Client::C_nonblocking_fsync_state *state)
+      : clnt(clnt), state(state) {
+    }
+
+    void finish(int r) override {
+      ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+      state->complete_flush(r);
+    }
+  };
+
   struct C_Readahead : public Context {
     C_Readahead(Client *c, Fh *f);
     ~C_Readahead() override;
@@ -1238,6 +1529,8 @@ private:
   struct VXattr {
     const std::string name;
     size_t (Client::*getxattr_cb)(Inode *in, char *val, size_t size);
+    int (Client::*setxattr_cb)(Inode *in, const void *val, size_t size,
+			       const UserPerm& perms);
     bool readonly;
     bool (Client::*exists_cb)(Inode *in);
     unsigned int flags;
@@ -1249,10 +1542,12 @@ private:
   };
 
   enum {
-    MAY_EXEC = 1,
-    MAY_WRITE = 2,
-    MAY_READ = 4,
+    CLIENT_MAY_EXEC = 1,
+    CLIENT_MAY_WRITE = 2,
+    CLIENT_MAY_READ = 4,
   };
+
+  typedef std::function<void(dir_result_t*, MetaRequest*, InodeRef&, frag_t)> fill_readdir_args_cb_t;
 
   std::unique_ptr<CephContext, std::function<void(CephContext*)>> cct_deleter;
 
@@ -1274,8 +1569,19 @@ private:
   bool _readdir_have_frag(dir_result_t *dirp);
   void _readdir_next_frag(dir_result_t *dirp);
   void _readdir_rechoose_frag(dir_result_t *dirp);
-  int _readdir_get_frag(dir_result_t *dirp);
+  int _readdir_get_frag(int op, dir_result_t *dirp,
+    fill_readdir_args_cb_t fill_req_cb);
   int _readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p, int caps, bool getref);
+  int _readdir_r_cb(int op,
+    dir_result_t* d,
+    add_dirent_cb_t cb,
+    fill_readdir_args_cb_t fill_cb,
+    void* p,
+    unsigned want,
+    unsigned flags,
+    bool getref,
+    bool bypass_cache);
+
   void _closedir(dir_result_t *dirp);
 
   // other helpers
@@ -1290,10 +1596,11 @@ private:
   int _release_fh(Fh *fh);
   void _put_fh(Fh *fh);
 
-  int _do_remount(bool retry_on_error);
+  std::pair<int, bool> _do_remount(bool retry_on_error);
 
   int _read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl, bool *checkeof);
-  int _read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl);
+  int _read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
+                  Context *onfinish);
 
   bool _dentry_valid(const Dentry *dn);
 
@@ -1303,7 +1610,8 @@ private:
 		 const UserPerm& perms);
 
   int _lookup(Inode *dir, const std::string& dname, int mask, InodeRef *target,
-	      const UserPerm& perm, std::string* alternate_name=nullptr);
+	      const UserPerm& perm, std::string* alternate_name=nullptr,
+              bool is_rename=false);
 
   int _link(Inode *in, Inode *dir, const char *name, const UserPerm& perm, std::string alternate_name,
 	    InodeRef *inp = 0);
@@ -1318,7 +1626,8 @@ private:
   int _mknod(Inode *dir, const char *name, mode_t mode, dev_t rdev,
 	     const UserPerm& perms, InodeRef *inp = 0);
   int _do_setattr(Inode *in, struct ceph_statx *stx, int mask,
-		  const UserPerm& perms, InodeRef *inp);
+		  const UserPerm& perms, InodeRef *inp,
+		  std::vector<uint8_t>* aux=nullptr);
   void stat_to_statx(struct stat *st, struct ceph_statx *stx);
   int __setattrx(Inode *in, struct ceph_statx *stx, int mask,
 		 const UserPerm& perms, InodeRef *inp = 0);
@@ -1337,6 +1646,8 @@ private:
 		const UserPerm& perms);
   int _getxattr(InodeRef &in, const char *name, void *value, size_t len,
 		const UserPerm& perms);
+  int _getvxattr(Inode *in, const UserPerm& perms, const char *attr_name,
+                 ssize_t size, void *value, mds_rank_t rank);
   int _listxattr(Inode *in, char *names, size_t len, const UserPerm& perms);
   int _do_setxattr(Inode *in, const char *name, const void *value, size_t len,
 		   int flags, const UserPerm& perms);
@@ -1357,26 +1668,36 @@ private:
               std::string alternate_name);
 
   loff_t _lseek(Fh *fh, loff_t offset, int whence);
-  int64_t _read(Fh *fh, int64_t offset, uint64_t size, bufferlist *bl);
+  int64_t _read(Fh *fh, int64_t offset, uint64_t size, bufferlist *bl,
+  		Context *onfinish = nullptr);
+  void do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len);
+  int64_t _write_success(Fh *fh, utime_t start, uint64_t fpos,
+          int64_t offset, uint64_t size, Inode *in);
   int64_t _write(Fh *fh, int64_t offset, uint64_t size, const char *buf,
-          const struct iovec *iov, int iovcnt);
+          const struct iovec *iov, int iovcnt, Context *onfinish = nullptr,
+          bool do_fsync = false, bool syncdataonly = false);
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                  unsigned iovcnt, int64_t offset,
-                                 bool write, bool clamp_to_int);
+                                 bool write, bool clamp_to_int,
+                                 Context *onfinish = nullptr,
+                                 bufferlist *blp = nullptr,
+                                 bool do_fsync = false, bool syncdataonly = false);
   int _preadv_pwritev(int fd, const struct iovec *iov, unsigned iovcnt,
-                      int64_t offset, bool write);
+                      int64_t offset, bool write, Context *onfinish = nullptr,
+                      bufferlist *blp = nullptr);
   int _flush(Fh *fh);
+  void nonblocking_fsync(Inode *in, bool syncdataonly, Context *onfinish);
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);
   int _sync_fs();
+  int clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer=false);
   int _fallocate(Fh *fh, int mode, int64_t offset, int64_t length);
   int _getlk(Fh *fh, struct flock *fl, uint64_t owner);
   int _setlk(Fh *fh, struct flock *fl, uint64_t owner, int sleep);
   int _flock(Fh *fh, int cmd, uint64_t owner);
   int _lazyio(Fh *fh, int enable);
 
-  int get_or_create(Inode *dir, const char* name,
-		    Dentry **pdn, bool expect_null=false);
+  Dentry *get_or_create(Inode *dir, const char* name);
 
   int xattr_permission(Inode *in, const char *name, unsigned want,
 		       const UserPerm& perms);
@@ -1392,6 +1713,12 @@ private:
 
   vinodeno_t _get_vino(Inode *in);
 
+  bool _vxattrcb_fscrypt_auth_exists(Inode *in);
+  size_t _vxattrcb_fscrypt_auth(Inode *in, char *val, size_t size);
+  int _vxattrcb_fscrypt_auth_set(Inode *in, const void *val, size_t size, const UserPerm& perms);
+  bool _vxattrcb_fscrypt_file_exists(Inode *in);
+  size_t _vxattrcb_fscrypt_file(Inode *in, char *val, size_t size);
+  int _vxattrcb_fscrypt_file_set(Inode *in, const void *val, size_t size, const UserPerm& perms);
   bool _vxattrcb_quota_exists(Inode *in);
   size_t _vxattrcb_quota(Inode *in, char *val, size_t size);
   size_t _vxattrcb_quota_max_bytes(Inode *in, char *val, size_t size);
@@ -1454,6 +1781,10 @@ private:
   void collect_and_send_metrics();
   void collect_and_send_global_metrics();
 
+  void update_io_stat_metadata(utime_t latency);
+  void update_io_stat_read(utime_t latency);
+  void update_io_stat_write(utime_t latency);
+
   uint32_t deleg_timeout = 0;
 
   client_switch_interrupt_callback_t switch_interrupt_cb = nullptr;
@@ -1472,7 +1803,7 @@ private:
   Finisher async_ino_releasor;
   Finisher objecter_finisher;
 
-  utime_t last_cap_renew;
+  ceph::coarse_mono_time last_cap_renew;
 
   CommandHook m_command_hook;
 
@@ -1533,8 +1864,8 @@ private:
   ceph::unordered_map<inodeno_t,SnapRealm*> snap_realms;
   std::map<std::string, std::string> metadata;
 
-  utime_t last_auto_reconnect;
-
+  ceph::coarse_mono_time last_auto_reconnect;
+  std::chrono::seconds caps_release_delay, mount_timeout;
   // trace generation
   std::ofstream traceout;
 
@@ -1543,10 +1874,11 @@ private:
   std::map<std::pair<int64_t,std::string>, int> pool_perms;
   std::list<ceph::condition_variable*> waiting_for_pool_perm;
 
+  std::list<ceph::condition_variable*> waiting_for_rename;
+
   uint64_t retries_on_invalidate = 0;
 
   // state reclaim
-  std::list<ceph::condition_variable*> waiting_for_reclaim;
   int reclaim_errno = 0;
   epoch_t reclaim_osd_epoch = 0;
   entity_addrvec_t reclaim_target_addrs;
@@ -1571,6 +1903,12 @@ private:
 
   ceph::spinlock delay_i_lock;
   std::map<Inode*,int> delay_i_release;
+
+  uint64_t nr_metadata_request = 0;
+  uint64_t nr_read_request = 0;
+  uint64_t nr_write_request = 0;
+
+  std::vector<MDSCapAuth> cap_auths;
 };
 
 /**

@@ -127,16 +127,30 @@ export class ActionLabelsI18n {
   FLAGS: string;
   ENTER_MAINTENANCE: string;
   EXIT_MAINTENANCE: string;
+  REMOVE_SCHEDULING: string;
+  PROMOTE: string;
+  DEMOTE: string;
   START_DRAIN: string;
   STOP_DRAIN: string;
   START: string;
   STOP: string;
   REDEPLOY: string;
   RESTART: string;
+  RESYNC: string;
+  EXPORT: string;
+  IMPORT: any;
+  MIGRATE: string;
+  START_UPGRADE: string;
 
   constructor() {
     /* Create a new item */
     this.CREATE = $localize`Create`;
+
+    this.EXPORT = $localize`Export`;
+
+    this.IMPORT = $localize`Import`;
+
+    this.MIGRATE = $localize`Migrate to Multi-Site`;
 
     /* Destroy an existing item */
     this.DELETE = $localize`Delete`;
@@ -186,9 +200,10 @@ export class ActionLabelsI18n {
     this.FLAGS = $localize`Flags`;
     this.ENTER_MAINTENANCE = $localize`Enter Maintenance`;
     this.EXIT_MAINTENANCE = $localize`Exit Maintenance`;
+
     this.START_DRAIN = $localize`Start Drain`;
     this.STOP_DRAIN = $localize`Stop Drain`;
-
+    this.RESYNC = $localize`Resync`;
     /* Prometheus wording */
     this.RECREATE = $localize`Recreate`;
     this.EXPIRE = $localize`Expire`;
@@ -197,6 +212,12 @@ export class ActionLabelsI18n {
     this.STOP = $localize`Stop`;
     this.REDEPLOY = $localize`Redeploy`;
     this.RESTART = $localize`Restart`;
+
+    this.REMOVE_SCHEDULING = $localize`Remove Scheduling`;
+    this.PROMOTE = $localize`Promote`;
+    this.DEMOTE = $localize`Demote`;
+
+    this.START_UPGRADE = $localize`Start Upgrade`;
   }
 }
 
@@ -215,6 +236,8 @@ export class SucceededActionLabelsI18n {
   CANCELED: string;
   PREVIEWED: string;
   MOVED: string;
+  EXPORT: string;
+  IMPORT: string;
   COPIED: string;
   CLONED: string;
   DEEP_SCRUBBED: string;
@@ -292,5 +315,16 @@ export class SucceededActionLabelsI18n {
     this.STOP = $localize`Stop`;
     this.REDEPLOY = $localize`Redeploy`;
     this.RESTART = $localize`Restart`;
+  }
+}
+
+@Injectable({
+  providedIn: 'root'
+})
+export class TimerServiceInterval {
+  TIMER_SERVICE_PERIOD: number;
+
+  constructor() {
+    this.TIMER_SERVICE_PERIOD = 5000;
   }
 }

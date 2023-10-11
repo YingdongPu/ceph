@@ -304,11 +304,10 @@ For example::
 
 .. tip:: ``rbd-mirror`` tunables are set by default to values suitable for
    mirroring an entire pool.  When using ``rbd-mirror`` to migrate single
-   volumes been clusters you may achieve substantial performance gains
-   by setting ``rbd_mirror_journal_max_fetch_bytes=33554432`` and
-   ``rbd_journal_max_payload_bytes=8388608`` within the ``[client]`` config
-   section of the local or centralized configuration.  Note that these
-   settings may allow ``rbd-mirror`` to present a substantial write workload
+   volumes between clusters you may achieve substantial performance gains
+   by setting ``rbd_journal_max_payload_bytes=8388608`` within the ``[client]``
+   config section of the local or centralized configuration.  Note that this
+   setting may allow ``rbd-mirror`` to present a substantial write workload
    to the destination cluster:  monitor cluster performance closely during
    migrations and test carefully before running multiple migrations in parallel.
 
@@ -326,7 +325,7 @@ For example::
 
         $ rbd --cluster site-a mirror image snapshot image-pool/image-1
 
-By default only ``3`` mirror-snapshots will be created per-image. The most
+By default up to ``5`` mirror-snapshots will be created per-image. The most
 recent mirror-snapshot is automatically pruned if the limit is reached.
 The limit can be overridden via the ``rbd_mirroring_max_mirroring_snapshots``
 configuration option if required. Additionally, mirror-snapshots are

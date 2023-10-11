@@ -1,5 +1,5 @@
 import { Component, Input, OnChanges, OnInit, TemplateRef, ViewChild } from '@angular/core';
-import { Validators } from '@angular/forms';
+import { AbstractControl, Validators } from '@angular/forms';
 
 import {
   ITreeOptions,
@@ -17,6 +17,7 @@ import { ConfirmationModalComponent } from '~/app/shared/components/confirmation
 import { CriticalConfirmationModalComponent } from '~/app/shared/components/critical-confirmation-modal/critical-confirmation-modal.component';
 import { FormModalComponent } from '~/app/shared/components/form-modal/form-modal.component';
 import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
 import { Icons } from '~/app/shared/enum/icons.enum';
 import { NotificationType } from '~/app/shared/enum/notification-type.enum';
 import { CdValidators } from '~/app/shared/forms/cd-validators';
@@ -103,6 +104,7 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     updateSelection: Function;
   };
   nodes: any[];
+  alreadyExists: boolean;
 
   constructor(
     private authStorageService: AuthStorageService,
@@ -199,8 +201,8 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
         {
           prop: 'path',
           name: $localize`Path`,
-          isHidden: true,
-          flexGrow: 2
+          flexGrow: 1.5,
+          cellTransformation: CellTemplate.path
         },
         {
           prop: 'created',
@@ -236,7 +238,7 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
 
   private disableCreateSnapshot(): string | boolean {
     const folders = this.selectedDir.path.split('/').slice(1);
-    // With deph of 4 or more we have the subvolume files/folders for which we cannot create
+    // With depth of 4 or more we have the subvolume files/folders for which we cannot create
     // a snapshot. Somehow, you can create a snapshot of the subvolume but not its files.
     if (folders.length >= 4 && folders[0] === 'volumes') {
       return $localize`Cannot create snapshots for files/folders in the subvolume ${folders[2]}`;
@@ -546,20 +548,32 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
           type: 'text',
           name: 'name',
           value: `${moment().toISOString(true)}`,
-          required: true
+          required: true,
+          validators: [this.validateValue.bind(this)]
         }
       ],
       submitButtonText: $localize`Create Snapshot`,
       onSubmit: (values: CephfsSnapshot) => {
-        this.cephfsService.mkSnapshot(this.id, path, values.name).subscribe((name) => {
+        if (!this.alreadyExists) {
+          this.cephfsService.mkSnapshot(this.id, path, values.name).subscribe((name) => {
+            this.notificationService.show(
+              NotificationType.success,
+              $localize`Created snapshot '${name}' for '${path}'`
+            );
+            this.forceDirRefresh();
+          });
+        } else {
           this.notificationService.show(
-            NotificationType.success,
-            $localize`Created snapshot '${name}' for '${path}'`
+            NotificationType.error,
+            $localize`Snapshot name '${values.name}' is already in use. Please use another name.`
           );
-          this.forceDirRefresh();
-        });
+        }
       }
     });
+  }
+
+  validateValue(control: AbstractControl) {
+    this.alreadyExists = this.selectedDir.snapshots.some((s) => s.name === control.value);
   }
 
   /**
@@ -627,7 +641,7 @@ export class CephfsDirectoriesComponent implements OnInit, OnChanges {
     }
     const node = this.getNode(parent);
     if (!node) {
-      // Node will not be found for new sub sub directories - this is the intended behaviour
+      // Node will not be found for new sub directories - this is the intended behaviour
       return;
     }
     const children = this.getChildren(parent);

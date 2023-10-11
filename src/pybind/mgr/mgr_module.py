@@ -1,7 +1,7 @@
 import ceph_module  # noqa
 
 from typing import cast, Tuple, Any, Dict, Generic, Optional, Callable, List, \
-    Mapping, NamedTuple, Sequence, Union, TYPE_CHECKING
+    Mapping, NamedTuple, Sequence, Union, Set, TYPE_CHECKING
 if TYPE_CHECKING:
     import sys
     if sys.version_info >= (3, 8):
@@ -329,6 +329,26 @@ class CRUSHMap(ceph_module.BasePyCRUSH):
 
 HandlerFuncType = Callable[..., Tuple[int, str, str]]
 
+def _extract_target_func(
+    f: HandlerFuncType
+) -> Tuple[HandlerFuncType, Dict[str, Any]]:
+    """In order to interoperate with other decorated functions,
+    we need to find the original function which will provide
+    the main set of arguments. While we descend through the
+    stack of wrapped functions, gather additional arguments
+    the decorators may want to provide.
+    """
+    # use getattr to keep mypy happy
+    wrapped = getattr(f, "__wrapped__", None)
+    if not wrapped:
+        return f, {}
+    extra_args: Dict[str, Any] = {}
+    while wrapped is not None:
+        extra_args.update(getattr(f, "extra_args", {}))
+        f = wrapped
+        wrapped = getattr(f, "__wrapped__", None)
+    return f, extra_args
+
 
 class CLICommand(object):
     COMMANDS = {}  # type: Dict[str, CLICommand]
@@ -346,8 +366,9 @@ class CLICommand(object):
 
     KNOWN_ARGS = '_', 'self', 'mgr', 'inbuf', 'return'
 
-    @staticmethod
-    def load_func_metadata(f: HandlerFuncType) -> Tuple[str, Dict[str, Any], int, str]:
+    @classmethod
+    def _load_func_metadata(cls: Any, f: HandlerFuncType) -> Tuple[str, Dict[str, Any], int, str]:
+        f, extra_args = _extract_target_func(f)
         desc = (inspect.getdoc(f) or '').replace('\n', ' ')
         full_argspec = inspect.getfullargspec(f)
         arg_spec = full_argspec.annotations
@@ -357,7 +378,11 @@ class CLICommand(object):
         args = []
         positional = True
         for index, arg in enumerate(full_argspec.args):
-            if arg in CLICommand.KNOWN_ARGS:
+            if arg in cls.KNOWN_ARGS:
+                # record that this function takes an inbuf if it is present
+                # in the full_argspec and not already in the arg_spec
+                if arg == 'inbuf' and 'inbuf' not in arg_spec:
+                    arg_spec['inbuf'] = 'str'
                 continue
             if arg == '_end_positional_':
                 positional = False
@@ -377,11 +402,19 @@ class CLICommand(object):
                                                dict(name=arg),
                                                has_default,
                                                positional))
+        for argname, argtype in extra_args.items():
+            # avoid shadowing args from the function
+            if argname in arg_spec:
+                continue
+            arg_spec[argname] = argtype
+            args.append(CephArgtype.to_argdesc(
+                argtype, dict(name=argname), has_default=True, positional=False
+            ))
         return desc, arg_spec, first_default, ' '.join(args)
 
     def store_func_metadata(self, f: HandlerFuncType) -> None:
         self.desc, self.arg_spec, self.first_default, self.args = \
-            self.load_func_metadata(f)
+            self._load_func_metadata(f)
 
     def __call__(self, func: HandlerFuncType) -> HandlerFuncType:
         self.store_func_metadata(func)
@@ -406,11 +439,13 @@ class CLICommand(object):
             k, v = key, val
         return kwargs_switch, k.replace('-', '_'), v
 
-    def _collect_args_by_argspec(self, cmd_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def _collect_args_by_argspec(self, cmd_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], Set[str]]:
         kwargs = {}
+        special_args = set()
         kwargs_switch = False
         for index, (name, tp) in enumerate(self.arg_spec.items()):
             if name in CLICommand.KNOWN_ARGS:
+                special_args.add(name)
                 continue
             assert self.first_default >= 0
             raw_v = cmd_dict.get(name)
@@ -420,14 +455,20 @@ class CLICommand(object):
             kwargs_switch, k, v = self._get_arg_value(kwargs_switch,
                                                       name, raw_v)
             kwargs[k] = CephArgtype.cast_to(tp, v)
-        return kwargs
+        return kwargs, special_args
 
     def call(self,
              mgr: Any,
              cmd_dict: Dict[str, Any],
              inbuf: Optional[str] = None) -> HandleCommandResult:
-        kwargs = self._collect_args_by_argspec(cmd_dict)
+        kwargs, specials = self._collect_args_by_argspec(cmd_dict)
         if inbuf:
+            if 'inbuf' not in specials:
+                return HandleCommandResult(
+                    -errno.EINVAL,
+                    '',
+                    'Invalid command: Input file data (-i) not supported',
+                )
             kwargs['inbuf'] = inbuf
         assert self.func
         return self.func(mgr, **kwargs)
@@ -470,6 +511,28 @@ def CLICheckNonemptyFileInput(desc: str) -> Callable[[HandlerFuncType], HandlerF
         check.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
         return check
     return CheckFileInput
+
+# If the mgr loses its lock on the database because e.g. the pgs were
+# transiently down, then close it and allow it to be reopened.
+MAX_DBCLEANUP_RETRIES = 3
+def MgrModuleRecoverDB(func: Callable) -> Callable:
+    @functools.wraps(func)
+    def check(self: MgrModule, *args: Any, **kwargs: Any) -> Any:
+        retries = 0
+        while True:
+            try:
+                return func(self, *args, **kwargs)
+            except sqlite3.DatabaseError as e:
+                self.log.error(f"Caught fatal database error: {e}")
+                retries = retries+1
+                if retries > MAX_DBCLEANUP_RETRIES:
+                    raise
+                self.log.debug(f"attempting reopen of database")
+                self.close_db()
+                self.open_db();
+                # allow retry of func(...)
+    check.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
+    return check
 
 def CLIRequiresDB(func: HandlerFuncType) -> HandlerFuncType:
     @functools.wraps(func)
@@ -856,6 +919,9 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
             return socket.gethostname()
         return ips[0]
 
+    def get_hostname(self) -> str:
+        return socket.gethostname()
+
     def get_localized_module_option(self, key: str, default: OptionValue = None) -> OptionValue:
         r = self._ceph_get_module_option(key, self.get_mgr_id())
         if r is None:
@@ -1044,6 +1110,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             'format': 'json',
             'srcpool': srcpool,
             'destpool': destpool,
+            'yes_i_really_mean_it': True
         }
         self.check_mon_command(c)
 
@@ -1057,6 +1124,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             'pg_num': 1,
             'pg_num_min': 1,
             'pg_num_max': 32,
+            'yes_i_really_mean_it': True
         }
         self.check_mon_command(c)
 
@@ -1136,7 +1204,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         if version <= 0:
             self.log.info(f"creating main.db for {self.module_name}")
             assert self.SCHEMA is not None
-            cur = db.executescript(self.SCHEMA)
+            db.executescript(self.SCHEMA)
             self.update_schema_version(db, 1)
         else:
             assert self.SCHEMA_VERSIONED is not None
@@ -1168,8 +1236,15 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         db.execute('PRAGMA JOURNAL_MODE = PERSIST')
         db.execute('PRAGMA PAGE_SIZE = 65536')
         db.execute('PRAGMA CACHE_SIZE = 64')
+        db.execute('PRAGMA TEMP_STORE = memory')
         db.row_factory = sqlite3.Row
         self.load_schema(db)
+
+    def close_db(self) -> None:
+        with self._db_lock:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
 
     def open_db(self) -> Optional[sqlite3.Connection]:
         if not self.pool_exists(self.MGR_POOL_NAME):
@@ -1179,6 +1254,13 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         uri = f"file:///{self.MGR_POOL_NAME}:{self.module_name}/main.db?vfs=ceph";
         self.log.debug(f"using uri {uri}")
         db = sqlite3.connect(uri, check_same_thread=False, uri=True)
+        # if libcephsqlite reconnects, update the addrv for blocklist
+        with db:
+            cur = db.execute('SELECT json_extract(ceph_status(), "$.addr");')
+            (addrv,) = cur.fetchone()
+            assert addrv is not None
+            self.log.debug(f"new libcephsqlite addrv = {addrv}")
+            self._ceph_register_client("libcephsqlite", addrv, True)
         self.configure_db(db)
         return db
 
@@ -1294,7 +1376,8 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         if self._rados:
             addrs = self._rados.get_addrs()
             self._rados.shutdown()
-            self._ceph_unregister_client(addrs)
+            self._ceph_unregister_client(None, addrs)
+            self._rados = None
 
     @API.expose
     def get(self, data_name: str) -> Any:
@@ -1533,7 +1616,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         :rtype: dict, or None if no metadata found
         """
         metadata = self._ceph_get_metadata(svc_type, svc_id)
-        if metadata is None:
+        if not metadata:
             return default
         return metadata
 
@@ -1605,6 +1688,31 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         self.log.debug("osd_command: '{0}' -> {1} in {2:.3f}s".format(
             cmd_dict['prefix'], r[0], t2 - t1
+        ))
+
+        return r
+
+    def tell_command(self, daemon_type: str, daemon_id: str, cmd_dict: dict, inbuf: Optional[str] = None) -> Tuple[int, str, str]:
+        """
+        Helper for `ceph tell` command execution.
+
+        See send_command for general case.
+
+        :param dict cmd_dict: expects a prefix i.e.:
+            cmd_dict = {
+                'prefix': 'heap',
+                'heapcmd': 'stats',
+            }
+        :return: status int, out std, err str
+        """
+        t1 = time.time()
+        result = CommandResult()
+        self.send_command(result, daemon_type, daemon_id, json.dumps(cmd_dict), "", inbuf)
+        r = result.wait()
+        t2 = time.time()
+
+        self.log.debug("tell_command on {0}.{1}: '{2}' -> {3} in {4:.5f}s".format(
+            daemon_type, daemon_id, cmd_dict['prefix'], r[0], t2 - t1
         ))
 
         return r
@@ -1748,6 +1856,10 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             self._mgr_ips = ips[0]
         assert self._mgr_ips is not None
         return self._mgr_ips
+
+    @API.expose
+    def get_hostname(self) -> str:
+        return socket.gethostname()
 
     @API.expose
     def get_ceph_option(self, key: str) -> OptionValue:
@@ -1945,7 +2057,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
     @API.expose
     @profile_method()
-    def get_all_perf_counters(self, prio_limit: int = PRIO_USEFUL,
+    def get_unlabeled_perf_counters(self, prio_limit: int = PRIO_USEFUL,
                               services: Sequence[str] = ("mds", "mon", "osd",
                                                          "rbd-mirror", "rgw",
                                                          "tcmu-runner")) -> Dict[str, dict]:
@@ -2071,7 +2183,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         ctx_capsule = self.get_context()
         self._rados = rados.Rados(context=ctx_capsule)
         self._rados.connect()
-        self._ceph_register_client(self._rados.get_addrs())
+        self._ceph_register_client(None, self._rados.get_addrs(), False)
         return self._rados
 
     @staticmethod
@@ -2204,6 +2316,13 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         return self._ceph_remove_mds_perf_query(query_id)
 
     @API.expose
+
+    def reregister_mds_perf_queries(self) -> None:
+        """
+        Re-register MDS perf queries.
+        """
+        return self._ceph_reregister_mds_perf_queries()
+
     def get_mds_perf_counters(self, query_id: int) -> Optional[Dict[str, List[PerfCounterT]]]:
         """
         Get stats collected for an MDS perf query.
@@ -2211,6 +2330,13 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         :param int query_id: query ID
         """
         return self._ceph_get_mds_perf_counters(query_id)
+
+    def get_daemon_health_metrics(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get the list of health metrics per daemon. This includes SLOW_OPS health metrics
+        in MON and OSD daemons, and PENDING_CREATING_PGS health metrics for OSDs.
+        """
+        return self._ceph_get_daemon_health_metrics()
 
     def is_authorized(self, arguments: Dict[str, str]) -> bool:
         """

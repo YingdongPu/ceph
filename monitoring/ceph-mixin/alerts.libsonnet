@@ -1,3 +1,4 @@
 {
-  prometheusAlerts+:: std.parseYaml(importstr 'prometheus_alerts.yaml'),
+  prometheusAlerts+:: (import 'prometheus_alerts.libsonnet') +
+                      { _config:: $._config },
 }

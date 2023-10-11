@@ -15,11 +15,15 @@
 #ifndef CEPH_MESSAGE_H
 #define CEPH_MESSAGE_H
 
+#include <concepts>
 #include <cstdlib>
 #include <ostream>
 #include <string_view>
 
 #include <boost/intrusive/list.hpp>
+#if FMT_VERSION >= 90000
+#include <fmt/ostream.h>
+#endif
 
 #include "include/Context.h"
 #include "common/RefCountedObj.h"
@@ -34,10 +38,6 @@
 #include "msg/Connection.h"
 #include "msg/MessageRef.h"
 #include "msg_types.h"
-
-#ifdef WITH_SEASTAR
-#  include "crimson/net/SocketConnection.h"
-#endif // WITH_SEASTAR
 
 // monitor internal
 #define MSG_MON_SCRUB              64
@@ -58,6 +58,7 @@
 #define MSG_GETPOOLSTATSREPLY      59
 
 #define MSG_MON_GLOBAL_ID          60
+#define MSG_MON_USED_PENDING_KEYS  141
 
 #define MSG_ROUTE                  47
 #define MSG_FORWARD                46
@@ -235,6 +236,9 @@
 #define MSG_MGR_COMMAND           0x709
 #define MSG_MGR_COMMAND_REPLY     0x70a
 
+// *** ceph-mgr <-> MON daemons ***
+#define MSG_MGR_UPDATE     0x70b
+
 // ======================================================
 
 // abstract Message class
@@ -242,10 +246,11 @@
 class Message : public RefCountedObject {
 public:
 #ifdef WITH_SEASTAR
-  using ConnectionRef = crimson::net::ConnectionRef;
+  // In crimson, conn is independently maintained outside Message.
+  using ConnectionRef = void*;
 #else
   using ConnectionRef = ::ConnectionRef;
-#endif // WITH_SEASTAR
+#endif
 
 protected:
   ceph_msg_header  header;      // headerelope
@@ -340,8 +345,17 @@ protected:
       completion_hook->complete(0);
   }
 public:
-  const ConnectionRef& get_connection() const { return connection; }
+  const ConnectionRef& get_connection() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#endif
+    return connection;
+  }
   void set_connection(ConnectionRef c) {
+#ifdef WITH_SEASTAR
+    // In crimson, conn is independently maintained outside Message.
+    ceph_assert(c == nullptr);
+#endif
     connection = std::move(c);
   }
   CompletionHook* get_completion_hook() { return completion_hook; }
@@ -478,13 +492,21 @@ public:
     return entity_name_t(header.src);
   }
   entity_addr_t get_source_addr() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
     if (connection)
       return connection->get_peer_addr();
+#endif
     return entity_addr_t();
   }
   entity_addrvec_t get_source_addrs() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
     if (connection)
       return connection->get_peer_addrs();
+#endif
     return entity_addrvec_t();
   }
 
@@ -541,6 +563,14 @@ extern Message *decode_message(CephContext *cct, int crcflags,
 class SafeMessage : public Message {
 public:
   using Message::Message;
+  bool is_a_client() const {
+#ifdef WITH_SEASTAR
+    ceph_abort("In crimson, conn is independently maintained outside Message");
+#else
+    return get_connection()->get_peer_type() == CEPH_ENTITY_TYPE_CLIENT;
+#endif
+  }
+
 private:
   using RefCountedObject::get;
   using RefCountedObject::put;
@@ -559,4 +589,26 @@ MURef<T> make_message(Args&&... args) {
   return {new T(std::forward<Args>(args)...), TOPNSPC::common::UniquePtrDeleter{}};
 }
 }
+
+namespace fmt {
+// placed in the fmt namespace due to an ADL bug in g++ < 12
+// (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=92944).
+// Specifically - gcc pre-12 can't handle two templated specializations of
+// the formatter if in two different namespaces.
+template <std::derived_from<Message> M>
+struct formatter<M> {
+  constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const M& m, FormatContext& ctx) const {
+    std::ostringstream oss;
+    m.print(oss);
+    if (auto ver = m.get_header().version; ver) {
+      return fmt::format_to(ctx.out(), "{} v{}", oss.str(), ver);
+    } else {
+      return fmt::format_to(ctx.out(), "{}", oss.str());
+    }
+  }
+};
+}  // namespace fmt
+
 #endif

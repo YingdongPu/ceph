@@ -62,6 +62,7 @@ public:
       default_metadata_range(dmr)
   {}
 
+  virtual bool is_alive() const = 0;
   virtual const onode_layout_t &get_layout() const = 0;
   virtual onode_layout_t &get_mutable_layout(Transaction &t) = 0;
   virtual ~Onode() = default;
@@ -82,3 +83,7 @@ public:
 std::ostream& operator<<(std::ostream &out, const Onode &rhs);
 using OnodeRef = boost::intrusive_ptr<Onode>;
 }
+
+#if FMT_VERSION >= 90000
+template<> struct fmt::formatter<crimson::os::seastore::Onode> : fmt::ostream_formatter {};
+#endif

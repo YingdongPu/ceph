@@ -25,11 +25,14 @@ private:
   Dentry *_old_dentry = NULL; //associated with path2
   int abort_rc = 0;
 public:
+  ceph::coarse_mono_time created = ceph::coarse_mono_clock::zero();
   uint64_t tid = 0;
   utime_t  op_stamp;
   ceph_mds_request_head head;
   filepath path, path2;
   std::string alternate_name;
+  std::vector<uint8_t>	fscrypt_auth;
+  std::vector<uint8_t>	fscrypt_file;
   bufferlist data;
   int inode_drop = 0;   //the inode caps this operation will drop
   int inode_unless = 0; //unless we have these caps already
@@ -67,7 +70,7 @@ public:
 
   ceph::condition_variable *caller_cond = NULL;   // who to take up
   ceph::condition_variable *dispatch_cond = NULL; // who to kick back
-  std::list<ceph::condition_variable*> waitfor_safe;
+  std::list<Context*> waitfor_safe;
 
   InodeRef target;
   UserPerm perms;
@@ -77,6 +80,8 @@ public:
     unsafe_target_item(this) {
     memset(&head, 0, sizeof(head));
     head.op = op;
+    head.owner_uid = -1;
+    head.owner_gid = -1;
   }
   ~MetaRequest();
 
@@ -150,17 +155,24 @@ public:
     return v == 0;
   }
 
+  void set_inode_owner_uid_gid(unsigned u, unsigned g) {
+    /* it makes sense to set owner_{u,g}id only for OPs which create inodes */
+    ceph_assert(IS_CEPH_MDS_OP_NEWINODE(head.op));
+    head.owner_uid = u;
+    head.owner_gid = g;
+  }
+
   // normal fields
   void set_tid(ceph_tid_t t) { tid = t; }
   void set_oldest_client_tid(ceph_tid_t t) { head.oldest_client_tid = t; }
-  void inc_num_fwd() { head.num_fwd = head.num_fwd + 1; }
-  void set_retry_attempt(int a) { head.num_retry = a; }
+  void inc_num_fwd() { head.ext_num_fwd = head.ext_num_fwd + 1; }
+  void set_retry_attempt(int a) { head.ext_num_retry = a; }
   void set_filepath(const filepath& fp) { path = fp; }
   void set_filepath2(const filepath& fp) { path2 = fp; }
   void set_alternate_name(std::string an) { alternate_name = an; }
   void set_string2(const char *s) { path2.set_path(std::string_view(s), 0); }
   void set_caller_perms(const UserPerm& _perms) {
-    perms.shallow_copy(_perms);
+    perms = _perms;
     head.caller_uid = perms.uid();
     head.caller_gid = perms.gid();
   }
@@ -186,12 +198,45 @@ public:
       return false;
     return true;
   }
-  bool auth_is_best() {
-    if ((head.op & CEPH_MDS_OP_WRITE) || head.op == CEPH_MDS_OP_OPEN ||
-        (head.op == CEPH_MDS_OP_GETATTR && (head.args.getattr.mask & CEPH_STAT_RSTAT)) ||
-	head.op == CEPH_MDS_OP_READDIR || send_to_auth) 
+  bool auth_is_best(int issued) {
+    if (send_to_auth)
       return true;
-    return false;    
+
+    /* Any write op ? */
+    if (head.op & CEPH_MDS_OP_WRITE)
+      return true;
+
+    switch (head.op) {
+    case CEPH_MDS_OP_OPEN:
+    case CEPH_MDS_OP_READDIR:
+      return true;
+    case CEPH_MDS_OP_GETATTR:
+      /*
+       * If any 'x' caps is issued we can just choose the auth MDS
+       * instead of the random replica MDSes. Because only when the
+       * Locker is in LOCK_EXEC state will the loner client could
+       * get the 'x' caps. And if we send the getattr requests to
+       * any replica MDS it must auth pin and tries to rdlock from
+       * the auth MDS, and then the auth MDS need to do the Locker
+       * state transition to LOCK_SYNC. And after that the lock state
+       * will change back.
+       *
+       * This cost much when doing the Locker state transition and
+       * usually will need to revoke caps from clients.
+       *
+       * And for the 'Xs' caps for getxattr we will also choose the
+       * auth MDS, because the MDS side code is buggy due to setxattr
+       * won't notify the replica MDSes when the values changed and
+       * the replica MDS will return the old values. Though we will
+       * fix it in MDS code, but this still makes sense for old ceph.
+       */
+      if (((head.args.getattr.mask & CEPH_CAP_ANY_SHARED) &&
+	   (issued & CEPH_CAP_ANY_EXCL)) ||
+          (head.args.getattr.mask & (CEPH_STAT_RSTAT | CEPH_STAT_CAP_XATTR)))
+        return true;
+    default:
+      return false;
+    }
   }
 
   void dump(Formatter *f) const;

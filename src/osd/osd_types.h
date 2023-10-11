@@ -31,6 +31,7 @@
 
 #include "include/rados/rados_types.hpp"
 #include "include/mempool.h"
+#include "common/fmt_common.h"
 
 #include "msg/msg_types.h"
 #include "include/compat.h"
@@ -47,7 +48,6 @@
 #include "common/snap_types.h"
 #include "HitSet.h"
 #include "Watch.h"
-#include "include/cmp.h"
 #include "librados/ListObjectImpl.h"
 #include "compressor/Compressor.h"
 #include "osd_perf_counters.h"
@@ -196,10 +196,9 @@ struct pg_shard_t {
       f->dump_unsigned("shard", shard);
     }
   }
+  auto operator<=>(const pg_shard_t&) const = default;
 };
 WRITE_CLASS_ENCODER(pg_shard_t)
-WRITE_EQ_OPERATORS_2(pg_shard_t, osd, shard)
-WRITE_CMP_OPERATORS_2(pg_shard_t, osd, shard)
 std::ostream& operator<<(std::ostream &lhs, const pg_shard_t &rhs);
 
 using HobjToShardSetMapping = std::map<hobject_t, std::set<pg_shard_t>>;
@@ -369,12 +368,14 @@ enum {
   CEPH_OSD_RMW_FLAG_SKIP_PROMOTE      = (1 << 9),
   CEPH_OSD_RMW_FLAG_RWORDERED         = (1 << 10),
   CEPH_OSD_RMW_FLAG_RETURNVEC = (1 << 11),
+  CEPH_OSD_RMW_FLAG_READ_DATA  = (1 << 12),
 };
 
 
 // pg stuff
 
 #define OSD_SUPERBLOCK_GOBJECT ghobject_t(hobject_t(sobject_t(object_t("osd_superblock"), 0)))
+#define OSD_SUPERBLOCK_OMAP_KEY "osd_superblock"
 
 // placement seed (a hash value)
 typedef uint32_t ps_t;
@@ -468,17 +469,7 @@ struct pg_t {
   hobject_t get_hobj_end(unsigned pg_num) const;
 
   // strong ordering is supported
-  inline int compare(const pg_t& p) const noexcept {
-    if (auto delta = pool() - p.pool(); delta != 0) {
-      return delta;
-    } else if (ps() < p.ps()) {
-      return -1;
-    } else if (ps() > p.ps()) {
-      return 1;
-    } else {
-      return 0;
-    }
-  }
+  auto operator<=>(const pg_t&) const noexcept = default;
 
   void encode(ceph::buffer::list& bl) const {
     using ceph::encode;
@@ -507,25 +498,6 @@ struct pg_t {
 };
 WRITE_CLASS_ENCODER(pg_t)
 
-inline bool operator<(const pg_t& l, const pg_t& r) {
-  return l.compare(r) < 0;
-}
-inline bool operator<=(const pg_t& l, const pg_t& r) {
-  return l.compare(r) <= 0;
-}
-inline bool operator==(const pg_t& l, const pg_t& r) {
-  return l.compare(r) == 0;
-}
-inline bool operator!=(const pg_t& l, const pg_t& r) {
-  return l.compare(r) != 0;
-}
-inline bool operator>(const pg_t& l, const pg_t& r) {
-  return l.compare(r) > 0;
-}
-inline bool operator>=(const pg_t& l, const pg_t& r) {
-  return l.compare(r) >= 0;
-}
-
 std::ostream& operator<<(std::ostream& out, const pg_t &pg);
 
 namespace std {
@@ -546,6 +518,7 @@ struct spg_t {
   spg_t() : shard(shard_id_t::NO_SHARD) {}
   spg_t(pg_t pgid, shard_id_t shard) : pgid(pgid), shard(shard) {}
   explicit spg_t(pg_t pgid) : pgid(pgid), shard(shard_id_t::NO_SHARD) {}
+  auto operator<=>(const spg_t&) const = default;
   unsigned get_split_bits(unsigned pg_num) const {
     return pgid.get_split_bits(pg_num);
   }
@@ -639,8 +612,6 @@ struct spg_t {
   }
 };
 WRITE_CLASS_ENCODER(spg_t)
-WRITE_EQ_OPERATORS_2(spg_t, pgid, shard)
-WRITE_CMP_OPERATORS_2(spg_t, pgid, shard)
 
 namespace std {
   template<> struct hash< spg_t >
@@ -816,6 +787,10 @@ inline std::ostream& operator<<(std::ostream& out, const coll_t& c) {
   out << c.to_str();
   return out;
 }
+
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<coll_t> : fmt::ostream_formatter {};
+#endif
 
 namespace std {
   template<> struct hash<coll_t> {
@@ -1076,6 +1051,9 @@ inline std::ostream& operator<<(std::ostream& out, const pool_snap_info_t& si) {
  * pool options.
  */
 
+// The order of items in the list is important, therefore,
+// you should always add to the end of the list when adding new options.
+
 class pool_opts_t {
 public:
   enum key_t {
@@ -1095,7 +1073,6 @@ public:
     CSUM_MIN_BLOCK,
     FINGERPRINT_ALGORITHM,
     PG_NUM_MIN,         // min pg_num
-    PG_NUM_MAX,         // max pg_num
     TARGET_SIZE_BYTES,  // total bytes in pool
     TARGET_SIZE_RATIO,  // fraction of total cluster
     PG_AUTOSCALE_BIAS,
@@ -1103,6 +1080,7 @@ public:
     DEDUP_TIER,
     DEDUP_CHUNK_ALGORITHM,
     DEDUP_CDC_CHUNK_SIZE,
+    PG_NUM_MAX, // max pg_num
   };
 
   enum type_t {
@@ -1260,6 +1238,10 @@ struct pg_pool_t {
     FLAG_CREATING = 1<<15,          // initial pool PGs are being created
     FLAG_EIO = 1<<16,               // return EIO for all client ops
     FLAG_BULK = 1<<17, //pool is large
+    // PGs from this pool are allowed to be created on crimson osds.
+    // Pool features are restricted to those supported by crimson-osd.
+    // Note, does not prohibit being created on classic osd.
+    FLAG_CRIMSON = 1<<18,
   };
 
   static const char *get_flag_name(uint64_t f) {
@@ -1282,6 +1264,7 @@ struct pg_pool_t {
     case FLAG_CREATING: return "creating";
     case FLAG_EIO: return "eio";
     case FLAG_BULK: return "bulk";
+    case FLAG_CRIMSON: return "crimson";
     default: return "???";
     }
   }
@@ -1336,6 +1319,8 @@ struct pg_pool_t {
       return FLAG_EIO;
     if (name == "bulk")
       return FLAG_BULK;
+    if (name == "crimson")
+      return FLAG_CRIMSON;
     return 0;
   }
 
@@ -1522,6 +1507,10 @@ public:
     hit_set_grade_decay_rate = 0;
     hit_set_search_last_n = 0;
     grade_table.resize(0);
+  }
+
+  bool has_snaps() const {
+    return snaps.size() > 0;
   }
 
   bool is_stretch_pool() const {
@@ -1734,6 +1723,10 @@ public:
     return has_flag(FLAG_EC_OVERWRITES);
   }
 
+  bool is_crimson() const {
+    return has_flag(FLAG_CRIMSON);
+  }
+
   bool can_shift_osds() const {
     switch (get_type()) {
     case TYPE_REPLICATED:
@@ -1886,76 +1879,48 @@ struct object_stat_sum_t {
    * WARNING: be sure to update operator==, floor, and split when
    * adding/removing fields!
    **************************************************************************/
-  int64_t num_bytes;    // in bytes
-  int64_t num_objects;
-  int64_t num_object_clones;
-  int64_t num_object_copies;  // num_objects * num_replicas
-  int64_t num_objects_missing_on_primary;
-  int64_t num_objects_degraded;
-  int64_t num_objects_unfound;
-  int64_t num_rd;
-  int64_t num_rd_kb;
-  int64_t num_wr;
-  int64_t num_wr_kb;
-  int64_t num_scrub_errors;	// total deep and shallow scrub errors
-  int64_t num_objects_recovered;
-  int64_t num_bytes_recovered;
-  int64_t num_keys_recovered;
-  int64_t num_shallow_scrub_errors;
-  int64_t num_deep_scrub_errors;
-  int64_t num_objects_dirty;
-  int64_t num_whiteouts;
-  int64_t num_objects_omap;
-  int64_t num_objects_hit_set_archive;
-  int64_t num_objects_misplaced;
-  int64_t num_bytes_hit_set_archive;
-  int64_t num_flush;
-  int64_t num_flush_kb;
-  int64_t num_evict;
-  int64_t num_evict_kb;
-  int64_t num_promote;
-  int32_t num_flush_mode_high;  // 1 when in high flush mode, otherwise 0
-  int32_t num_flush_mode_low;   // 1 when in low flush mode, otherwise 0
-  int32_t num_evict_mode_some;  // 1 when in evict some mode, otherwise 0
-  int32_t num_evict_mode_full;  // 1 when in evict full mode, otherwise 0
-  int64_t num_objects_pinned;
-  int64_t num_objects_missing;
-  int64_t num_legacy_snapsets; ///< upper bound on pre-luminous-style SnapSets
-  int64_t num_large_omap_objects = 0;
-  int64_t num_objects_manifest = 0;
-  int64_t num_omap_bytes = 0;
-  int64_t num_omap_keys = 0;
-  int64_t num_objects_repaired = 0;
+  int64_t num_bytes{0};    // in bytes
+  int64_t num_objects{0};
+  int64_t num_object_clones{0};
+  int64_t num_object_copies{0};  // num_objects * num_replicas
+  int64_t num_objects_missing_on_primary{0};
+  int64_t num_objects_degraded{0};
+  int64_t num_objects_unfound{0};
+  int64_t num_rd{0};
+  int64_t num_rd_kb{0};
+  int64_t num_wr{0};
+  int64_t num_wr_kb{0};
+  int64_t num_scrub_errors{0};	// total deep and shallow scrub errors
+  int64_t num_objects_recovered{0};
+  int64_t num_bytes_recovered{0};
+  int64_t num_keys_recovered{0};
+  int64_t num_shallow_scrub_errors{0};
+  int64_t num_deep_scrub_errors{0};
+  int64_t num_objects_dirty{0};
+  int64_t num_whiteouts{0};
+  int64_t num_objects_omap{0};
+  int64_t num_objects_hit_set_archive{0};
+  int64_t num_objects_misplaced{0};
+  int64_t num_bytes_hit_set_archive{0};
+  int64_t num_flush{0};
+  int64_t num_flush_kb{0};
+  int64_t num_evict{0};
+  int64_t num_evict_kb{0};
+  int64_t num_promote{0};
+  int32_t num_flush_mode_high{0};  // 1 when in high flush mode, otherwise 0
+  int32_t num_flush_mode_low{0};   // 1 when in low flush mode, otherwise 0
+  int32_t num_evict_mode_some{0};  // 1 when in evict some mode, otherwise 0
+  int32_t num_evict_mode_full{0};  // 1 when in evict full mode, otherwise 0
+  int64_t num_objects_pinned{0};
+  int64_t num_objects_missing{0};
+  int64_t num_legacy_snapsets{0}; ///< upper bound on pre-luminous-style SnapSets
+  int64_t num_large_omap_objects{0};
+  int64_t num_objects_manifest{0};
+  int64_t num_omap_bytes{0};
+  int64_t num_omap_keys{0};
+  int64_t num_objects_repaired{0};
 
-  object_stat_sum_t()
-    : num_bytes(0),
-      num_objects(0), num_object_clones(0), num_object_copies(0),
-      num_objects_missing_on_primary(0), num_objects_degraded(0),
-      num_objects_unfound(0),
-      num_rd(0), num_rd_kb(0), num_wr(0), num_wr_kb(0),
-      num_scrub_errors(0),
-      num_objects_recovered(0),
-      num_bytes_recovered(0),
-      num_keys_recovered(0),
-      num_shallow_scrub_errors(0),
-      num_deep_scrub_errors(0),
-      num_objects_dirty(0),
-      num_whiteouts(0),
-      num_objects_omap(0),
-      num_objects_hit_set_archive(0),
-      num_objects_misplaced(0),
-      num_bytes_hit_set_archive(0),
-      num_flush(0),
-      num_flush_kb(0),
-      num_evict(0),
-      num_evict_kb(0),
-      num_promote(0),
-      num_flush_mode_high(0), num_flush_mode_low(0),
-      num_evict_mode_some(0), num_evict_mode_full(0),
-      num_objects_pinned(0),
-      num_objects_missing(0),
-      num_legacy_snapsets(0)
-  {}
+  object_stat_sum_t() = default;
 
   void floor(int64_t f) {
 #define FLOOR(x) if (x < f) x = f
@@ -2195,7 +2160,8 @@ enum class pg_scrub_sched_status_t : uint16_t {
   not_queued,	   ///< not in the OSD's scrub queue. Probably not active.
   active,          ///< scrubbing
   scheduled,	   ///< scheduled for a scrub at an already determined time
-  queued	   ///< queued to be scrubbed
+  queued,	   ///< queued to be scrubbed
+  blocked	   ///< blocked waiting for objects to be unlocked
 };
 
 struct pg_scrubbing_status_t {
@@ -2247,8 +2213,10 @@ struct pg_stat_t {
   object_stat_collection_t stats;
 
   int64_t log_size;
+  int64_t log_dups_size;
   int64_t ondisk_log_size;    // >= active_log_size
   int64_t objects_scrubbed;
+  double scrub_duration;
 
   std::vector<int32_t> up, acting;
   std::vector<pg_shard_t> avail_no_missing;
@@ -2269,6 +2237,8 @@ struct pg_stat_t {
   // snaptrimq.size() is 64bit, but let's be serious - anything over 50k is
   // absurd already, so cap it to 2^32 and save 4 bytes at the same time
   uint32_t snaptrimq_len;
+  int64_t objects_trimmed;
+  double snaptrim_duration;
 
   pg_scrubbing_status_t scrub_sched_status;
 
@@ -2288,12 +2258,16 @@ struct pg_stat_t {
       state(0),
       created(0), last_epoch_clean(0),
       parent_split_bits(0),
-      log_size(0), ondisk_log_size(0),
+      log_size(0), log_dups_size(0),
+      ondisk_log_size(0),
       objects_scrubbed(0),
+      scrub_duration(0),
       mapping_epoch(0),
       up_primary(-1),
       acting_primary(-1),
       snaptrimq_len(0),
+      objects_trimmed(0),
+      snaptrim_duration(0.0),
       stats_invalid(false),
       dirty_stats_invalid(false),
       omap_stats_invalid(false),
@@ -2340,6 +2314,7 @@ struct pg_stat_t {
   void add(const pg_stat_t& o) {
     stats.add(o.stats);
     log_size += o.log_size;
+    log_dups_size += o.log_dups_size;
     ondisk_log_size += o.ondisk_log_size;
     snaptrimq_len = std::min((uint64_t)snaptrimq_len + o.snaptrimq_len,
                              (uint64_t)(1ull << 31));
@@ -2348,6 +2323,7 @@ struct pg_stat_t {
   void sub(const pg_stat_t& o) {
     stats.sub(o.stats);
     log_size -= o.log_size;
+    log_dups_size -= o.log_dups_size;
     ondisk_log_size -= o.ondisk_log_size;
     if (o.snaptrimq_len < snaptrimq_len) {
       snaptrimq_len -= o.snaptrimq_len;
@@ -3255,6 +3231,7 @@ public:
     void encode(ceph::buffer::list& bl) const;
     void decode(ceph::buffer::list::const_iterator& bl);
     void dump(ceph::Formatter *f) const;
+    std::string fmt_print() const;
     static void generate_test_instances(std::list<pg_interval_t*>& o);
   };
 
@@ -3279,6 +3256,7 @@ public:
     virtual void encode(ceph::buffer::list &bl) const = 0;
     virtual void decode(ceph::buffer::list::const_iterator &bl) = 0;
     virtual void dump(ceph::Formatter *f) const = 0;
+    virtual std::string print() const = 0;
     virtual void iterate_mayberw_back_to(
       epoch_t les,
       std::function<void(epoch_t, const std::set<pg_shard_t> &)> &&f) const = 0;
@@ -3324,6 +3302,9 @@ public:
     ceph_assert(past_intervals);
     past_intervals->dump(f);
   }
+
+  std::string fmt_print() const;
+
   static void generate_test_instances(std::list<PastIntervals *> & o);
 
   /**
@@ -3532,6 +3513,8 @@ public:
     bool affected_by_map(
       const OSDMap &osdmap,
       const DoutPrefixProvider *dpp) const;
+
+    std::string fmt_print() const;
 
     // For verifying tests
     PriorSet(
@@ -4099,6 +4082,7 @@ public:
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
+  std::string fmt_print() const;
   static void generate_test_instances(std::list<ObjectCleanRegions*>& o);
 };
 WRITE_CLASS_ENCODER(ObjectCleanRegions)
@@ -4107,10 +4091,9 @@ std::ostream& operator<<(std::ostream& out, const ObjectCleanRegions& ocr);
 
 struct OSDOp {
   ceph_osd_op op;
-  sobject_t soid;
 
   ceph::buffer::list indata, outdata;
-  errorcode32_t rval = 0;
+  errorcode32_t rval;
 
   OSDOp() {
     // FIPS zeroization audit 20191115: this memset clean for security
@@ -4240,6 +4223,16 @@ struct pg_log_op_return_item_t {
   }
 };
 WRITE_CLASS_ENCODER(pg_log_op_return_item_t)
+namespace fmt {
+template <>
+struct formatter<pg_log_op_return_item_t> {
+  constexpr auto parse(fmt::format_parse_context& ctx) { return ctx.begin(); }
+  template <typename FormatContext>
+  auto format(const pg_log_op_return_item_t& litm, FormatContext& ctx) const {
+    return fmt::format_to(ctx.out(), "r={}+{}b", litm.rval, litm.bl.length());
+  }
+};
+} // namespace fmt
 
 /**
  * pg_log_entry_t - single entry/event in pg log
@@ -4323,7 +4316,7 @@ struct pg_log_entry_t {
      invalid_hash(false), invalid_pool(false) {
     snaps.reassign_to_mempool(mempool::mempool_osd_pglog);
   }
-      
+
   bool is_clone() const { return op == CLONE; }
   bool is_modify() const { return op == MODIFY; }
   bool is_promote() const { return op == PROMOTE; }
@@ -4382,6 +4375,7 @@ struct pg_log_entry_t {
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
+  std::string fmt_print() const;
   static void generate_test_instances(std::list<pg_log_entry_t*>& o);
 
 };
@@ -4757,6 +4751,9 @@ struct pg_missing_item {
 };
 WRITE_CLASS_ENCODER_FEATURES(pg_missing_item)
 std::ostream& operator<<(std::ostream& out, const pg_missing_item &item);
+#if FMT_VERSION >= 90000
+template <> struct fmt::formatter<pg_missing_item> : fmt::ostream_formatter {};
+#endif
 
 class pg_missing_const_i {
 public:
@@ -5469,6 +5466,8 @@ public:
   epoch_t purged_snaps_last = 0;
   utime_t last_purged_snaps_scrub;
 
+  epoch_t cluster_osdmap_trim_lower_bound = 0;
+
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
@@ -5484,6 +5483,7 @@ inline std::ostream& operator<<(std::ostream& out, const OSDSuperblock& sb)
              << " e" << sb.current_epoch
              << " [" << sb.oldest_map << "," << sb.newest_map << "]"
 	     << " lci=[" << sb.mounted << "," << sb.clean_thru << "]"
+             << " tlb=" << sb.cluster_osdmap_trim_lower_bound
              << ")";
 }
 
@@ -5519,11 +5519,11 @@ struct SnapSet {
 
   /// get space accounted to clone
   uint64_t get_clone_bytes(snapid_t clone) const;
-    
+
   void encode(ceph::buffer::list& bl) const;
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
-  static void generate_test_instances(std::list<SnapSet*>& o);  
+  static void generate_test_instances(std::list<SnapSet*>& o);
 
   SnapContext get_ssc_as_of(snapid_t as_of) const {
     SnapContext out;
@@ -5564,6 +5564,7 @@ struct watch_info_t {
   void encode(ceph::buffer::list& bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator& bl);
   void dump(ceph::Formatter *f) const;
+  std::string fmt_print() const;
   static void generate_test_instances(std::list<watch_info_t*>& o);
 };
 WRITE_CLASS_ENCODER_FEATURES(watch_info_t)
@@ -5574,8 +5575,7 @@ static inline bool operator==(const watch_info_t& l, const watch_info_t& r) {
 }
 
 static inline std::ostream& operator<<(std::ostream& out, const watch_info_t& w) {
-  return out << "watch(cookie " << w.cookie << " " << w.timeout_seconds << "s"
-    << " " << w.addr << ")";
+  return out << w.fmt_print();
 }
 
 struct notify_info_t {
@@ -6024,24 +6024,21 @@ struct ObjectRecoveryInfo {
   static void generate_test_instances(std::list<ObjectRecoveryInfo*>& o);
   void encode(ceph::buffer::list &bl, uint64_t features) const;
   void decode(ceph::buffer::list::const_iterator &bl, int64_t pool = -1);
-  std::ostream &print(std::ostream &out) const;
+  std::string fmt_print() const;
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER_FEATURES(ObjectRecoveryInfo)
 std::ostream& operator<<(std::ostream& out, const ObjectRecoveryInfo &inf);
 
 struct ObjectRecoveryProgress {
-  uint64_t data_recovered_to;
+  uint64_t data_recovered_to{0};
   std::string omap_recovered_to;
-  bool first;
-  bool data_complete;
-  bool omap_complete;
-  bool error = false;
+  bool first{true};
+  bool data_complete{false};
+  bool omap_complete{false};
+  bool error{false};
 
-  ObjectRecoveryProgress()
-    : data_recovered_to(0),
-      first(true),
-      data_complete(false), omap_complete(false) { }
+  ObjectRecoveryProgress() {}
 
   bool is_complete(const ObjectRecoveryInfo& info) const {
     return (data_recovered_to >= (
@@ -6050,10 +6047,16 @@ struct ObjectRecoveryProgress {
       omap_complete;
   }
 
+  uint64_t estimate_remaining_data_to_recover(const ObjectRecoveryInfo& info) const {
+    // Overestimates in case of clones, but avoids traversing copy_subset
+    return info.size - data_recovered_to;
+  }
+
   static void generate_test_instances(std::list<ObjectRecoveryProgress*>& o);
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   std::ostream &print(std::ostream &out) const;
+  std::string fmt_print() const;
   void dump(ceph::Formatter *f) const;
 };
 WRITE_CLASS_ENCODER(ObjectRecoveryProgress)
@@ -6116,6 +6119,8 @@ std::ostream& operator<<(std::ostream& out, const PushOp &op);
 
 /*
  * summarize pg contents for purposes of a scrub
+ *
+ * If members are added to ScrubMap, make sure to modify swap().
  */
 struct ScrubMap {
   struct object {
@@ -6153,8 +6158,8 @@ struct ScrubMap {
   std::map<hobject_t,object> objects;
   eversion_t valid_through;
   eversion_t incr_since;
-  bool has_large_omap_object_errors:1;
-  bool has_omap_keys:1;
+  bool has_large_omap_object_errors{false};
+  bool has_omap_keys{false};
 
   void merge_incr(const ScrubMap &l);
   void clear_from(const hobject_t& start) {
@@ -6168,6 +6173,8 @@ struct ScrubMap {
     swap(objects, r.objects);
     swap(valid_through, r.valid_through);
     swap(incr_since, r.incr_since);
+    swap(has_large_omap_object_errors, r.has_large_omap_object_errors);
+    swap(has_omap_keys, r.has_omap_keys);
   }
 
   void encode(ceph::buffer::list& bl) const;

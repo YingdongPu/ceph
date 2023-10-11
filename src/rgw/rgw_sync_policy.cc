@@ -258,6 +258,10 @@ void rgw_sync_bucket_entities::set_bucket(std::optional<string> tenant,
     bucket.emplace();
   }
 
+  if (!bucket) {
+    return;
+  }
+
   set_bucket_field(tenant, &bucket->tenant);
   set_bucket_field(bucket_name, &bucket->name);
   set_bucket_field(bucket_id, &bucket->bucket_id);
@@ -768,6 +772,12 @@ void rgw_sync_policy_info::dump(Formatter *f) const
   for (auto& group : groups ) {
     encode_json("group", group.second, f);
   }
+}
+
+void rgw_sync_policy_info::generate_test_instances(list<rgw_sync_policy_info*>& o)
+{
+  rgw_sync_policy_info *info = new rgw_sync_policy_info;
+  o.push_back(info);
 }
 
 void rgw_sync_policy_info::decode_json(JSONObj *obj)

@@ -116,6 +116,7 @@ AsyncConnection::AsyncConnection(CephContext *cct, AsyncMessenger *m, DispatchQu
   : Connection(cct, m),
     delay_state(NULL), async_msgr(m), conn_id(q->get_id()),
     logger(w->get_perf_counter()),
+    labeled_logger(w->get_labeled_perf_counter()),
     state(STATE_NONE), port(-1),
     dispatch_queue(q), recv_buf(NULL),
     recv_max_prefetch(std::max<int64_t>(msgr->cct->_conf->ms_tcp_prefetch_max_size, TCP_PREFETCH_MIN_SIZE)),
@@ -226,6 +227,7 @@ ssize_t AsyncConnection::read_until(unsigned len, char *p)
                                << " left is " << left << " buffer still has "
                                << recv_end - recv_start << dendl;
     if (left == 0) {
+      state_offset = 0;
       return 0;
     }
     state_offset += to_read;
@@ -327,7 +329,12 @@ ssize_t AsyncConnection::_try_send(bool more)
   ceph_assert(center->in_thread());
   ldout(async_msgr->cct, 25) << __func__ << " cs.send " << outgoing_bl.length()
                              << " bytes" << dendl;
-  ssize_t r = cs.send(outgoing_bl, more);
+  // network block would make ::send return EAGAIN, that would make here looks
+  // like do not call cs.send() and r = 0
+  ssize_t r = 0;
+  if (likely(!inject_network_congestion())) {
+    r = cs.send(outgoing_bl, more);
+  }
   if (r < 0) {
     ldout(async_msgr->cct, 1) << __func__ << " send error: " << cpp_strerror(r) << dendl;
     return r;
@@ -360,6 +367,11 @@ void AsyncConnection::inject_delay() {
     t.set_from_double(async_msgr->cct->_conf->ms_inject_internal_delays);
     t.sleep();
   }
+}
+
+bool AsyncConnection::inject_network_congestion() const {
+  return (async_msgr->cct->_conf->ms_inject_network_congestion > 0 &&
+	  rand() % async_msgr->cct->_conf->ms_inject_network_congestion != 0);
 }
 
 void AsyncConnection::process() {
@@ -396,6 +408,12 @@ void AsyncConnection::process() {
 
       SocketOptions opts;
       opts.priority = async_msgr->get_socket_priority();
+      if (async_msgr->cct->_conf->mon_use_min_delay_socket) {
+          if (async_msgr->get_mytype() == CEPH_ENTITY_TYPE_MON &&
+              peer_is_mon()) {
+            opts.priority = SOCKET_PRIORITY_MIN_DELAY;
+          }
+      }
       opts.connect_bind_addr = msgr->get_myaddrs().front();
       ssize_t r = worker->connect(target_addr, opts, &cs);
       if (r < 0) {
@@ -440,7 +458,13 @@ void AsyncConnection::process() {
     case STATE_ACCEPTING: {
       center->create_file_event(cs.fd(), EVENT_READABLE, read_handler);
       state = STATE_CONNECTION_ESTABLISHED;
-
+      if (async_msgr->cct->_conf->mon_use_min_delay_socket) {
+        if (async_msgr->get_mytype() == CEPH_ENTITY_TYPE_MON &&
+            peer_is_mon()) {
+          cs.set_priority(cs.fd(), SOCKET_PRIORITY_MIN_DELAY,
+                          target_addr.get_family());
+        }
+      }
       break;
     }
 
@@ -764,9 +788,11 @@ void AsyncConnection::tick(uint64_t id)
           (now - last_connect_started).count()) {
       ldout(async_msgr->cct, 1) << __func__ << " see no progress in more than "
                                 << connect_timeout_us
-                                << " us during connecting, fault."
+                                << " us during connecting to "
+                                << target_addr << ", fault."
                                 << dendl;
       protocol->fault();
+      labeled_logger->inc(l_msgr_connection_ready_timeouts);
     } else {
       last_tick_id = center->create_time_event(connect_timeout_us, tick_handler);
     }
@@ -779,6 +805,7 @@ void AsyncConnection::tick(uint64_t id)
                                 << " us, fault."
                                 << dendl;
       protocol->fault();
+      labeled_logger->inc(l_msgr_connection_idle_timeouts);
     } else {
       last_tick_id = center->create_time_event(inactive_timeout_us, tick_handler);
     }
