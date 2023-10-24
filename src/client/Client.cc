@@ -2384,6 +2384,12 @@ void Client::_closed_mds_session(MetaSession *s, int err, bool rejected)
     mds_sessions.erase(s->mds_num);
 }
 
+static void reinit_mds_features(MetaSession *session,
+				const MConstRef<MClientSession>& m) {
+  session->mds_features = std::move(m->supported_features);
+  session->mds_metric_flags = std::move(m->metric_spec.metric_flags);
+}
+
 void Client::handle_client_session(const MConstRef<MClientSession>& m)
 {
   mds_rank_t from = mds_rank_t(m->get_source().num());
@@ -2402,6 +2408,13 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
       if (session->state == MetaSession::STATE_OPEN) {
         ldout(cct, 10) << "mds." << from << " already opened, ignore it"
                        << dendl;
+	// The MDS could send a client_session(open) message even when
+	// the session state is STATE_OPEN. Normally, its fine to
+	// ignore this message, but, if the MDS sent this message just
+	// after it got upgraded, the MDS feature bits could differ
+	// than the one before the upgrade - so, refresh the feature
+	// bits the client holds.
+	reinit_mds_features(session.get(), m);
         return;
       }
       /*
@@ -2411,8 +2424,7 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
       if (!session->seq && m->get_seq())
         session->seq = m->get_seq();
 
-      session->mds_features = std::move(m->supported_features);
-      session->mds_metric_flags = std::move(m->metric_spec.metric_flags);
+      reinit_mds_features(session.get(), m);
       cap_auths = std::move(m->cap_auths);
 
       renew_caps(session.get());
@@ -4796,6 +4808,9 @@ void Client::trim_caps(MetaSession *s, uint64_t max)
     // is deleted inside remove_cap
     ++p;
 
+    if (in->dirty_caps || in->cap_snaps.size())
+      cap_delay_requeue(in.get());
+
     if (in->caps.size() > 1 && cap != in->auth_cap) {
       int mine = cap->issued | cap->implemented;
       int oissued = in->auth_cap ? in->auth_cap->issued : 0;
@@ -4833,7 +4848,8 @@ void Client::trim_caps(MetaSession *s, uint64_t max)
       }
       if (all && in->ino != CEPH_INO_ROOT) {
         ldout(cct, 20) << __func__ << " counting as trimmed: " << *in << dendl;
-	trimmed++;
+	if (!in->dirty_caps && !in->cap_snaps.size())
+	  trimmed++;
       }
     }
   }
@@ -10999,15 +11015,11 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 
 void Client::C_Read_Async_Finisher::finish(int r)
 {
-  clnt->client_lock.lock();
-
   // Do read ahead as long as we aren't completing with 0 bytes
   if (r != 0)
     clnt->do_readahead(f, in, off, len);
 
   onfinish->complete(r);
-
-  clnt->client_lock.unlock();
 }
 
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
@@ -11039,9 +11051,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
     Context *crf = io_finish.release();
 
     // Complete the crf immediately with 0 bytes
-    client_lock.unlock();
     crf->complete(0);
-    client_lock.lock();
 
     // Signal async completion
     return 0;
@@ -11073,9 +11083,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
     Context *crf = io_finish.release();
     if (r != 0) {
       // need to do readahead, so complete the crf
-      client_lock.unlock();
       crf->complete(r);
-      client_lock.lock();
     } else {
       get_cap_ref(in, CEPH_CAP_FILE_CACHE);
     }
