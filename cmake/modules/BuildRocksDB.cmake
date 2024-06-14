@@ -24,6 +24,7 @@ function(build_rocksdb)
   endif()
 
   list(APPEND rocksdb_CMAKE_ARGS -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
+  list(APPEND rocksdb_CMAKE_ARGS -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER})
 
   list(APPEND rocksdb_CMAKE_ARGS -DWITH_SNAPPY=${SNAPPY_FOUND})
   if(SNAPPY_FOUND)
@@ -59,12 +60,13 @@ function(build_rocksdb)
   endif()
   include(CheckCXXCompilerFlag)
   check_cxx_compiler_flag("-Wno-deprecated-copy" HAS_WARNING_DEPRECATED_COPY)
+  set(rocksdb_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
   if(HAS_WARNING_DEPRECATED_COPY)
-    set(rocksdb_CXX_FLAGS -Wno-deprecated-copy)
+    string(APPEND rocksdb_CXX_FLAGS " -Wno-deprecated-copy")
   endif()
   check_cxx_compiler_flag("-Wno-pessimizing-move" HAS_WARNING_PESSIMIZING_MOVE)
   if(HAS_WARNING_PESSIMIZING_MOVE)
-    set(rocksdb_CXX_FLAGS "${rocksdb_CXX_FLAGS} -Wno-pessimizing-move")
+    string(APPEND rocksdb_CXX_FLAGS " -Wno-pessimizing-move")
   endif()
   if(rocksdb_CXX_FLAGS)
     list(APPEND rocksdb_CMAKE_ARGS -DCMAKE_CXX_FLAGS='${rocksdb_CXX_FLAGS}')
@@ -90,6 +92,9 @@ function(build_rocksdb)
     BUILD_BYPRODUCTS "${rocksdb_LIBRARY}"
     INSTALL_COMMAND ""
     LIST_SEPARATOR !)
+
+  # make sure all the link libraries are built first
+  add_dependencies(rocksdb_ext ${rocksdb_INTERFACE_LINK_LIBRARIES})
 
   add_library(RocksDB::RocksDB STATIC IMPORTED)
   add_dependencies(RocksDB::RocksDB rocksdb_ext)

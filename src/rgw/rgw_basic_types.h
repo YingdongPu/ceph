@@ -31,7 +31,8 @@
 #include "rgw_user_types.h"
 #include "rgw_bucket_types.h"
 #include "rgw_obj_types.h"
-#include "rgw_obj_manifest.h"
+
+#include "driver/rados/rgw_obj_manifest.h" // FIXME: subclass dependency
 
 #include "common/Formatter.h"
 
@@ -65,12 +66,12 @@ struct rgw_zone_id {
   rgw_zone_id(std::string&& _id) : id(std::move(_id)) {}
 
   void encode(ceph::buffer::list& bl) const {
-    /* backward compatiblity, not using ENCODE_{START,END} macros */
+    /* backward compatibility, not using ENCODE_{START,END} macros */
     ceph::encode(id, bl);
   }
 
   void decode(ceph::buffer::list::const_iterator& bl) {
-    /* backward compatiblity, not using DECODE_{START,END} macros */
+    /* backward compatibility, not using DECODE_{START,END} macros */
     ceph::decode(id, bl);
   }
 
@@ -140,7 +141,7 @@ extern void decode_json_obj(rgw_placement_rule& v, JSONObj *obj);
 namespace rgw {
 namespace auth {
 class Principal {
-  enum types { User, Role, Tenant, Wildcard, OidcProvider, AssumedRole };
+  enum types { User, Role, Account, Wildcard, OidcProvider, AssumedRole };
   types t;
   rgw_user u;
   std::string idp_url;
@@ -168,8 +169,8 @@ public:
     return Principal(Role, std::move(t), std::move(u));
   }
 
-  static Principal tenant(std::string&& t) {
-    return Principal(Tenant, std::move(t), {});
+  static Principal account(std::string&& t) {
+    return Principal(Account, std::move(t), {});
   }
 
   static Principal oidc_provider(std::string&& idp_url) {
@@ -192,8 +193,8 @@ public:
     return t == Role;
   }
 
-  bool is_tenant() const {
-    return t == Tenant;
+  bool is_account() const {
+    return t == Account;
   }
 
   bool is_oidc_provider() const {
@@ -204,7 +205,7 @@ public:
     return t == AssumedRole;
   }
 
-  const std::string& get_tenant() const {
+  const std::string& get_account() const {
     return u.tenant;
   }
 

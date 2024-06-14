@@ -127,10 +127,12 @@ def with_osd_daemon(cephadm_module: CephadmOrchestrator, _run_cephadm, host: str
         [host]).stdout == f"Created osd(s) 1 on host '{host}'"
     assert _run_cephadm.mock_calls == [
         mock.call(host, 'osd', 'ceph-volume',
-                  ['--', 'lvm', 'list', '--format', 'json'], no_fsid=False, error_ok=False, image='', log_output=True),
-        mock.call(host, f'osd.{osd_id}', ['_orch', 'deploy'], [], stdin=mock.ANY),
+                  ['--', 'lvm', 'list', '--format', 'json'],
+                  no_fsid=False, error_ok=False, image='', log_output=True, use_current_daemon_image=False),
+        mock.call(host, f'osd.{osd_id}', ['_orch', 'deploy'], [], stdin=mock.ANY, use_current_daemon_image=False),
         mock.call(host, 'osd', 'ceph-volume',
-                  ['--', 'raw', 'list', '--format', 'json'], no_fsid=False, error_ok=False, image='', log_output=True),
+                  ['--', 'raw', 'list', '--format', 'json'],
+                  no_fsid=False, error_ok=False, image='', log_output=True, use_current_daemon_image=False),
     ]
     dd = cephadm_module.cache.get_daemon(f'osd.{osd_id}', host=host)
     assert dd.name() == f'osd.{osd_id}'
@@ -400,6 +402,42 @@ class TestCephadm(object):
 
                     assert 'myerror' in ''.join(evs)
 
+    @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('[]'))
+    def test_daemon_action_event_timestamp_update(self, cephadm_module: CephadmOrchestrator):
+        # Test to make sure if a new daemon event is created with the same subject
+        # and message that the timestamp of the event is updated to let users know
+        # when it most recently occurred.
+        cephadm_module.service_cache_timeout = 10
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, RGWSpec(service_id='myrgw.foobar', unmanaged=True)) as _, \
+                    with_daemon(cephadm_module, RGWSpec(service_id='myrgw.foobar'), 'test') as daemon_id:
+
+                d_name = 'rgw.' + daemon_id
+
+                now = str_to_datetime('2023-10-18T22:45:29.119250Z')
+                with mock.patch("cephadm.inventory.datetime_now", lambda: now):
+                    c = cephadm_module.daemon_action('redeploy', d_name)
+                    assert wait(cephadm_module,
+                                c) == f"Scheduled to redeploy rgw.{daemon_id} on host 'test'"
+
+                    CephadmServe(cephadm_module)._check_daemons()
+
+                d_events = cephadm_module.events.get_for_daemon(d_name)
+                assert len(d_events) == 1
+                assert d_events[0].created == now
+
+                later = str_to_datetime('2023-10-18T23:46:37.119250Z')
+                with mock.patch("cephadm.inventory.datetime_now", lambda: later):
+                    c = cephadm_module.daemon_action('redeploy', d_name)
+                    assert wait(cephadm_module,
+                                c) == f"Scheduled to redeploy rgw.{daemon_id} on host 'test'"
+
+                    CephadmServe(cephadm_module)._check_daemons()
+
+                d_events = cephadm_module.events.get_for_daemon(d_name)
+                assert len(d_events) == 1
+                assert d_events[0].created == later
+
     @pytest.mark.parametrize(
         "action",
         [
@@ -488,6 +526,7 @@ class TestCephadm(object):
                             },
                         },
                     }),
+                    use_current_daemon_image=True,
                 )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -542,6 +581,7 @@ class TestCephadm(object):
                             "crush_location": "datacenter=a",
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -583,6 +623,7 @@ class TestCephadm(object):
                             "keyring": "[client.crash.test]\nkey = None\n",
                         },
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -624,6 +665,7 @@ class TestCephadm(object):
                         },
                         "config_blobs": {},
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -673,6 +715,7 @@ class TestCephadm(object):
                         },
                         "config_blobs": {},
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -726,6 +769,7 @@ class TestCephadm(object):
                         },
                         "config_blobs": {},
                     }),
+                    use_current_daemon_image=False,
                 )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
@@ -1071,9 +1115,13 @@ class TestCephadm(object):
                 env_vars=['CEPH_VOLUME_OSDSPEC_AFFINITY=foo'], error_ok=True,
                 stdin='{"config": "", "keyring": ""}')
             _run_cephadm.assert_any_call(
-                'test', 'osd', 'ceph-volume', ['--', 'lvm', 'list', '--format', 'json'], image='', no_fsid=False, error_ok=False, log_output=True)
+                'test', 'osd', 'ceph-volume', ['--', 'lvm', 'list', '--format', 'json'],
+                image='', no_fsid=False, error_ok=False, log_output=True, use_current_daemon_image=False
+            )
             _run_cephadm.assert_any_call(
-                'test', 'osd', 'ceph-volume', ['--', 'raw', 'list', '--format', 'json'], image='', no_fsid=False, error_ok=False, log_output=True)
+                'test', 'osd', 'ceph-volume', ['--', 'raw', 'list', '--format', 'json'],
+                image='', no_fsid=False, error_ok=False, log_output=True, use_current_daemon_image=False
+            )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
     def test_apply_osd_save_non_collocated(self, _run_cephadm, cephadm_module: CephadmOrchestrator):
@@ -1111,11 +1159,16 @@ class TestCephadm(object):
                     '--no-auto', '/dev/sdb', '--db-devices', '/dev/sdc',
                     '--wal-devices', '/dev/sdd', '--yes', '--no-systemd'],
                 env_vars=['CEPH_VOLUME_OSDSPEC_AFFINITY=noncollocated'],
-                error_ok=True, stdin='{"config": "", "keyring": ""}')
+                error_ok=True, stdin='{"config": "", "keyring": ""}',
+            )
             _run_cephadm.assert_any_call(
-                'test', 'osd', 'ceph-volume', ['--', 'lvm', 'list', '--format', 'json'], image='', no_fsid=False, error_ok=False, log_output=True)
+                'test', 'osd', 'ceph-volume', ['--', 'lvm', 'list', '--format', 'json'],
+                image='', no_fsid=False, error_ok=False, log_output=True, use_current_daemon_image=False
+            )
             _run_cephadm.assert_any_call(
-                'test', 'osd', 'ceph-volume', ['--', 'raw', 'list', '--format', 'json'], image='', no_fsid=False, error_ok=False, log_output=True)
+                'test', 'osd', 'ceph-volume', ['--', 'raw', 'list', '--format', 'json'],
+                image='', no_fsid=False, error_ok=False, log_output=True, use_current_daemon_image=False
+            )
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     @mock.patch("cephadm.module.SpecStore.save")
@@ -1157,7 +1210,8 @@ class TestCephadm(object):
     @mock.patch('cephadm.services.osd.OSDService.driveselection_to_ceph_volume')
     @mock.patch('cephadm.services.osd.OsdIdClaims.refresh', lambda _: None)
     @mock.patch('cephadm.services.osd.OsdIdClaims.get', lambda _: {})
-    def test_limit_not_reached(self, d_to_cv, _run_cv_cmd, cephadm_module):
+    @mock.patch('cephadm.inventory.HostCache.get_daemons_by_service')
+    def test_limit_not_reached(self, _get_daemons_by_service, d_to_cv, _run_cv_cmd, cephadm_module):
         with with_host(cephadm_module, 'test'):
             dg = DriveGroupSpec(placement=PlacementSpec(host_pattern='test'),
                                 data_devices=DeviceSelection(limit=5, rotational=1),
@@ -1167,12 +1221,14 @@ class TestCephadm(object):
                 '[{"data": "/dev/vdb", "data_size": "50.00 GB", "encryption": "None"}, {"data": "/dev/vdc", "data_size": "50.00 GB", "encryption": "None"}]']
             d_to_cv.return_value = 'foo'
             _run_cv_cmd.side_effect = async_side_effect((disks_found, '', 0))
+            _get_daemons_by_service.return_value = [DaemonDescription(daemon_type='osd', hostname='test', service_name='not_enough')]
             preview = cephadm_module.osd_service.generate_previews([dg], 'test')
 
             for osd in preview:
                 assert 'notes' in osd
                 assert osd['notes'] == [
-                    'NOTE: Did not find enough disks matching filter on host test to reach data device limit (Found: 2 | Limit: 5)']
+                    ('NOTE: Did not find enough disks matching filter on host test to reach '
+                     'data device limit\n(New Devices: 2 | Existing Matching Daemons: 1 | Limit: 5)')]
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm", _run_cephadm('{}'))
     def test_prepare_drivegroup(self, cephadm_module):
@@ -1251,7 +1307,11 @@ class TestCephadm(object):
     ))
     @mock.patch("cephadm.services.osd.OSD.exists", True)
     @mock.patch("cephadm.services.osd.RemoveUtil.get_pg_count", lambda _, __: 0)
-    def test_remove_osds(self, cephadm_module):
+    @mock.patch("cephadm.services.osd.RemoveUtil.get_weight")
+    @mock.patch("cephadm.services.osd.RemoveUtil.reweight_osd")
+    def test_remove_osds(self, _reweight_osd, _get_weight, cephadm_module):
+        osd_initial_weight = 2.1
+        _get_weight.return_value = osd_initial_weight
         with with_host(cephadm_module, 'test'):
             CephadmServe(cephadm_module)._refresh_host_daemons('test')
             c = cephadm_module.list_daemons()
@@ -1261,13 +1321,23 @@ class TestCephadm(object):
             out = wait(cephadm_module, c)
             assert out == ["Removed osd.0 from host 'test'"]
 
-            cephadm_module.to_remove_osds.enqueue(OSD(osd_id=0,
-                                                      replace=False,
-                                                      force=False,
-                                                      hostname='test',
-                                                      process_started_at=datetime_now(),
-                                                      remove_util=cephadm_module.to_remove_osds.rm_util
-                                                      ))
+            osd_0 = OSD(osd_id=0,
+                        replace=False,
+                        force=False,
+                        hostname='test',
+                        process_started_at=datetime_now(),
+                        remove_util=cephadm_module.to_remove_osds.rm_util
+                        )
+
+            cephadm_module.to_remove_osds.enqueue(osd_0)
+            _get_weight.assert_called()
+
+            # test that OSD is properly reweighted on removal
+            cephadm_module.stop_remove_osds([0])
+            _reweight_osd.assert_called_with(mock.ANY, osd_initial_weight)
+
+            # add OSD back to queue and test normal removal queue processing
+            cephadm_module.to_remove_osds.enqueue(osd_0)
             cephadm_module.to_remove_osds.process_removal_queue()
             assert cephadm_module.to_remove_osds == OSDRemovalQueue(cephadm_module)
 
@@ -2058,6 +2128,21 @@ class TestCephadm(object):
         CephadmServe(cephadm_module)._write_client_files({}, 'host2')
         CephadmServe(cephadm_module)._write_client_files({}, 'host3')
 
+    @mock.patch('cephadm.CephadmOrchestrator.mon_command')
+    @mock.patch("cephadm.inventory.HostCache.get_host_client_files")
+    def test_dont_write_etc_ceph_client_files_when_turned_off(self, _get_client_files, _mon_command, cephadm_module):
+        cephadm_module.keys.update(ClientKeyringSpec('keyring1', PlacementSpec(label='keyring1'), include_ceph_conf=False))
+        cephadm_module.inventory.add_host(HostSpec('host1', '1.2.3.1', labels=['keyring1']))
+        cephadm_module.cache.update_host_daemons('host1', {})
+
+        _mon_command.return_value = (0, 'my-keyring', '')
+
+        client_files = CephadmServe(cephadm_module)._calc_client_files()
+
+        assert 'host1' in client_files
+        assert '/etc/ceph/ceph.keyring1.keyring' in client_files['host1']
+        assert '/etc/ceph/ceph.conf' not in client_files['host1']
+
     def test_etc_ceph_init(self):
         with with_cephadm_module({'manage_etc_ceph_ceph_conf': True}) as m:
             assert m.manage_etc_ceph_ceph_conf is True
@@ -2230,10 +2315,10 @@ Traceback (most recent call last):
             assert _run_cephadm.mock_calls == [
                 mock.call('test', 'osd', 'ceph-volume',
                           ['--', 'inventory', '--format=json-pretty', '--filter-for-batch'], image='',
-                          no_fsid=False, error_ok=False, log_output=False),
+                          no_fsid=False, error_ok=False, log_output=False, use_current_daemon_image=False),
                 mock.call('test', 'osd', 'ceph-volume',
                           ['--', 'inventory', '--format=json-pretty'], image='',
-                          no_fsid=False, error_ok=False, log_output=False),
+                          no_fsid=False, error_ok=False, log_output=False, use_current_daemon_image=False),
             ]
 
     @mock.patch("cephadm.serve.CephadmServe._run_cephadm")
